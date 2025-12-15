@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --oneline -10)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot show-ref)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot status)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot config --list)",
+      "Skill(doc-audit)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(chmod:*)",
+      "Bash(bash setup.sh:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(wc:*)",
+      "Bash(sqlite3:*)",
+      "Bash(python -m pytest:*)"
+    ]
+  }
+}

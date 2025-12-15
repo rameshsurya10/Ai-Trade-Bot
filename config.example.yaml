@@ -1,0 +1,113 @@
+# AI Trade Bot Configuration - EXAMPLE
+# =====================================
+# Copy this file to config.yaml and fill in your details:
+#   cp config.example.yaml config.yaml
+#
+# NEVER commit config.yaml to git (it's in .gitignore)
+
+# =============================================================================
+# DATA SETTINGS
+# =============================================================================
+data:
+  # Single symbol mode (backward compatible)
+  symbol: "BTC/USDT"             # Trading pair
+
+  # Multi-symbol mode (optional - overrides 'symbol' if set)
+  # symbols:
+  #   - symbol: "BTC/USDT"
+  #     enabled: true
+  #     min_confidence: 0.55       # Override default confidence
+  #     risk_multiplier: 1.0       # Position size multiplier
+  #   - symbol: "ETH/USDT"
+  #     enabled: true
+  #   - symbol: "SOL/USDT"
+  #     enabled: true
+
+  exchange: "binance"            # Data source: binance, coinbase, kraken
+  interval: "1h"                 # Candle interval: 1m, 5m, 15m, 1h, 4h, 1d
+  history_days: 365              # Days of historical data to maintain
+  mode: "hybrid"                 # Data mode: websocket, polling, hybrid
+
+# =============================================================================
+# ANALYSIS SETTINGS
+# =============================================================================
+analysis:
+  update_interval: 60           # Seconds between analysis cycles
+  min_confidence: 0.55          # Minimum confidence to generate signal (55%)
+  lookback_period: 100          # Candles to use for feature calculation
+
+# =============================================================================
+# MODEL SETTINGS
+# =============================================================================
+model:
+  path: "models/best_model.pt"  # Trained model location
+  sequence_length: 60           # Input sequence length for LSTM
+  hidden_size: 128              # LSTM hidden layer size
+  num_layers: 2                 # LSTM layers
+  dropout: 0.2                  # Dropout rate
+
+# =============================================================================
+# SIGNAL SETTINGS (For your manual trading)
+# =============================================================================
+signals:
+  # Risk Management (YOU apply these on your exchange)
+  risk_per_trade: 0.02          # 2% of capital per trade
+  risk_reward_ratio: 2.0        # Target 2:1 reward:risk
+
+  # Signal Thresholds
+  strong_signal: 0.65           # Above this = STRONG signal
+  medium_signal: 0.55           # Above this = MEDIUM signal
+
+  # Cooldown (prevent spam - min time between same-direction signals)
+  cooldown_minutes: 60          # Minutes between similar signals
+
+# =============================================================================
+# NOTIFICATION SETTINGS
+# =============================================================================
+notifications:
+  # Desktop Notifications (always enabled)
+  desktop: true
+
+  # Sound Alerts
+  sound: true
+  sound_file: ""                # Custom sound file path (optional)
+
+  # Telegram (optional - get credentials from @BotFather)
+  # For security, you can also use environment variables:
+  #   TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+  telegram:
+    enabled: false
+    bot_token: ""               # YOUR_BOT_TOKEN_HERE
+    chat_id: ""                 # YOUR_CHAT_ID_HERE
+
+  # Email (optional)
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender: ""                  # YOUR_EMAIL_HERE
+    password: ""                # Use app password, not real password!
+    recipient: ""               # RECIPIENT_EMAIL_HERE
+
+# =============================================================================
+# DATABASE SETTINGS
+# =============================================================================
+database:
+  path: "data/trading.db"       # SQLite database path
+
+# =============================================================================
+# DASHBOARD SETTINGS (Optional - analysis runs without it)
+# =============================================================================
+dashboard:
+  host: "localhost"
+  port: 8501
+  theme: "dark"                 # dark or light
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging:
+  level: "INFO"                 # DEBUG, INFO, WARNING, ERROR
+  file: "data/trading.log"
+  max_size_mb: 10
+  backup_count: 3

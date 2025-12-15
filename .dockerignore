@@ -1,0 +1,43 @@
+# Docker ignore file
+# ===================
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Data files (mount separately)
+data/*.db
+data/*.log
+
+# Secrets
+.env
+*.env
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Documentation (optional)
+*.md
+!ReadMe.md
+
+# Tests (optional in production)
+# tests/

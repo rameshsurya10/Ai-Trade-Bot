@@ -1,0 +1,54 @@
+# AI Trade Bot - Docker Compose
+# =============================
+#
+# Start all services:
+#   docker-compose up -d
+#
+# View logs:
+#   docker-compose logs -f
+#
+# Stop all:
+#   docker-compose down
+
+version: '3.8'
+
+services:
+  # Analysis Engine - runs continuously
+  analysis:
+    build: .
+    container_name: ai-trade-bot-analysis
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+    command: python run_analysis.py
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('data/.analysis.pid') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Dashboard - web UI
+  dashboard:
+    build: .
+    container_name: ai-trade-bot-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./config.yaml:/app/config.yaml:ro
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - analysis
+
+# Persistent volumes
+volumes:
+  data:
+  models:

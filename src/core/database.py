@@ -1,0 +1,541 @@
+"""
+Database Manager
+================
+Centralized database operations with connection pooling.
+Handles all SQL operations for the trading system.
+"""
+
+import sqlite3
+import logging
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import threading
+
+import pandas as pd
+
+from .types import Signal, SignalType, SignalStrength, TradeResult
+
+logger = logging.getLogger(__name__)
+
+
+class Database:
+    """
+    Thread-safe SQLite database manager.
+
+    Handles:
+    - Candle storage (OHLCV data)
+    - Signal history
+    - Performance tracking
+    """
+
+    def __init__(self, db_path: str = "data/trading.db"):
+        """
+        Initialize database.
+
+        Args:
+            db_path: Path to SQLite database file
+        """
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+        self._init_schema()
+
+    # Maximum limit for queries to prevent memory issues
+    MAX_QUERY_LIMIT = 100000
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get thread-local database connection."""
+        if not hasattr(self._local, 'connection') or self._local.connection is None:
+            self._local.connection = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,
+                isolation_level='DEFERRED'
+            )
+            self._local.connection.row_factory = sqlite3.Row
+        return self._local.connection
+
+    @contextmanager
+    def connection(self):
+        """Context manager for database connection."""
+        conn = self._get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+
+    def _init_schema(self):
+        """Create database tables if they don't exist."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            # Candles table (OHLCV data)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS candles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER UNIQUE,
+                    datetime TEXT,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    symbol TEXT,
+                    interval TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_candles_timestamp
+                ON candles(timestamp DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_candles_symbol
+                ON candles(symbol, interval)
+            ''')
+
+            # Signals table (with performance tracking)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    datetime TEXT,
+                    signal_type TEXT,
+                    strength TEXT,
+                    confidence REAL,
+                    price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    atr REAL,
+                    notified INTEGER DEFAULT 0,
+                    -- Performance tracking columns
+                    actual_outcome TEXT,
+                    outcome_price REAL,
+                    outcome_timestamp TEXT,
+                    pnl_percent REAL
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_signals_timestamp
+                ON signals(timestamp DESC)
+            ''')
+
+            # Trade results table (for backtesting)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trade_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id INTEGER,
+                    entry_price REAL,
+                    entry_time TEXT,
+                    exit_price REAL,
+                    exit_time TEXT,
+                    direction TEXT,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    hit_target INTEGER,
+                    hit_stop INTEGER,
+                    pnl_percent REAL,
+                    pnl_absolute REAL,
+                    FOREIGN KEY (signal_id) REFERENCES signals(id)
+                )
+            ''')
+
+            logger.debug(f"Database initialized: {self.db_path}")
+
+    # =========================================================================
+    # CANDLE OPERATIONS
+    # =========================================================================
+
+    def save_candles(self, df: pd.DataFrame, symbol: str = "", interval: str = ""):
+        """
+        Save candles to database.
+
+        Args:
+            df: DataFrame with columns [timestamp, datetime, open, high, low, close, volume]
+            symbol: Trading symbol
+            interval: Candle interval
+        """
+        if df.empty:
+            return
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            for _, row in df.iterrows():
+                try:
+                    dt = row.get('datetime')
+                    if hasattr(dt, 'isoformat'):
+                        dt_str = dt.isoformat()
+                    else:
+                        dt_str = str(dt)
+
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO candles
+                        (timestamp, datetime, open, high, low, close, volume, symbol, interval)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        int(row['timestamp']),
+                        dt_str,
+                        float(row['open']),
+                        float(row['high']),
+                        float(row['low']),
+                        float(row['close']),
+                        float(row['volume']),
+                        symbol or row.get('symbol', ''),
+                        interval or row.get('interval', ''),
+                    ))
+                except Exception as e:
+                    logger.debug(f"Error saving candle: {e}")
+
+    def get_candles(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 500
+    ) -> pd.DataFrame:
+        """
+        Get recent candles from database.
+
+        Args:
+            symbol: Trading symbol
+            interval: Candle interval
+            limit: Maximum candles to return (1 to MAX_QUERY_LIMIT)
+
+        Returns:
+            DataFrame sorted by timestamp ascending
+
+        Raises:
+            ValueError: If limit is invalid
+        """
+        # Validate limit parameter
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError(f"limit must be a positive integer, got {limit}")
+        if limit > self.MAX_QUERY_LIMIT:
+            logger.warning(f"limit {limit} exceeds max {self.MAX_QUERY_LIMIT}, capping")
+            limit = self.MAX_QUERY_LIMIT
+
+        with self.connection() as conn:
+            df = pd.read_sql_query('''
+                SELECT timestamp, datetime, open, high, low, close, volume
+                FROM candles
+                WHERE symbol = ? AND interval = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', conn, params=(symbol, interval, limit))
+
+        if not df.empty:
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+
+        return df
+
+    def get_candle_count(self, symbol: str = "", interval: str = "") -> int:
+        """Get total number of candles."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if symbol and interval:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM candles WHERE symbol = ? AND interval = ?",
+                    (symbol, interval)
+                )
+            else:
+                cursor.execute("SELECT COUNT(*) FROM candles")
+            return cursor.fetchone()[0]
+
+    def get_latest_candle(self, symbol: str, interval: str) -> Optional[Dict]:
+        """Get most recent candle."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT timestamp, datetime, open, high, low, close, volume
+                FROM candles
+                WHERE symbol = ? AND interval = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            ''', (symbol, interval))
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    # =========================================================================
+    # SIGNAL OPERATIONS
+    # =========================================================================
+
+    def save_signal(self, signal: Signal) -> int:
+        """
+        Save signal to database.
+
+        Args:
+            signal: Signal to save
+
+        Returns:
+            Signal ID
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            ts = signal.timestamp
+            if hasattr(ts, 'timestamp'):
+                ts_int = int(ts.timestamp() * 1000)
+                ts_str = ts.isoformat()
+            else:
+                ts_int = int(datetime.utcnow().timestamp() * 1000)
+                ts_str = str(ts)
+
+            cursor.execute('''
+                INSERT INTO signals
+                (timestamp, datetime, signal_type, strength, confidence, price,
+                 stop_loss, take_profit, atr, actual_outcome, outcome_price,
+                 outcome_timestamp, pnl_percent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                ts_int,
+                ts_str,
+                signal.signal_type.value,
+                signal.strength.value,
+                signal.confidence,
+                signal.price,
+                signal.stop_loss,
+                signal.take_profit,
+                signal.atr,
+                signal.actual_outcome,
+                signal.outcome_price,
+                signal.outcome_timestamp.isoformat() if signal.outcome_timestamp else None,
+                signal.pnl_percent,
+            ))
+
+            return cursor.lastrowid
+
+    def update_signal_outcome(
+        self,
+        signal_id: int,
+        outcome: str,
+        outcome_price: float,
+        pnl_percent: float
+    ):
+        """
+        Update signal with actual outcome.
+
+        Args:
+            signal_id: Signal ID
+            outcome: 'WIN', 'LOSS', or 'PENDING'
+            outcome_price: Price at outcome
+            pnl_percent: Profit/loss percentage
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE signals
+                SET actual_outcome = ?,
+                    outcome_price = ?,
+                    outcome_timestamp = ?,
+                    pnl_percent = ?
+                WHERE id = ?
+            ''', (
+                outcome,
+                outcome_price,
+                datetime.utcnow().isoformat(),
+                pnl_percent,
+                signal_id,
+            ))
+
+    def get_signals(self, limit: int = 50) -> List[Signal]:
+        """
+        Get recent signals.
+
+        Args:
+            limit: Maximum signals to return
+
+        Returns:
+            List of Signal objects
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, datetime, signal_type, strength, confidence, price,
+                       stop_loss, take_profit, atr, actual_outcome, outcome_price,
+                       outcome_timestamp, pnl_percent
+                FROM signals
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+
+            signals = []
+            for row in cursor.fetchall():
+                try:
+                    signal = Signal(
+                        id=row['id'],
+                        timestamp=datetime.fromisoformat(row['datetime']) if row['datetime'] else datetime.utcnow(),
+                        signal_type=SignalType(row['signal_type']) if row['signal_type'] else SignalType.NEUTRAL,
+                        strength=SignalStrength(row['strength']) if row['strength'] else SignalStrength.WEAK,
+                        confidence=row['confidence'] or 0,
+                        price=row['price'] or 0,
+                        stop_loss=row['stop_loss'],
+                        take_profit=row['take_profit'],
+                        atr=row['atr'],
+                        actual_outcome=row['actual_outcome'],
+                        outcome_price=row['outcome_price'],
+                        outcome_timestamp=datetime.fromisoformat(row['outcome_timestamp']) if row['outcome_timestamp'] else None,
+                        pnl_percent=row['pnl_percent'],
+                    )
+                    signals.append(signal)
+                except Exception as e:
+                    logger.debug(f"Error parsing signal: {e}")
+
+            return signals
+
+    def get_pending_signals(self) -> List[Signal]:
+        """Get signals that haven't been resolved yet."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, datetime, signal_type, strength, confidence, price,
+                       stop_loss, take_profit, atr
+                FROM signals
+                WHERE actual_outcome IS NULL OR actual_outcome = 'PENDING'
+                ORDER BY timestamp DESC
+            ''')
+
+            signals = []
+            for row in cursor.fetchall():
+                try:
+                    signal = Signal(
+                        id=row['id'],
+                        timestamp=datetime.fromisoformat(row['datetime']),
+                        signal_type=SignalType(row['signal_type']),
+                        strength=SignalStrength(row['strength']),
+                        confidence=row['confidence'],
+                        price=row['price'],
+                        stop_loss=row['stop_loss'],
+                        take_profit=row['take_profit'],
+                        atr=row['atr'],
+                        actual_outcome='PENDING',
+                    )
+                    signals.append(signal)
+                except Exception as e:
+                    logger.debug(f"Error parsing signal: {e}")
+
+            return signals
+
+    def get_signal_count(self) -> int:
+        """Get total number of signals."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM signals")
+            return cursor.fetchone()[0]
+
+    # =========================================================================
+    # PERFORMANCE TRACKING
+    # =========================================================================
+
+    def save_trade_result(self, result: TradeResult) -> int:
+        """Save trade result to database."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trade_results
+                (signal_id, entry_price, entry_time, exit_price, exit_time,
+                 direction, stop_loss, take_profit, hit_target, hit_stop,
+                 pnl_percent, pnl_absolute)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                result.signal_id,
+                result.entry_price,
+                result.entry_time.isoformat(),
+                result.exit_price,
+                result.exit_time.isoformat(),
+                result.direction.value,
+                result.stop_loss,
+                result.take_profit,
+                int(result.hit_target),
+                int(result.hit_stop),
+                result.pnl_percent,
+                result.pnl_absolute,
+            ))
+            return cursor.lastrowid
+
+    def get_trade_results(self, limit: int = 100) -> List[Dict]:
+        """Get recent trade results."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM trade_results
+                ORDER BY id DESC
+                LIMIT ?
+            ''', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """
+        Get overall trading performance statistics.
+
+        Returns:
+            Dict with win rate, total trades, average PnL, etc.
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            # Get signals with outcomes
+            cursor.execute('''
+                SELECT actual_outcome, pnl_percent
+                FROM signals
+                WHERE actual_outcome IN ('WIN', 'LOSS')
+            ''')
+
+            outcomes = cursor.fetchall()
+
+            if not outcomes:
+                return {
+                    'total_signals': self.get_signal_count(),
+                    'resolved_trades': 0,
+                    'win_rate': 0,
+                    'avg_pnl': 0,
+                    'total_pnl': 0,
+                    'winners': 0,
+                    'losers': 0,
+                }
+
+            winners = sum(1 for o in outcomes if o['actual_outcome'] == 'WIN')
+            losers = sum(1 for o in outcomes if o['actual_outcome'] == 'LOSS')
+            total = winners + losers
+
+            pnls = [o['pnl_percent'] for o in outcomes if o['pnl_percent'] is not None]
+            avg_pnl = sum(pnls) / len(pnls) if pnls else 0
+            total_pnl = sum(pnls)
+
+            return {
+                'total_signals': self.get_signal_count(),
+                'resolved_trades': total,
+                'win_rate': winners / total if total > 0 else 0,
+                'avg_pnl': avg_pnl,
+                'total_pnl': total_pnl,
+                'winners': winners,
+                'losers': losers,
+            }
+
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+
+    def close(self):
+        """Close database connection."""
+        if hasattr(self._local, 'connection') and self._local.connection:
+            self._local.connection.close()
+            self._local.connection = None
+
+    def clear_old_data(self, days: int = 365):
+        """Remove data older than specified days."""
+        cutoff = int((datetime.utcnow().timestamp() - days * 86400) * 1000)
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM candles WHERE timestamp < ?", (cutoff,))
+            deleted = cursor.rowcount
+            logger.info(f"Deleted {deleted} old candles")
