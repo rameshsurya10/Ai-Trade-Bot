@@ -9,30 +9,22 @@ Modules:
 - core: Configuration, database, types, logging
 - data: WebSocket and polling data feeds
 - analysis_engine: Feature engineering and ML predictions
-- multi_symbol_engine: Multi-symbol analysis
+- multi_currency_system: Multi-currency trading with auto-learning
 - signal_service: Signal filtering and management
 - notifier: Multi-channel notifications
-- backtesting: Strategy validation against historical data
-- tracking: Real-time performance monitoring
-- paper_trading: Simulated trading for testing
-- monitoring: Prometheus metrics and health checks
+- math_engine: Advanced mathematical algorithms
+- advanced_predictor: Fourier, Kalman, Monte Carlo predictions
 
 Usage:
 ------
     from src import DataService, AnalysisEngine, SignalService
     from src.core import Config, Database
-    from src.data import HybridDataService, create_websocket_feed
-    from src.backtesting import BacktestEngine
-    from src.paper_trading import PaperTradingEngine
-    from src.monitoring import metrics, start_metrics_server
+    from src.multi_currency_system import MultiCurrencySystem
 
 Quick Start:
 ------------
     # Run analysis
     python run_analysis.py
-
-    # Run backtest
-    python scripts/run_backtest.py
 
     # Start dashboard
     streamlit run dashboard.py
@@ -47,8 +39,8 @@ from .analysis_engine import AnalysisEngine, FeatureCalculator, LSTMModel
 from .signal_service import SignalService
 from .notifier import Notifier
 
-# New multi-symbol engine
-from .multi_symbol_engine import MultiSymbolEngine, SymbolPrediction
+# Multi-currency system with auto-learning
+from .multi_currency_system import MultiCurrencySystem, CurrencyConfig, PerformanceStats
 
 # Utilities (kept for backward compatibility)
 from .utils import (
@@ -73,9 +65,10 @@ __all__ = [
     "LSTMModel",
     "SignalService",
     "Notifier",
-    # Multi-symbol
-    "MultiSymbolEngine",
-    "SymbolPrediction",
+    # Multi-currency
+    "MultiCurrencySystem",
+    "CurrencyConfig",
+    "PerformanceStats",
     # Utils
     "load_config",
     "get_config_value",

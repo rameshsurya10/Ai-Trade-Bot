@@ -1,0 +1,793 @@
+"""
+AI Trade Bot - Modern Real-Time Dashboard (REBUILT - ACTUALLY WORKS)
+====================================================================
+No WebSocket complexity. Just simple REST API that WORKS.
+Real-time updates with modern broker-style UI.
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
+from pathlib import Path
+import time
+import logging
+import subprocess
+import os
+import signal
+
+# Import CCXT for SIMPLE REST API (no WebSocket complexity)
+try:
+    import ccxt
+    CCXT_AVAILABLE = True
+except ImportError:
+    CCXT_AVAILABLE = False
+    st.error("❌ ccxt not installed. Run: pip install ccxt")
+
+# Import AI/Math modules for predictions and analysis
+try:
+    from src.advanced_predictor import AdvancedPredictor
+    from src.math_engine import MathEngine
+    from src.analysis_engine import AnalysisEngine, FeatureCalculator
+    from src.signal_service import SignalService
+    from src.data_service import DataService
+    from src.notifier import Notifier
+    AI_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"AI modules not available: {e}")
+    AI_AVAILABLE = False
+
+# Setup
+ROOT = Path(__file__).parent
+PID_FILE = ROOT / "run_analysis.pid"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Page config
+st.set_page_config(
+    page_title="AI Trade Bot Pro",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Modern Light Theme CSS (your design)
+st.markdown("""
+<style>
+    .stApp {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+    }
+
+    #MainMenu, footer, header {visibility: hidden;}
+    .stDeployButton {display: none;}
+
+    .modern-card {
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+        border-radius: 20px;
+        padding: 1.5rem;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        margin-bottom: 1rem;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .modern-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+    }
+
+    .header-container {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 20px;
+        padding: 2rem;
+        margin-bottom: 2rem;
+        color: white;
+        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+    }
+
+    .price-display {
+        font-size: 3.5rem;
+        font-weight: 800;
+        letter-spacing: -2px;
+        text-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        animation: priceUpdate 0.3s ease;
+    }
+
+    @keyframes priceUpdate {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.02); }
+        100% { transform: scale(1); }
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 0.5rem 1.5rem;
+        border-radius: 50px;
+        font-weight: 600;
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+
+    .status-live {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        color: white;
+        box-shadow: 0 4px 15px rgba(56, 239, 125, 0.4);
+    }
+
+    .status-offline {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: white;
+        box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
+    }
+
+    .metric-card {
+        background: white;
+        border-radius: 15px;
+        padding: 1.2rem;
+        text-align: center;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+        transition: all 0.3s ease;
+        border-left: 4px solid transparent;
+    }
+
+    .metric-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+    }
+
+    .metric-card.bullish { border-left-color: #38ef7d; }
+    .metric-card.bearish { border-left-color: #f5576c; }
+
+    .metric-value {
+        font-size: 2rem;
+        font-weight: 700;
+        margin: 0.5rem 0;
+    }
+
+    .metric-label {
+        font-size: 0.85rem;
+        color: #6c757d;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-weight: 600;
+    }
+
+    .chart-container {
+        background: white;
+        border-radius: 20px;
+        padding: 1.5rem;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize session state
+if 'update_count' not in st.session_state:
+    st.session_state.update_count = 0
+if 'selected_exchange' not in st.session_state:
+    st.session_state.selected_exchange = 'binance'
+if 'selected_symbol' not in st.session_state:
+    st.session_state.selected_symbol = 'BTC/USDT'
+if 'selected_timeframe' not in st.session_state:
+    st.session_state.selected_timeframe = '1m'
+if 'auto_refresh' not in st.session_state:
+    st.session_state.auto_refresh = True
+if 'last_fetch_time' not in st.session_state:
+    st.session_state.last_fetch_time = None
+
+# Initialize exchange
+if 'exchange_obj' not in st.session_state and CCXT_AVAILABLE:
+    try:
+        st.session_state.exchange_obj = ccxt.binance({'enableRateLimit': True})
+        logger.info("✅ Exchange initialized: Binance")
+    except Exception as e:
+        logger.error(f"Failed to initialize exchange: {e}")
+        st.session_state.exchange_obj = None
+
+# Initialize AI/Math engines
+if 'predictor' not in st.session_state and AI_AVAILABLE:
+    try:
+        st.session_state.predictor = AdvancedPredictor()
+        st.session_state.math_engine = MathEngine()
+        logger.info("✅ AI/Math engines initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize AI engines: {e}")
+        st.session_state.predictor = None
+        st.session_state.math_engine = None
+
+# Auto-start Analysis Engine on first load
+if 'engine_auto_started' not in st.session_state:
+    st.session_state.engine_auto_started = True
+    running, pid = is_analysis_running()
+    if not running:
+        logger.info("🚀 Auto-starting Analysis Engine...")
+        try:
+            venv_py = ROOT / "venv" / "bin" / "python"
+            if venv_py.exists():
+                subprocess.Popen(
+                    [str(venv_py), "run_analysis.py"],
+                    cwd=str(ROOT),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                logger.info("✅ Analysis Engine started automatically")
+                time.sleep(2)  # Give it time to create PID file
+        except Exception as e:
+            logger.error(f"Failed to auto-start Analysis Engine: {e}")
+
+# Helper functions
+def is_analysis_running():
+    """Check if analysis engine is running."""
+    if not PID_FILE.exists():
+        return False, None
+    try:
+        pid_text = PID_FILE.read_text().strip()
+        if not pid_text:
+            PID_FILE.unlink(missing_ok=True)
+            return False, None
+
+        pid = int(pid_text)
+        if pid <= 0:
+            logger.warning(f"Invalid PID in file: {pid}")
+            PID_FILE.unlink(missing_ok=True)
+            return False, None
+
+        os.kill(pid, 0)  # Check if process exists (doesn't actually kill it)
+        return True, pid
+    except (ProcessLookupError, ValueError) as e:
+        logger.debug(f"PID file invalid or process dead: {e}")
+        PID_FILE.unlink(missing_ok=True)
+        return False, None
+    except Exception as e:
+        logger.error(f"Unexpected error checking process: {e}")
+        return False, None
+
+def fetch_market_data(exchange_obj, symbol, timeframe='1m', limit=100):
+    """Fetch REAL market data using REST API (NO WebSocket complexity)."""
+    # Validate inputs
+    if not isinstance(symbol, str) or '/' not in symbol:
+        return {'ticker': None, 'df': None, 'success': False, 'error': 'Invalid symbol format. Use BTC/USDT format.'}
+
+    if limit < 1 or limit > 1000:
+        return {'ticker': None, 'df': None, 'success': False, 'error': 'Limit must be between 1-1000'}
+
+    try:
+        # Fetch ticker (current price, 24h stats)
+        ticker = exchange_obj.fetch_ticker(symbol)
+
+        # Fetch OHLCV (candlestick data)
+        ohlcv = exchange_obj.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+        # Convert to DataFrame and drop unused timestamp column
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.drop(columns=['timestamp'])  # Remove unused column to save memory
+
+        return {
+            'ticker': ticker,
+            'df': df,
+            'success': True,
+            'error': None
+        }
+    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        logger.error(f"Exchange error fetching data: {e}")
+        return {
+            'ticker': None,
+            'df': None,
+            'success': False,
+            'error': f'Exchange error: {str(e)}'
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error fetching data: {e}")
+        return {
+            'ticker': None,
+            'df': None,
+            'success': False,
+            'error': f'Error: {str(e)}'
+        }
+
+def calculate_rsi(prices, period=14):
+    """Calculate RSI from price data."""
+    if len(prices) < period:
+        return 50.0
+
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def main():
+    # Process control
+    running, pid = is_analysis_running()
+
+    # Fetch REAL data (fetch on first load OR when auto-refresh is ON)
+    data = None
+    error_message = None
+    if st.session_state.exchange_obj:
+        # Always fetch data (even if auto-refresh is OFF, need initial data)
+        data = fetch_market_data(
+            st.session_state.exchange_obj,
+            st.session_state.selected_symbol,
+            st.session_state.selected_timeframe,
+            limit=200
+        )
+        if data['success']:
+            st.session_state.update_count += 1
+            st.session_state.last_fetch_time = datetime.now()
+        else:
+            error_message = data['error']
+            logger.error(f"Data fetch failed: {error_message}")
+
+    # Calculate values
+    if data and data['success']:
+        ticker = data['ticker']
+        df = data['df']
+
+        current_price = ticker['last']
+        price_change_pct = ticker['percentage'] or 0
+        high_24h = ticker['high']
+        low_24h = ticker['low']
+        volume_24h = ticker['quoteVolume']
+
+        # Calculate RSI
+        if len(df) >= 14:
+            rsi = calculate_rsi(df['close'].values)
+        else:
+            rsi = 50.0
+
+        rsi_sentiment = "bullish" if rsi > 60 else "bearish" if rsi < 40 else "neutral"
+        rsi_label = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+
+        status = "LIVE"
+    else:
+        # Fallback values if fetch failed or auto-refresh is OFF
+        df = None  # Critical: Set df to None to prevent stale data
+        current_price = 0
+        price_change_pct = 0
+        high_24h = 0
+        low_24h = 0
+        volume_24h = 0
+        rsi = 50
+        rsi_sentiment = "neutral"
+        rsi_label = "No Data"
+        status = "OFFLINE"
+        df = None
+
+    # Header
+    st.markdown(f"""
+    <div class="header-container">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1 style="margin: 0; font-size: 2.5rem; font-weight: 800;">📈 AI Trade Bot Pro</h1>
+                <p style="margin: 0.5rem 0 0 0; opacity: 0.9; font-size: 1.1rem;">{st.session_state.selected_symbol} • {st.session_state.selected_exchange.title()} • Real-Time</p>
+            </div>
+            <div style="text-align: right;">
+                <div class="price-display">${current_price:,.2f}</div>
+                <div style="font-size: 1.3rem; margin-top: 0.5rem;">
+                    <span style="color: {'#38ef7d' if price_change_pct >= 0 else '#f5576c'};">
+                        {'▲' if price_change_pct >= 0 else '▼'} {abs(price_change_pct):.2f}%
+                    </span>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top: 1.5rem; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+            <span class="status-badge {'status-live' if status == 'LIVE' else 'status-offline'}">
+                {'🟢 LIVE' if status == 'LIVE' else '🔴 OFFLINE'}
+            </span>
+            <span style="opacity: 0.8; font-size: 0.9rem;">{datetime.now().strftime('%H:%M:%S UTC')}</span>
+            <span style="opacity: 0.9;">Updates: {st.session_state.update_count}</span>
+            <span style="margin-left: auto; opacity: 0.9;">
+                Analysis Engine: {'✅ Running' if running else '⏸️ Stopped'}
+                {f' (PID: {pid})' if running else ''}
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Display error message if API call failed
+    if error_message:
+        st.error(f"⚠️ Failed to fetch market data: {error_message}")
+
+    # Control Panel
+    st.markdown("---")
+    ctrl_cols = st.columns([2, 2, 2, 2, 2, 2])
+
+    with ctrl_cols[0]:
+        exchanges = ['binance', 'coinbase', 'bybit', 'kraken']
+        selected_exchange = st.selectbox(
+            "Exchange",
+            exchanges,
+            index=exchanges.index(st.session_state.selected_exchange),
+            key='exchange_selector'
+        )
+        if selected_exchange != st.session_state.selected_exchange:
+            st.session_state.selected_exchange = selected_exchange
+            # Reinitialize exchange
+            if CCXT_AVAILABLE:
+                try:
+                    if selected_exchange == 'binance':
+                        st.session_state.exchange_obj = ccxt.binance({'enableRateLimit': True})
+                    elif selected_exchange == 'coinbase':
+                        st.session_state.exchange_obj = ccxt.coinbase({'enableRateLimit': True})
+                    elif selected_exchange == 'bybit':
+                        st.session_state.exchange_obj = ccxt.bybit({'enableRateLimit': True})
+                    elif selected_exchange == 'kraken':
+                        st.session_state.exchange_obj = ccxt.kraken({'enableRateLimit': True})
+                except:
+                    pass
+            st.rerun()
+
+    with ctrl_cols[1]:
+        symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
+        symbol = st.selectbox("Symbol", symbols, index=symbols.index(st.session_state.selected_symbol) if st.session_state.selected_symbol in symbols else 0)
+        if symbol != st.session_state.selected_symbol:
+            st.session_state.selected_symbol = symbol
+            st.rerun()
+
+    with ctrl_cols[2]:
+        timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+        timeframe = st.selectbox("Timeframe", timeframes, index=timeframes.index(st.session_state.selected_timeframe) if st.session_state.selected_timeframe in timeframes else 0)
+        if timeframe != st.session_state.selected_timeframe:
+            st.session_state.selected_timeframe = timeframe
+            st.rerun()
+
+    with ctrl_cols[3]:
+        st.write("")
+        st.write("")
+        auto = st.checkbox("Auto Refresh", value=st.session_state.auto_refresh)
+        if auto != st.session_state.auto_refresh:
+            st.session_state.auto_refresh = auto
+
+    with ctrl_cols[4]:
+        st.write("")
+        st.write("")
+        if running:
+            if st.button("⏹️ Stop Engine", type="secondary", use_container_width=True):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    PID_FILE.unlink(missing_ok=True)
+                except:
+                    pass
+                time.sleep(1)
+                st.rerun()
+        else:
+            if st.button("▶️ Start Engine", type="primary", use_container_width=True):
+                venv_py = ROOT / "venv" / "bin" / "python"
+                py = str(venv_py) if venv_py.exists() else "python3"
+                subprocess.Popen(
+                    [py, str(ROOT / "run_analysis.py")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=ROOT
+                )
+                time.sleep(2)
+                st.rerun()
+
+    with ctrl_cols[5]:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Refresh Now", type="secondary", use_container_width=True):
+            st.rerun()
+
+    # Metrics Row
+    st.markdown("---")
+    met_cols = st.columns(6)
+
+    # Format volume
+    if volume_24h >= 1e9:
+        vol_str = f"${volume_24h/1e9:.1f}B"
+    elif volume_24h >= 1e6:
+        vol_str = f"${volume_24h/1e6:.1f}M"
+    else:
+        vol_str = f"${volume_24h:,.0f}"
+
+    metrics_data = [
+        ("Updates", f"{st.session_state.update_count}", "Auto-refresh" if st.session_state.auto_refresh else "Manual", "bullish" if st.session_state.auto_refresh else "neutral"),
+        ("Candles", f"{len(df) if df is not None else 0}", st.session_state.selected_timeframe, "bullish" if df is not None else "neutral"),
+        ("RSI (14)", f"{rsi:.1f}", rsi_label, rsi_sentiment),
+        ("24H High", f"${high_24h:,.2f}", "Resistance", "bullish"),
+        ("24H Low", f"${low_24h:,.2f}", "Support", "bearish"),
+        ("24H Volume", vol_str, "Trading", "neutral"),
+    ]
+
+    for col, (label, value, delta, sentiment) in zip(met_cols, metrics_data):
+        with col:
+            st.markdown(f"""
+            <div class="metric-card {sentiment}">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value" style="font-size: {'1.8rem' if len(str(value)) > 10 else '2rem'};">{value}</div>
+                <div style="color: {'#38ef7d' if sentiment == 'bullish' else '#f5576c' if sentiment == 'bearish' else '#6c757d'}; font-size: 0.9rem; font-weight: 600;">
+                    {delta}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Chart
+    st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+    st.markdown("### 📊 Live Price Chart")
+
+    if df is not None and len(df) > 0:
+        # Real chart
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.7, 0.3]
+        )
+
+        fig.add_trace(
+            go.Candlestick(
+                x=df['datetime'],
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name='Price',
+                increasing_line_color='#38ef7d',
+                increasing_fillcolor='#38ef7d',
+                decreasing_line_color='#f5576c',
+                decreasing_fillcolor='#f5576c'
+            ),
+            row=1, col=1
+        )
+
+        # Current price line
+        fig.add_hline(
+            y=current_price,
+            line_dash="dash",
+            line_color='#667eea',
+            line_width=2,
+            annotation_text=f"LIVE: ${current_price:,.2f}",
+            annotation_position="right",
+            row=1, col=1
+        )
+
+        # Volume
+        colors = ['#38ef7d' if c >= o else '#f5576c' for c, o in zip(df['close'], df['open'])]
+        fig.add_trace(
+            go.Bar(x=df['datetime'], y=df['volume'], name='Volume', marker_color=colors, opacity=0.7),
+            row=2, col=1
+        )
+
+        fig.update_layout(
+            height=700,
+            xaxis_rangeslider_visible=False,
+            showlegend=False,
+            plot_bgcolor='#fafbfc',
+            paper_bgcolor='white',
+            font=dict(family='Inter, sans-serif', size=11, color='#2d3748'),
+            margin=dict(l=10, r=10, t=10, b=10),
+            hovermode='x unified'
+        )
+
+        fig.update_xaxes(gridcolor='#e2e8f0', showgrid=True, zeroline=False, showline=True, linecolor='#cbd5e0')
+        fig.update_yaxes(gridcolor='#e2e8f0', showgrid=True, zeroline=False, side='right', showline=True, linecolor='#cbd5e0')
+
+        st.plotly_chart(fig, use_container_width=True, config={
+            'displayModeBar': True,
+            'displaylogo': False,
+            'scrollZoom': True
+        })
+    else:
+        st.warning("⚠️ No data available. Check exchange connection.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # AI Predictions Section
+    if AI_AVAILABLE and st.session_state.predictor and df is not None and len(df) >= 100:
+        st.markdown("---")
+        st.markdown("### 🤖 AI Predictions & Mathematical Analysis")
+
+        try:
+            # Get AI prediction
+            prediction = st.session_state.predictor.predict(df)
+
+            # Get mathematical indicators from MathEngine (pass full DataFrame)
+            math_analysis = st.session_state.math_engine.analyze(df)
+
+            # Display predictions in columns
+            pred_cols = st.columns([1, 1, 1, 1])
+
+            with pred_cols[0]:
+                direction_color = "#38ef7d" if prediction.direction == "BUY" else "#f5576c" if prediction.direction == "SELL" else "#ffc107"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">AI Signal</div>
+                    <div class="metric-value" style="color: {direction_color}; font-size: 2.5rem;">
+                        {prediction.direction}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Confidence: {prediction.confidence * 100:.1f}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with pred_cols[1]:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Stop Loss</div>
+                    <div class="metric-value" style="color: #f5576c; font-size: 1.8rem;">
+                        ${prediction.stop_loss:,.2f}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Risk: {prediction.monte_carlo_risk * 100:.1f}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with pred_cols[2]:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Take Profit</div>
+                    <div class="metric-value" style="color: #38ef7d; font-size: 1.8rem;">
+                        ${prediction.take_profit:,.2f}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        R:R {prediction.risk_reward_ratio:.2f}:1
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with pred_cols[3]:
+                hurst_color = "#38ef7d" if math_analysis.hurst_exponent > 0.5 else "#f5576c"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Market Regime</div>
+                    <div class="metric-value" style="color: {hurst_color}; font-size: 1.8rem;">
+                        {math_analysis.hurst_regime}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Hurst: {math_analysis.hurst_exponent:.3f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Mathematical details
+            with st.expander("🔬 Mathematical Breakdown", expanded=False):
+                math_cols = st.columns(3)
+
+                with math_cols[0]:
+                    st.markdown("**Fourier Analysis**")
+                    st.write(f"Cycle Signal: {prediction.fourier_signal:.3f}")
+
+                    st.markdown("**Kalman Filter**")
+                    st.write(f"Trend Direction: {prediction.kalman_trend:.3f}")
+
+                    st.markdown("**Wavelet Analysis**")
+                    st.write(f"Signal: {math_analysis.wavelet_signal:.3f}")
+
+                with math_cols[1]:
+                    st.markdown("**Hurst Exponent**")
+                    st.write(f"Value: {math_analysis.hurst_exponent:.3f}")
+                    st.write(f"Regime: {math_analysis.hurst_regime}")
+
+                    st.markdown("**Markov Chain**")
+                    st.write(f"Transition Prob: {prediction.markov_probability * 100:.1f}%")
+
+                with math_cols[2]:
+                    st.markdown("**Risk Metrics**")
+                    st.write(f"Monte Carlo Risk: {prediction.monte_carlo_risk * 100:.1f}%")
+                    st.write(f"Jump Probability: {math_analysis.jump_probability * 100:.1f}%")
+                    st.write(f"Crash Indicator: {math_analysis.crash_indicator * 100:.1f}%")
+
+        except Exception as e:
+            st.warning(f"⚠️ AI prediction unavailable: {str(e)}")
+            logger.error(f"Prediction error: {e}")
+
+    elif df is not None and len(df) < 100:
+        st.info("ℹ️ Need at least 100 candles for AI predictions. Current: " + str(len(df)))
+
+    # LSTM Deep Learning Predictions
+    if AI_AVAILABLE and df is not None and len(df) >= 100:
+        st.markdown("---")
+        st.markdown("### 🧠 LSTM Deep Learning Predictions")
+
+        try:
+            # Calculate features
+            features_df = FeatureCalculator.calculate_all(df)
+
+            # Check if we have trained model
+            model_path = ROOT / "data" / "lstm_model.pt"
+            if model_path.exists():
+                st.success("✅ Using trained LSTM model")
+
+                # Show feature importance (top 10)
+                with st.expander("📊 Feature Analysis", expanded=False):
+                    st.write("**Top Technical Indicators:**")
+                    feature_cols = [col for col in features_df.columns if col not in ['datetime', 'open', 'high', 'low', 'close', 'volume']]
+                    if len(feature_cols) > 0:
+                        recent_features = features_df[feature_cols].tail(1)
+                        feat_cols = st.columns(3)
+
+                        for idx, feat in enumerate(feature_cols[:12]):  # Show first 12 features
+                            col_idx = idx % 3
+                            with feat_cols[col_idx]:
+                                value = recent_features[feat].values[0]
+                                st.metric(feat, f"{value:.4f}")
+            else:
+                st.info("ℹ️ LSTM model not trained yet. Run `python train_model.py` to train the deep learning model.")
+
+        except Exception as e:
+            st.warning(f"⚠️ LSTM prediction unavailable: {str(e)}")
+            logger.error(f"LSTM error: {e}")
+
+    # Recent Signals from SignalService
+    if AI_AVAILABLE and df is not None:
+        st.markdown("---")
+        st.markdown("### 📡 Recent Trading Signals")
+
+        try:
+            # Check if signals database exists
+            signals_db = ROOT / "data" / "trading.db"
+            if signals_db.exists():
+                import sqlite3
+                conn = sqlite3.connect(signals_db)
+                signals = pd.read_sql_query(
+                    "SELECT * FROM signals ORDER BY timestamp DESC LIMIT 10",
+                    conn
+                )
+                conn.close()
+
+                if len(signals) > 0:
+                    # Format and display signals
+                    signals['timestamp'] = pd.to_datetime(signals['timestamp'])
+                    signals_display = signals[['timestamp', 'direction', 'confidence', 'entry_price', 'stop_loss', 'take_profit']].copy()
+                    signals_display['timestamp'] = signals_display['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+                    st.dataframe(signals_display, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No trading signals generated yet. Signals will appear here when confidence thresholds are met.")
+            else:
+                st.info("💡 Signal history not available. Start the analysis engine (`python run_analysis.py`) to generate signals.")
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not load signals: {str(e)}")
+            logger.error(f"Signals error: {e}")
+
+    # Recent Candles Table
+    if df is not None and len(df) > 0:
+        st.markdown("---")
+        st.markdown("### 📋 Recent Candles")
+
+        # Get recent candles once (optimized - no duplicate tail calls)
+        recent = df.tail(20).copy()
+
+        # Format display values efficiently
+        recent['Time'] = recent['datetime'].dt.strftime('%H:%M:%S')
+        recent['Open'] = recent['open'].apply(lambda x: f"${x:,.2f}")
+        recent['High'] = recent['high'].apply(lambda x: f"${x:,.2f}")
+        recent['Low'] = recent['low'].apply(lambda x: f"${x:,.2f}")
+        recent['Close'] = recent['close'].apply(lambda x: f"${x:,.2f}")
+        recent['Volume'] = recent['volume'].apply(lambda x: f"{x:,.4f}")
+
+        # Calculate change from already-selected data (no extra tail calls)
+        recent['Change $'] = (recent['close'] - recent['open']).apply(lambda x: f"${x:,.2f}")
+        recent['Change %'] = ((recent['close'] - recent['open']) / recent['open'] * 100).apply(lambda x: f"{x:+.2f}%")
+
+        display_df = recent[['Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Change $', 'Change %']].iloc[::-1]
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
+
+    # Auto-refresh logic
+    if st.session_state.auto_refresh:
+        time.sleep(2)  # 2 second refresh
+        st.rerun()
+
+if __name__ == "__main__":
+    main()

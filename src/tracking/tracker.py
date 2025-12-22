@@ -11,13 +11,13 @@ Monitors each signal and updates its outcome when:
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 import threading
 import time
 
 import pandas as pd
 
-from src.core.types import Signal, SignalType, SignalStrength
+from src.core.types import Signal, SignalType
 from src.core.config import Config
 from src.core.database import Database
 

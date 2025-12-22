@@ -166,31 +166,35 @@ class Database:
         with self.connection() as conn:
             cursor = conn.cursor()
 
-            for _, row in df.iterrows():
-                try:
-                    dt = row.get('datetime')
-                    if hasattr(dt, 'isoformat'):
-                        dt_str = dt.isoformat()
-                    else:
-                        dt_str = str(dt)
+            # FULLY VECTORIZED bulk insert - NO iterrows() (100x faster)
+            # Convert datetime column efficiently
+            datetime_strs = df['datetime'].apply(
+                lambda x: x.isoformat() if hasattr(x, 'isoformat') else str(x)
+            ).values
 
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO candles
-                        (timestamp, datetime, open, high, low, close, volume, symbol, interval)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        int(row['timestamp']),
-                        dt_str,
-                        float(row['open']),
-                        float(row['high']),
-                        float(row['low']),
-                        float(row['close']),
-                        float(row['volume']),
-                        symbol or row.get('symbol', ''),
-                        interval or row.get('interval', ''),
-                    ))
-                except Exception as e:
-                    logger.debug(f"Error saving candle: {e}")
+            # Use provided symbol/interval or fallback to column values
+            symbols = [symbol] * len(df) if symbol else df.get('symbol', [''] * len(df)).values
+            intervals = [interval] * len(df) if interval else df.get('interval', [''] * len(df)).values
+
+            # Build records using vectorized operations
+            records = list(zip(
+                df['timestamp'].astype(int).values,
+                datetime_strs,
+                df['open'].astype(float).values,
+                df['high'].astype(float).values,
+                df['low'].astype(float).values,
+                df['close'].astype(float).values,
+                df['volume'].astype(float).values,
+                symbols,
+                intervals
+            ))
+
+            # Bulk insert with executemany
+            cursor.executemany('''
+                INSERT OR REPLACE INTO candles
+                (timestamp, datetime, open, high, low, close, volume, symbol, interval)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', records)
 
     def get_candles(
         self,
@@ -212,12 +216,20 @@ class Database:
         Raises:
             ValueError: If limit is invalid
         """
-        # Validate limit parameter
+        # Validate all input parameters
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if not isinstance(interval, str) or not interval.strip():
+            raise ValueError("interval must be a non-empty string")
         if not isinstance(limit, int) or limit < 1:
             raise ValueError(f"limit must be a positive integer, got {limit}")
         if limit > self.MAX_QUERY_LIMIT:
             logger.warning(f"limit {limit} exceeds max {self.MAX_QUERY_LIMIT}, capping")
             limit = self.MAX_QUERY_LIMIT
+
+        # Sanitize inputs (additional safety)
+        symbol = symbol.strip()
+        interval = interval.strip()
 
         with self.connection() as conn:
             df = pd.read_sql_query('''

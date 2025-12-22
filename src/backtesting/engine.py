@@ -11,19 +11,18 @@ Simple Flow:
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.core.types import Signal, SignalType, SignalStrength, TradeResult
+from src.core.types import SignalType, SignalStrength
 from src.core.config import Config
 from src.analysis_engine import AnalysisEngine, FeatureCalculator
 from .metrics import BacktestMetrics, calculate_metrics

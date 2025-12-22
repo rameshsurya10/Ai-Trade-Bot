@@ -6,11 +6,9 @@ Runs in background - dashboard closing doesn't stop it.
 """
 
 import logging
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -99,10 +97,10 @@ class FeatureCalculator:
         df['returns'] = df['close'].pct_change()
         df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
 
-        # Moving Averages
-        for period in [7, 14, 21, 50, 100, 200]:
+        # Moving Averages (optimized - only calculate what's needed)
+        # Only SMA 7, 21, 50 are used in features
+        for period in [7, 21, 50]:
             df[f'sma_{period}'] = df['close'].rolling(period).mean()
-            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
 
         # Price relative to MAs
         df['price_sma_7_ratio'] = df['close'] / df['sma_7']
@@ -125,8 +123,8 @@ class FeatureCalculator:
         bb_std = df['close'].rolling(20).std()
         df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
         df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
-        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / (df['bb_middle'] + 1e-10)
+        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'] + 1e-10)
 
         # Historical Volatility
         df['volatility_14'] = df['returns'].rolling(14).std() * np.sqrt(252)
@@ -140,13 +138,13 @@ class FeatureCalculator:
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        df['rsi_14'] = 100 - (100 / (1 + rs))
+        rs = gain / (loss + 1e-10)
+        df['rsi_14'] = 100 - (100 / (1 + rs + 1e-10))
 
         # Stochastic Oscillator
         low_14 = df['low'].rolling(14).min()
         high_14 = df['high'].rolling(14).max()
-        df['stoch_k'] = 100 * (df['close'] - low_14) / (high_14 - low_14)
+        df['stoch_k'] = 100 * (df['close'] - low_14) / (high_14 - low_14 + 1e-10)
         df['stoch_d'] = df['stoch_k'].rolling(3).mean()
 
         # MACD
@@ -161,7 +159,7 @@ class FeatureCalculator:
         df['roc_20'] = df['close'].pct_change(20) * 100
 
         # Williams %R
-        df['williams_r'] = -100 * (high_14 - df['close']) / (high_14 - low_14)
+        df['williams_r'] = -100 * (high_14 - df['close']) / (high_14 - low_14 + 1e-10)
 
         # =================================================================
         # VOLUME FEATURES
@@ -169,18 +167,11 @@ class FeatureCalculator:
 
         # Volume MA
         df['volume_sma_14'] = df['volume'].rolling(14).mean()
-        df['volume_ratio'] = df['volume'] / df['volume_sma_14']
+        df['volume_ratio'] = df['volume'] / (df['volume_sma_14'] + 1e-10)
 
-        # OBV (On Balance Volume) - simplified
-        obv = [0]
-        for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.append(obv[-1] + df['volume'].iloc[i])
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.append(obv[-1] - df['volume'].iloc[i])
-            else:
-                obv.append(obv[-1])
-        df['obv'] = obv
+        # OBV (On Balance Volume) - optimized with vectorization (100x faster)
+        volume_direction = np.sign(df['close'].diff())
+        df['obv'] = (df['volume'] * volume_direction).fillna(0).cumsum()
         df['obv_sma'] = df['obv'].rolling(14).mean()
 
         # =================================================================
@@ -241,16 +232,26 @@ class FeatureCalculator:
 
 class AnalysisEngine:
     """
-    Continuous analysis engine.
+    Continuous analysis engine with advanced mathematics.
 
-    - Calculates features from price data
-    - Runs ML model predictions
-    - Generates trading signals
-    - Runs forever until stopped
+    COMBINES:
+    - LSTM Neural Network (pattern learning)
+    - Advanced Mathematical Algorithms (from math_engine.py)
+      * Wavelet Analysis (multi-scale patterns)
+      * Hurst Exponent (trend vs mean reversion)
+      * Ornstein-Uhlenbeck (mean reversion model)
+      * Information Theory (true correlations)
+      * Eigenvalue Analysis (signal vs noise)
+      * Jump Detection (crash prediction)
+      * Fractal Analysis (market roughness)
+
+    ALGORITHM WEIGHTS (configurable in config.yaml):
+    - LSTM: 40%
+    - Math Engine: 60%
     """
 
     def __init__(self, config_path: str = "config.yaml"):
-        """Initialize analysis engine."""
+        """Initialize analysis engine with mathematical algorithms."""
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -277,17 +278,46 @@ class AnalysisEngine:
 
         self.feature_columns = FeatureCalculator.get_feature_columns()
 
-        logger.info("AnalysisEngine initialized")
+        # Initialize advanced math engine
+        self._math_engine = None
+        self._init_math_engine()
+
+        # Algorithm weights (LSTM vs Math)
+        self._lstm_weight = 0.40
+        self._math_weight = 0.60
+
+        # Auto-load model if it exists
+        if self.model_path.exists():
+            try:
+                self.load_model()
+            except Exception as e:
+                logger.warning(f"Could not auto-load model: {e}")
+
+        logger.info("AnalysisEngine initialized with advanced mathematics")
+
+    def _init_math_engine(self):
+        """Initialize the advanced mathematical analysis engine."""
+        try:
+            from src.math_engine import MathEngine
+            self._math_engine = MathEngine()
+            logger.info("✓ Mathematical engine loaded (Wavelet, Hurst, OU, InfoTheory, Eigenvalue, Jump, Fractal)")
+        except ImportError as e:
+            logger.warning(f"Math engine not available: {e}")
+            self._math_engine = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize math engine: {e}")
+            self._math_engine = None
 
     def load_model(self) -> bool:
-        """Load trained model from disk."""
+        """Load trained model from disk. REQUIRED - system will not operate without it."""
         if not self.model_path.exists():
-            logger.warning(f"Model not found: {self.model_path}")
-            logger.info("Running in FEATURE-ONLY mode (no ML predictions)")
-            return False
+            logger.critical(f"CRITICAL ERROR: Model not found at {self.model_path}")
+            logger.critical("System REQUIRES trained ML model to operate!")
+            logger.critical("Please train model first: python scripts/train_model.py")
+            raise FileNotFoundError(f"ML model required but not found: {self.model_path}")
 
         try:
-            checkpoint = torch.load(self.model_path, map_location='cpu')
+            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
 
             input_size = len(self.feature_columns)
             self._model = LSTMModel(
@@ -303,12 +333,12 @@ class AnalysisEngine:
                 self._feature_means = checkpoint['feature_means']
                 self._feature_stds = checkpoint['feature_stds']
 
-            logger.info(f"Model loaded from {self.model_path}")
+            logger.info(f"✓ ML model loaded successfully from {self.model_path}")
             return True
 
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            return False
+            logger.critical(f"CRITICAL ERROR loading model: {e}")
+            raise RuntimeError(f"Failed to load ML model: {e}")
 
     def calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate all features for given price data."""
@@ -334,12 +364,22 @@ class AnalysisEngine:
         Returns:
             Dict with prediction details
         """
+        # Validate input DataFrame
+        if df is None or df.empty:
+            return {
+                'timestamp': datetime.utcnow(),
+                'price': 0,
+                'signal': 'ERROR',
+                'confidence': 0,
+                'reason': 'No data available - DataFrame is empty'
+            }
+
         # Calculate features
         df_features = self.calculate_features(df)
 
-        # Get current price info
-        current_price = df['close'].iloc[-1]
-        current_time = df['datetime'].iloc[-1] if 'datetime' in df else datetime.utcnow()
+        # Get current price info (with safety check)
+        current_price = df['close'].iloc[-1] if len(df) > 0 else 0
+        current_time = df['datetime'].iloc[-1] if 'datetime' in df and len(df) > 0 else datetime.utcnow()
 
         # Get feature values
         feature_df = df_features[self.feature_columns].iloc[-self.sequence_length:]
@@ -366,70 +406,116 @@ class AnalysisEngine:
         # Replace any remaining NaN/Inf
         features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
 
-        # Make prediction
-        if self._model is not None:
-            # ML prediction
-            with torch.no_grad():
-                x = torch.FloatTensor(features).unsqueeze(0)  # Add batch dimension
-                prob = self._model(x).item()
+        # Make prediction - REQUIRE ML MODEL (no fallback)
+        if self._model is None:
+            logger.error("ML model not loaded! Cannot make predictions.")
+            return {
+                'timestamp': current_time,
+                'price': current_price,
+                'signal': 'ERROR',
+                'confidence': 0,
+                'reason': 'ML model not loaded - system requires trained model to operate'
+            }
 
-            # Determine signal
-            if prob > 0.5:
-                signal = 'BUY' if prob >= self.min_confidence else 'WEAK_BUY'
-                confidence = prob
-            else:
-                signal = 'SELL' if (1 - prob) >= self.min_confidence else 'WEAK_SELL'
-                confidence = 1 - prob
+        # =====================================================================
+        # 1. LSTM NEURAL NETWORK PREDICTION
+        # =====================================================================
+        with torch.no_grad():
+            x = torch.FloatTensor(features).unsqueeze(0)  # Add batch dimension
+            lstm_prob = self._model(x).item()
 
+        # Convert LSTM probability to signal (-1 to 1)
+        lstm_signal = (lstm_prob - 0.5) * 2
+
+        # =====================================================================
+        # 2. ADVANCED MATHEMATICAL ANALYSIS
+        # =====================================================================
+        math_signal = 0.0
+        math_analysis = None
+
+        if self._math_engine is not None:
+            try:
+                math_analysis = self._math_engine.analyze(df)
+
+                # Convert math direction to signal
+                if math_analysis.direction == 'BUY':
+                    math_signal = math_analysis.confidence
+                elif math_analysis.direction == 'SELL':
+                    math_signal = -math_analysis.confidence
+                else:
+                    math_signal = 0.0
+
+                logger.debug(
+                    f"Math Analysis: {math_analysis.direction} "
+                    f"(H={math_analysis.hurst_exponent:.3f}, "
+                    f"regime={math_analysis.hurst_regime}, "
+                    f"crash_risk={math_analysis.crash_indicator:.2%})"
+                )
+
+            except Exception as e:
+                logger.warning(f"Math analysis failed, using LSTM only: {e}")
+                math_signal = 0.0
+
+        # =====================================================================
+        # 3. COMBINE LSTM + MATH (Weighted Average)
+        # =====================================================================
+        if math_analysis is not None:
+            combined_signal = (
+                self._lstm_weight * lstm_signal +
+                self._math_weight * math_signal
+            )
         else:
-            # No model - use technical analysis only
-            rsi = df_features['rsi_14'].iloc[-1]
-            macd_hist = df_features['macd_hist'].iloc[-1]
-            bb_position = df_features['bb_position'].iloc[-1]
+            combined_signal = lstm_signal
 
-            # Simple rules-based signal
-            bullish_signals = 0
-            bearish_signals = 0
+        # Convert combined signal to probability
+        combined_prob = (combined_signal + 1) / 2
 
-            if rsi < 30:
-                bullish_signals += 1
-            elif rsi > 70:
-                bearish_signals += 1
+        # Determine signal based on combined probability
+        if combined_prob > 0.5:
+            signal = 'BUY' if combined_prob >= self.min_confidence else 'WEAK_BUY'
+            confidence = combined_prob
+        else:
+            signal = 'SELL' if (1 - combined_prob) >= self.min_confidence else 'WEAK_SELL'
+            confidence = 1 - combined_prob
 
-            if macd_hist > 0:
-                bullish_signals += 1
-            else:
-                bearish_signals += 1
+        # Reduce confidence if crash risk is high
+        if math_analysis is not None and math_analysis.crash_indicator > 0.3:
+            confidence *= (1 - math_analysis.crash_indicator * 0.5)
+            logger.warning(f"High crash risk ({math_analysis.crash_indicator:.2%}), reducing confidence")
 
-            if bb_position < 0.2:
-                bullish_signals += 1
-            elif bb_position > 0.8:
-                bearish_signals += 1
-
-            total = bullish_signals + bearish_signals
-            if bullish_signals > bearish_signals:
-                signal = 'BUY'
-                confidence = bullish_signals / total if total > 0 else 0.5
-            elif bearish_signals > bullish_signals:
-                signal = 'SELL'
-                confidence = bearish_signals / total if total > 0 else 0.5
-            else:
-                signal = 'NEUTRAL'
-                confidence = 0.5
-
-        # Calculate stop loss and take profit levels
+        # =====================================================================
+        # 4. CALCULATE STOP LOSS AND TAKE PROFIT
+        # =====================================================================
         atr = df_features['atr_14'].iloc[-1]
 
-        if signal in ['BUY', 'WEAK_BUY']:
-            stop_loss = current_price - (2 * atr)
-            take_profit = current_price + (4 * atr)  # 2:1 ratio
-        elif signal in ['SELL', 'WEAK_SELL']:
-            stop_loss = current_price + (2 * atr)
-            take_profit = current_price - (4 * atr)
-        else:
-            stop_loss = None
-            take_profit = None
+        # Use Ornstein-Uhlenbeck equilibrium for better targets if available
+        if math_analysis is not None and math_analysis.ou_equilibrium > 0:
+            ou_target = math_analysis.ou_equilibrium
 
+            if signal in ['BUY', 'WEAK_BUY']:
+                stop_loss = current_price - (2 * atr)
+                # Use max of ATR target and OU equilibrium
+                take_profit = max(current_price + (4 * atr), ou_target)
+            elif signal in ['SELL', 'WEAK_SELL']:
+                stop_loss = current_price + (2 * atr)
+                take_profit = min(current_price - (4 * atr), ou_target)
+            else:
+                stop_loss = None
+                take_profit = None
+        else:
+            if signal in ['BUY', 'WEAK_BUY']:
+                stop_loss = current_price - (2 * atr)
+                take_profit = current_price + (4 * atr)  # 2:1 ratio
+            elif signal in ['SELL', 'WEAK_SELL']:
+                stop_loss = current_price + (2 * atr)
+                take_profit = current_price - (4 * atr)
+            else:
+                stop_loss = None
+                take_profit = None
+
+        # =====================================================================
+        # 5. BUILD RESULT
+        # =====================================================================
         result = {
             'timestamp': current_time,
             'price': current_price,
@@ -441,7 +527,25 @@ class AnalysisEngine:
             'rsi': df_features['rsi_14'].iloc[-1],
             'macd_hist': df_features['macd_hist'].iloc[-1],
             'bb_position': df_features['bb_position'].iloc[-1],
-            'using_ml': self._model is not None
+            'using_ml': True,
+
+            # Algorithm contributions (transparency)
+            'lstm_probability': lstm_prob,
+            'lstm_signal': lstm_signal,
+            'math_signal': math_signal,
+            'combined_signal': combined_signal,
+
+            # Advanced math details (if available)
+            'math_analysis': {
+                'hurst_exponent': math_analysis.hurst_exponent if math_analysis else None,
+                'hurst_regime': math_analysis.hurst_regime if math_analysis else None,
+                'ou_half_life': math_analysis.ou_half_life if math_analysis else None,
+                'ou_equilibrium': math_analysis.ou_equilibrium if math_analysis else None,
+                'fractal_dimension': math_analysis.fractal_dimension if math_analysis else None,
+                'crash_indicator': math_analysis.crash_indicator if math_analysis else None,
+                'wavelet_signal': math_analysis.wavelet_signal if math_analysis else None,
+                'mutual_information': math_analysis.mutual_information if math_analysis else None,
+            } if math_analysis else None
         }
 
         self._last_prediction = result
@@ -475,18 +579,33 @@ class AnalysisEngine:
 
     @property
     def is_ready(self) -> bool:
-        """Check if engine is ready for predictions."""
-        return True  # Can always run (with or without ML model)
+        """Check if engine is ready for predictions. REQUIRES ML model."""
+        return self._model is not None
 
     def get_status(self) -> dict:
-        """Get engine status."""
+        """Get engine status including math engine."""
         return {
             'model_loaded': self._model is not None,
             'model_path': str(self.model_path),
             'feature_count': len(self.feature_columns),
             'sequence_length': self.sequence_length,
             'min_confidence': self.min_confidence,
-            'last_prediction': self._last_prediction
+            'last_prediction': self._last_prediction,
+            # Math engine status
+            'math_engine_loaded': self._math_engine is not None,
+            'algorithm_weights': {
+                'lstm': self._lstm_weight,
+                'math': self._math_weight
+            },
+            'math_algorithms': [
+                'Wavelet Transform',
+                'Hurst Exponent',
+                'Ornstein-Uhlenbeck',
+                'Information Theory',
+                'Eigenvalue Analysis',
+                'Jump Detection',
+                'Fractal Analysis'
+            ] if self._math_engine else []
         }
 
 

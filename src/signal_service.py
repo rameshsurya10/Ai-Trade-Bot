@@ -149,35 +149,34 @@ class SignalService:
         return False
 
     def _save_signal(self, signal: dict):
-        """Save signal to database."""
+        """Save signal to database with proper connection cleanup."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Use context manager for automatic cleanup (security fix)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-            timestamp = signal.get('timestamp')
-            if hasattr(timestamp, 'timestamp'):
-                ts = int(timestamp.timestamp() * 1000)
-                dt = timestamp.isoformat()
-            else:
-                ts = int(datetime.utcnow().timestamp() * 1000)
-                dt = str(timestamp)
+                timestamp = signal.get('timestamp')
+                if hasattr(timestamp, 'timestamp'):
+                    ts = int(timestamp.timestamp() * 1000)
+                    dt = timestamp.isoformat()
+                else:
+                    ts = int(datetime.utcnow().timestamp() * 1000)
+                    dt = str(timestamp)
 
-            cursor.execute('''
-                INSERT INTO signals
-                (timestamp, datetime, signal, confidence, price, stop_loss, take_profit)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                ts,
-                dt,
-                f"{signal['strength']}_{signal['signal']}",
-                signal['confidence'],
-                signal['price'],
-                signal.get('stop_loss'),
-                signal.get('take_profit')
-            ))
-
-            conn.commit()
-            conn.close()
+                cursor.execute('''
+                    INSERT INTO signals
+                    (timestamp, datetime, signal, confidence, price, stop_loss, take_profit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    ts,
+                    dt,
+                    f"{signal['strength']}_{signal['signal']}",
+                    signal['confidence'],
+                    signal['price'],
+                    signal.get('stop_loss'),
+                    signal.get('take_profit')
+                ))
+                # Commit is automatic on successful context exit
 
         except Exception as e:
             logger.error(f"Error saving signal: {e}")

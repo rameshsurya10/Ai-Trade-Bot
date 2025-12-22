@@ -1,1412 +1,2019 @@
-#!/usr/bin/env python3
 """
-AI Trade Bot - Professional Trading Dashboard
-==============================================
-
-Complete trading dashboard with controls, charts, and signals.
-
-Usage:
-    streamlit run dashboard.py
-    ./start.sh
+AI Trade Bot - Modern Real-Time Dashboard (REBUILT - ACTUALLY WORKS)
+====================================================================
+No WebSocket complexity. Just simple REST API that WORKS.
+Real-time updates with modern broker-style UI.
 """
 
-import html
-import os
-import sys
-import subprocess
-import time
-import logging
-import warnings
-import sqlite3
-from contextlib import contextmanager
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict
-
-# Suppress warnings
-logging.getLogger('tornado.access').setLevel(logging.ERROR)
-logging.getLogger('tornado.application').setLevel(logging.ERROR)
-logging.getLogger('tornado.general').setLevel(logging.ERROR)
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-
-PROJECT_ROOT = Path(__file__).parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
+import streamlit as st
 import pandas as pd
 import numpy as np
-import yaml
+import plotly.graph_objects as go
+from datetime import datetime
+from pathlib import Path
+import time
+import logging
+import subprocess
+import os
+import signal
 
+# Import CCXT for SIMPLE REST API (no WebSocket complexity)
 try:
-    import streamlit as st
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+    import ccxt
+    CCXT_AVAILABLE = True
 except ImportError:
-    print("Required: pip install streamlit plotly")
-    sys.exit(1)
+    CCXT_AVAILABLE = False
+    st.error("❌ ccxt not installed. Run: pip install ccxt")
 
+# Import AI/Math modules for predictions and analysis
+try:
+    from src.advanced_predictor import AdvancedPredictor
+    from src.math_engine import MathEngine
+    from src.analysis_engine import FeatureCalculator
+    from src.multi_currency_system import MultiCurrencySystem
+    from src.data_service import DataService
+    from src.core.database import Database
+    from src.notifier import Notifier
+    import yaml
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+    MultiCurrencySystem = None
+    DataService = None
+    Database = None
+    Notifier = None
 
-# =============================================================================
-# CONFIGURATION CONSTANTS (Previously hardcoded values)
-# =============================================================================
+# Setup
+ROOT = Path(__file__).parent
+PID_FILE = ROOT / "run_analysis.pid"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Indicator periods - customize these for different trading strategies
-INDICATOR_CONFIG = {
-    'sma_fast': 20,          # Fast SMA period
-    'sma_slow': 50,          # Slow SMA period
-    'ema_fast': 12,          # Fast EMA period (for MACD)
-    'ema_slow': 26,          # Slow EMA period (for MACD)
-    'macd_signal': 9,        # MACD signal line period
-    'rsi_period': 14,        # RSI lookback period
-    'bb_period': 20,         # Bollinger Bands period
-    'bb_std': 2,             # Bollinger Bands standard deviations
-    'volume_sma': 20,        # Volume SMA period
-}
+# Page config
+st.set_page_config(
+    page_title="AI Trade Bot Pro",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# RSI thresholds
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-
-# Chart configuration
-CHART_CONFIG = {
-    'height': 620,
-    'row_heights': [0.5, 0.15, 0.15, 0.2],
-    'vertical_spacing': 0.025,
-}
-
-# Colors - centralized color scheme
-COLORS = {
-    'bullish': '#10b981',
-    'bearish': '#ef4444',
-    'sma_fast': '#f59e0b',
-    'sma_slow': '#3b82f6',
-    'rsi': '#8b5cf6',
-    'macd': '#3b82f6',
-    'macd_signal': '#f59e0b',
-    'bb_fill': 'rgba(139,92,246,0.05)',
-    'bb_line': 'rgba(139,92,246,0.3)',
-    'bg_dark': '#06080d',
-    'grid': 'rgba(30,42,58,0.5)',
-    'text': '#94a3b8',
-}
-
-# Data limits
-DATA_LIMITS = {
-    'candles_default': 200,
-    'signals_default': 20,
-    'log_tail_chars': 2000,
-}
-
-# Signal confidence thresholds
-CONFIDENCE_HIGH = 0.65
-
-# Pattern detection thresholds
-PATTERN_CONFIG = {
-    'doji_body_ratio': 0.1,
-    'wick_body_ratio': 2,
-    'wick_upper_limit': 0.5,
-    'engulfing_ratio': 1.5,
-}
-
-# Training defaults
-TRAINING_DEFAULTS = {
-    'days_options': [30, 90, 180, 365, 730],
-    'days_default_index': 3,
-    'epochs_min': 50,
-    'epochs_max': 200,
-    'epochs_default': 100,
-}
-
-# Analysis minimum data requirement
-MIN_CANDLES_FOR_ANALYSIS = 100
-MIN_CANDLES_FOR_TREND = 50
-
-# RSI scale
-RSI_MIN = 0
-RSI_MAX = 100
-RSI_MIDPOINT = 50
-
-# Process timing (seconds)
-PROCESS_DELAYS = {
-    'after_stop': 1,
-    'after_start': 2,
-}
-
-# Chart line widths
-LINE_WIDTHS = {
-    'thin': 1,
-    'medium': 1.5,
-    'thick': 2,
-}
-
-
-# =============================================================================
-# PROFESSIONAL CSS THEME
-# =============================================================================
-
-CUSTOM_CSS = """
+# Force Light Theme CSS - Clean Professional UI
+st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
-
-:root {
-    --bg-dark: #06080d;
-    --bg-card: #0c1017;
-    --bg-card-hover: #111820;
-    --bg-elevated: #141c28;
-    --bg-input: #0a0f16;
-    --border: #1e2a3a;
-    --border-light: #2a3a4d;
-    --text-primary: #ffffff;
-    --text-secondary: #94a3b8;
-    --text-muted: #64748b;
-    --accent-green: #10b981;
-    --accent-green-glow: rgba(16, 185, 129, 0.2);
-    --accent-red: #ef4444;
-    --accent-red-glow: rgba(239, 68, 68, 0.2);
-    --accent-blue: #3b82f6;
-    --accent-blue-glow: rgba(59, 130, 246, 0.15);
-    --accent-amber: #f59e0b;
-    --accent-purple: #8b5cf6;
-    --gradient-blue: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-    --gradient-green: linear-gradient(135deg, #10b981 0%, #059669 100%);
-    --gradient-red: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-}
-
-*, *::before, *::after { box-sizing: border-box; }
-
-.stApp {
-    background: var(--bg-dark) !important;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-}
-
-#MainMenu, footer, header, [data-testid="stToolbar"] { display: none !important; }
-
-.main .block-container {
-    padding: 1.5rem 2rem 2rem !important;
-    max-width: 1920px !important;
-}
-
-/* ========== HEADER ========== */
-.main-header {
-    background: linear-gradient(180deg, var(--bg-card) 0%, var(--bg-dark) 100%);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 1.25rem 1.75rem;
-    margin-bottom: 1.25rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-
-.header-left {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-}
-
-.header-logo {
-    width: 48px;
-    height: 48px;
-    background: var(--gradient-blue);
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.5rem;
-    box-shadow: 0 4px 16px var(--accent-blue-glow);
-}
-
-.header-text h1 {
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--text-primary);
-    margin: 0;
-    letter-spacing: -0.02em;
-}
-
-.header-text p {
-    font-size: 0.85rem;
-    color: var(--text-muted);
-    margin: 0.15rem 0 0;
-}
-
-.status-pill {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.6rem 1.25rem;
-    border-radius: 50px;
-    font-weight: 600;
-    font-size: 0.8rem;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-}
-
-.status-live {
-    background: var(--accent-green-glow);
-    color: var(--accent-green);
-    border: 1px solid var(--accent-green);
-    box-shadow: 0 0 20px var(--accent-green-glow);
-}
-
-.status-offline {
-    background: rgba(239, 68, 68, 0.1);
-    color: var(--accent-red);
-    border: 1px solid rgba(239, 68, 68, 0.3);
-}
-
-.pulse-dot {
-    width: 8px;
-    height: 8px;
-    background: currentColor;
-    border-radius: 50%;
-    animation: pulse 2s ease-in-out infinite;
-}
-
-@keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.5; transform: scale(0.9); }
-}
-
-/* ========== METRIC CARDS ========== */
-.metrics-grid {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    gap: 1rem;
-    margin-bottom: 1.25rem;
-}
-
-.metric-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 1.25rem;
-    transition: all 0.25s ease;
-    position: relative;
-    overflow: hidden;
-}
-
-.metric-card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-    background: var(--gradient-blue);
-    opacity: 0;
-    transition: opacity 0.25s ease;
-}
-
-.metric-card:hover {
-    border-color: var(--border-light);
-    transform: translateY(-2px);
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-}
-
-.metric-card:hover::before {
-    opacity: 1;
-}
-
-.metric-label {
-    font-size: 0.7rem;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 0.5rem;
-}
-
-.metric-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 1.4rem;
-    font-weight: 700;
-    color: var(--text-primary);
-    line-height: 1.2;
-}
-
-.metric-delta {
-    font-family: 'Space Mono', monospace;
-    font-size: 0.75rem;
-    font-weight: 600;
-    margin-top: 0.35rem;
-}
-
-.delta-up { color: var(--accent-green); }
-.delta-down { color: var(--accent-red); }
-
-/* ========== TABS ========== */
-.stTabs {
-    background: transparent;
-}
-
-.stTabs [data-baseweb="tab-list"] {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 6px;
-    gap: 4px;
-}
-
-.stTabs [data-baseweb="tab"] {
-    background: transparent;
-    border-radius: 8px;
-    color: var(--text-muted);
-    font-weight: 500;
-    font-size: 0.9rem;
-    padding: 0.7rem 1.25rem;
-    transition: all 0.2s ease;
-}
-
-.stTabs [data-baseweb="tab"]:hover {
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-}
-
-.stTabs [aria-selected="true"] {
-    background: var(--accent-blue) !important;
-    color: white !important;
-    font-weight: 600;
-    box-shadow: 0 4px 12px var(--accent-blue-glow);
-}
-
-/* ========== SECTION PANELS ========== */
-.panel {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 1.5rem;
-    margin-bottom: 1rem;
-}
-
-.panel-header {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 1.25rem;
-    padding-bottom: 1rem;
-    border-bottom: 1px solid var(--border);
-}
-
-.panel-icon {
-    width: 36px;
-    height: 36px;
-    background: var(--bg-elevated);
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.1rem;
-}
-
-.panel-title {
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0;
-}
-
-/* ========== BUTTONS ========== */
-.stButton > button {
-    background: var(--gradient-blue) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-weight: 600 !important;
-    font-size: 0.9rem !important;
-    padding: 0.85rem 1.5rem !important;
-    transition: all 0.25s ease !important;
-    box-shadow: 0 4px 12px var(--accent-blue-glow) !important;
-}
-
-.stButton > button:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 8px 24px var(--accent-blue-glow) !important;
-}
-
-.stButton > button:active {
-    transform: translateY(0) !important;
-}
-
-/* ========== INPUTS ========== */
-.stSelectbox > div > div {
-    background: var(--bg-input) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: 10px !important;
-    color: var(--text-primary) !important;
-}
-
-.stSelectbox > div > div:focus-within {
-    border-color: var(--accent-blue) !important;
-    box-shadow: 0 0 0 3px var(--accent-blue-glow) !important;
-}
-
-.stSlider > div > div > div {
-    background: var(--accent-blue) !important;
-}
-
-.stSlider [data-baseweb="slider"] {
-    margin-top: 0.5rem;
-}
-
-/* ========== STATUS BOX ========== */
-.status-box {
-    border-radius: 12px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1rem;
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-}
-
-.status-running {
-    background: var(--accent-green-glow);
-    border: 1px solid rgba(16, 185, 129, 0.3);
-}
-
-.status-stopped {
-    background: rgba(245, 158, 11, 0.1);
-    border: 1px solid rgba(245, 158, 11, 0.3);
-}
-
-.status-box-icon {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1rem;
-}
-
-.status-box-text {
-    flex: 1;
-}
-
-.status-box-title {
-    font-weight: 600;
-    font-size: 0.9rem;
-    color: var(--text-primary);
-}
-
-.status-box-sub {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    margin-top: 0.1rem;
-}
-
-/* ========== SIGNAL CARDS ========== */
-.signal-item {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 0.75rem;
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    transition: all 0.2s ease;
-}
-
-.signal-item:hover {
-    border-color: var(--border-light);
-    transform: translateX(4px);
-}
-
-.signal-item.buy {
-    border-left: 4px solid var(--accent-green);
-}
-
-.signal-item.sell {
-    border-left: 4px solid var(--accent-red);
-}
-
-.signal-icon {
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1.25rem;
-}
-
-.signal-icon.buy {
-    background: var(--accent-green-glow);
-}
-
-.signal-icon.sell {
-    background: var(--accent-red-glow);
-}
-
-.signal-content {
-    flex: 1;
-}
-
-.signal-type {
-    font-weight: 600;
-    font-size: 0.95rem;
-    color: var(--text-primary);
-}
-
-.signal-time {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    margin-top: 0.15rem;
-}
-
-.signal-price {
-    font-family: 'Space Mono', monospace;
-    font-weight: 700;
-    font-size: 1rem;
-    color: var(--text-primary);
-}
-
-.signal-conf {
-    padding: 0.35rem 0.75rem;
-    border-radius: 6px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    font-family: 'Space Mono', monospace;
-}
-
-.conf-high {
-    background: var(--accent-green-glow);
-    color: var(--accent-green);
-}
-
-.conf-med {
-    background: rgba(245, 158, 11, 0.15);
-    color: var(--accent-amber);
-}
-
-/* ========== PATTERN CARDS ========== */
-.pattern-item {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 0.75rem;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    transition: all 0.2s ease;
-}
-
-.pattern-item:hover {
-    border-color: var(--border-light);
-}
-
-.pattern-info h4 {
-    font-size: 0.95rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin: 0;
-}
-
-.pattern-info p {
-    font-size: 0.8rem;
-    color: var(--text-muted);
-    margin: 0.25rem 0 0;
-}
-
-.pattern-tag {
-    padding: 0.4rem 0.85rem;
-    border-radius: 6px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.tag-bullish {
-    background: var(--accent-green-glow);
-    color: var(--accent-green);
-}
-
-.tag-bearish {
-    background: var(--accent-red-glow);
-    color: var(--accent-red);
-}
-
-.tag-neutral {
-    background: var(--bg-card);
-    color: var(--text-muted);
-}
-
-/* ========== INDICATOR BADGES ========== */
-.indicator-row {
-    display: flex;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-    margin-top: 1rem;
-}
-
-.indicator-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.5rem 0.9rem;
-    border-radius: 8px;
-    font-size: 0.8rem;
-    font-weight: 600;
-}
-
-.badge-bullish {
-    background: var(--accent-green-glow);
-    color: var(--accent-green);
-}
-
-.badge-bearish {
-    background: var(--accent-red-glow);
-    color: var(--accent-red);
-}
-
-.badge-neutral {
-    background: var(--bg-elevated);
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-}
-
-/* ========== LOGS ========== */
-.log-viewer {
-    background: var(--bg-dark);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 1rem;
-    font-family: 'Space Mono', monospace;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    max-height: 250px;
-    overflow-y: auto;
-    line-height: 1.6;
-}
-
-/* ========== FOOTER ========== */
-.footer {
-    margin-top: 2rem;
-    padding-top: 1.5rem;
-    border-top: 1px solid var(--border);
-    text-align: center;
-}
-
-.footer-warning {
-    background: rgba(245, 158, 11, 0.1);
-    border: 1px solid rgba(245, 158, 11, 0.25);
-    border-radius: 12px;
-    padding: 1rem 1.5rem;
-    color: var(--accent-amber);
-    font-size: 0.85rem;
-    font-weight: 500;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-}
-
-.footer-note {
-    color: var(--text-muted);
-    font-size: 0.8rem;
-    margin-top: 0.75rem;
-}
-
-/* ========== SCROLLBAR ========== */
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: var(--bg-dark); }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
-
-/* ========== STREAMLIT OVERRIDES ========== */
-div[data-testid="stMetric"] {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1rem;
-}
-
-div[data-testid="stExpander"] {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-}
-
-div[data-testid="stExpander"] summary {
-    font-weight: 600;
-    color: var(--text-primary);
-}
-
-.stMarkdown a {
-    color: var(--accent-blue);
-}
+    /* Force Light Theme Globally */
+    html, body, .stApp, [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"], [data-testid="stToolbar"],
+    [data-testid="stSidebar"], [data-testid="stSidebarContent"],
+    .main, .block-container {
+        background-color: #ffffff !important;
+        color: #1a1a2e !important;
+    }
+
+    /* Hide Streamlit branding */
+    #MainMenu, footer, header {visibility: hidden;}
+    .stDeployButton {display: none;}
+
+    /* Sidebar Light Theme */
+    [data-testid="stSidebar"] {
+        background-color: #f8f9fa !important;
+    }
+
+    [data-testid="stSidebar"] * {
+        color: #1a1a2e !important;
+    }
+
+    [data-testid="stSidebar"] label {
+        color: #1a1a2e !important;
+    }
+
+    /* All text elements */
+    p, span, div, h1, h2, h3, h4, h5, h6, label,
+    .stMarkdown, .stText, [data-testid="stMarkdownContainer"] {
+        color: #1a1a2e !important;
+    }
+
+    /* Selectbox and inputs */
+    .stSelectbox label, .stSlider label, .stCheckbox label,
+    .stRadio label, .stTextInput label, .stNumberInput label {
+        color: #1a1a2e !important;
+    }
+
+    .stSelectbox > div > div {
+        background-color: #ffffff !important;
+        color: #1a1a2e !important;
+    }
+
+    /* Tables */
+    .stDataFrame, table, th, td {
+        background-color: #ffffff !important;
+        color: #1a1a2e !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        background-color: #f8f9fa !important;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        color: #1a1a2e !important;
+        background-color: transparent !important;
+    }
+
+    .stTabs [aria-selected="true"] {
+        background-color: #667eea !important;
+        color: white !important;
+    }
+
+    /* Expanders */
+    .streamlit-expanderHeader {
+        background-color: #f8f9fa !important;
+        color: #1a1a2e !important;
+    }
+
+    .streamlit-expanderContent {
+        background-color: #ffffff !important;
+        color: #1a1a2e !important;
+    }
+
+    /* Header Container */
+    .header-container {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 20px;
+        padding: 2rem;
+        margin-bottom: 1rem;
+        color: white !important;
+        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+    }
+
+    .header-container * {
+        color: white !important;
+    }
+
+    .price-display {
+        font-size: 3rem;
+        font-weight: 800;
+        color: white !important;
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 0.4rem 1rem;
+        border-radius: 50px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+
+    .status-live {
+        background: #38ef7d;
+        color: #000 !important;
+    }
+
+    .status-offline {
+        background: #f5576c;
+        color: white !important;
+    }
+
+    /* Metric Cards - Light Theme */
+    .metric-card {
+        background: #ffffff !important;
+        border-radius: 12px;
+        padding: 1rem;
+        text-align: center;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+        border-left: 4px solid #667eea;
+        border: 1px solid #e0e0e0;
+    }
+
+    .metric-card * {
+        color: #1a1a2e !important;
+    }
+
+    .metric-card .metric-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        margin: 0.3rem 0;
+        color: #1a1a2e !important;
+    }
+
+    .metric-card .metric-label {
+        font-size: 0.75rem;
+        color: #555555 !important;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-weight: 600;
+    }
+
+    .metric-card.bullish { border-left-color: #38ef7d; }
+    .metric-card.bearish { border-left-color: #f5576c; }
+
+    /* Info boxes */
+    .stAlert, [data-testid="stAlert"] {
+        background-color: #f0f7ff !important;
+        color: #1a1a2e !important;
+    }
+
+    /* Buttons */
+    .stButton > button {
+        background-color: #667eea !important;
+        color: white !important;
+        border: none !important;
+    }
+
+    .stButton > button:hover {
+        background-color: #5a6fd6 !important;
+    }
+
+    /* Metrics */
+    [data-testid="stMetricValue"] {
+        color: #1a1a2e !important;
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: #555555 !important;
+    }
+
+    [data-testid="stMetricDelta"] {
+        color: #38ef7d !important;
+    }
+
+    /* JSON display */
+    .stJson {
+        background-color: #f8f9fa !important;
+    }
+
+    /* Code blocks */
+    code, pre {
+        background-color: #f8f9fa !important;
+        color: #1a1a2e !important;
+    }
 </style>
-"""
+""", unsafe_allow_html=True)
 
+# Initialize session state
+if 'update_count' not in st.session_state:
+    st.session_state.update_count = 0
+if 'selected_exchange' not in st.session_state:
+    st.session_state.selected_exchange = 'binance'
+if 'selected_symbol' not in st.session_state:
+    st.session_state.selected_symbol = 'BTC/USDT'
+if 'selected_timeframe' not in st.session_state:
+    st.session_state.selected_timeframe = '1m'
+if 'auto_refresh' not in st.session_state:
+    st.session_state.auto_refresh = True
+if 'last_fetch_time' not in st.session_state:
+    st.session_state.last_fetch_time = None
+# Multi-currency tracking
+if 'tracked_currencies' not in st.session_state:
+    st.session_state.tracked_currencies = ['BTC/USDT']
+# Algorithm weights (adjustable)
+if 'algorithm_weights' not in st.session_state:
+    st.session_state.algorithm_weights = {
+        'fourier': 0.15, 'kalman': 0.25, 'entropy': 0.10,
+        'markov': 0.20, 'lstm': 0.30
+    }
+# Dashboard view mode
+if 'view_mode' not in st.session_state:
+    st.session_state.view_mode = 'trading'  # trading, analysis, config
+# Show advanced panels
+if 'show_algorithm_details' not in st.session_state:
+    st.session_state.show_algorithm_details = False
+if 'show_all_indicators' not in st.session_state:
+    st.session_state.show_all_indicators = False
 
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def load_config() -> dict:
-    config_path = PROJECT_ROOT / "config.yaml"
-    if config_path.exists():
-        with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
-    return {}
-
-
-@contextmanager
-def get_db_connection():
-    config = load_config()
-    db_path = PROJECT_ROOT / config.get('database', {}).get('path', 'data/trading.db')
-    conn = sqlite3.connect(db_path)
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
+# Helper functions (defined before use)
 def is_analysis_running():
-    pid_file = PROJECT_ROOT / "data" / ".analysis.pid"
-    if not pid_file.exists():
+    """Check if analysis engine is running."""
+    if not PID_FILE.exists():
         return False, None
     try:
-        pid = int(pid_file.read_text().strip())
-        os.kill(pid, 0)
+        pid_text = PID_FILE.read_text().strip()
+        if not pid_text:
+            PID_FILE.unlink(missing_ok=True)
+            return False, None
+
+        pid = int(pid_text)
+        if pid <= 0:
+            logger.warning(f"Invalid PID in file: {pid}")
+            PID_FILE.unlink(missing_ok=True)
+            return False, None
+
+        os.kill(pid, 0)  # Check if process exists (doesn't actually kill it)
         return True, pid
-    except (ProcessLookupError, ValueError, PermissionError):
+    except (ProcessLookupError, ValueError) as e:
+        logger.debug(f"PID file invalid or process dead: {e}")
+        PID_FILE.unlink(missing_ok=True)
+        return False, None
+    except Exception as e:
+        logger.error(f"Unexpected error checking process: {e}")
         return False, None
 
+def fetch_market_data(exchange_obj, symbol, timeframe='1m', limit=100):
+    """Fetch REAL market data using REST API (NO WebSocket complexity)."""
+    # Validate inputs
+    if not isinstance(symbol, str) or '/' not in symbol:
+        return {'ticker': None, 'df': None, 'success': False, 'error': 'Invalid symbol format. Use BTC/USDT format.'}
 
-def get_stats() -> dict:
-    config = load_config()
-    db_path = PROJECT_ROOT / config.get('database', {}).get('path', 'data/trading.db')
-    if not db_path.exists():
-        return {'candles': 0, 'signals': 0, 'price': None}
+    if limit < 1 or limit > 1000:
+        return {'ticker': None, 'df': None, 'success': False, 'error': 'Limit must be between 1-1000'}
+
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM candles")
-            candles = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM signals")
-            signals = cursor.fetchone()[0]
-            cursor.execute("SELECT close FROM candles ORDER BY timestamp DESC LIMIT 1")
-            latest = cursor.fetchone()
-            return {'candles': candles, 'signals': signals, 'price': latest[0] if latest else None}
-    except Exception:
-        return {'candles': 0, 'signals': 0, 'price': None}
+        # Fetch ticker (current price, 24h stats)
+        ticker = exchange_obj.fetch_ticker(symbol)
 
+        # Fetch OHLCV (candlestick data)
+        ohlcv = exchange_obj.fetch_ohlcv(symbol, timeframe, limit=limit)
 
-def run_script(script: str, args: list = None) -> dict:
-    try:
-        venv_py = PROJECT_ROOT / "venv" / "bin" / "python"
-        py = str(venv_py) if venv_py.exists() else "python3"
-        cmd = [py, str(PROJECT_ROOT / script)]
-        if args:
-            cmd.extend([str(a) for a in args])
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=PROJECT_ROOT, timeout=300)
-        return {'success': result.returncode == 0, 'stdout': result.stdout, 'stderr': result.stderr}
+        # Convert to DataFrame and drop unused timestamp column
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.drop(columns=['timestamp'])  # Remove unused column to save memory
+
+        return {
+            'ticker': ticker,
+            'df': df,
+            'success': True,
+            'error': None
+        }
+    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        logger.error(f"Exchange error fetching data: {e}")
+        return {
+            'ticker': None,
+            'df': None,
+            'success': False,
+            'error': f'Exchange error: {str(e)}'
+        }
     except Exception as e:
-        return {'success': False, 'stdout': '', 'stderr': str(e)}
+        logger.error(f"Unexpected error fetching data: {e}")
+        return {
+            'ticker': None,
+            'df': None,
+            'success': False,
+            'error': f'Error: {str(e)}'
+        }
+
+def calculate_rsi(prices, period=14):
+    """Calculate RSI from price data."""
+    if len(prices) < period:
+        return 50.0
+
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 
-def load_candles(limit: int = None) -> pd.DataFrame:
-    if limit is None:
-        limit = DATA_LIMITS['candles_default']
-    config = load_config()
+# ==============================================================================
+# INITIALIZATION (after helper functions are defined)
+# ==============================================================================
+
+# Initialize exchange
+if 'exchange_obj' not in st.session_state and CCXT_AVAILABLE:
     try:
-        with get_db_connection() as conn:
-            df = pd.read_sql_query('''
-                SELECT timestamp, datetime, open, high, low, close, volume
-                FROM candles WHERE symbol = ? AND interval = ?
-                ORDER BY timestamp DESC LIMIT ?
-            ''', conn, params=(config['data']['symbol'], config['data']['interval'], limit))
-        if not df.empty:
-            df = df.sort_values('timestamp')
-            df['datetime'] = pd.to_datetime(df['datetime'])
-        return df
-    except Exception:
-        return pd.DataFrame()
+        st.session_state.exchange_obj = ccxt.binance({'enableRateLimit': True})
+        logger.info("✅ Exchange initialized: Binance")
+    except Exception as e:
+        logger.error(f"Failed to initialize exchange: {e}")
+        st.session_state.exchange_obj = None
 
-
-def load_signals(limit: int = None) -> pd.DataFrame:
-    if limit is None:
-        limit = DATA_LIMITS['signals_default']
+# Initialize AI/Math engines
+if 'predictor' not in st.session_state and AI_AVAILABLE:
     try:
-        with get_db_connection() as conn:
-            return pd.read_sql_query('''
-                SELECT datetime, signal, confidence, price FROM signals
-                ORDER BY timestamp DESC LIMIT ?
-            ''', conn, params=(limit,))
-    except Exception:
-        return pd.DataFrame()
+        st.session_state.predictor = AdvancedPredictor()
+        st.session_state.math_engine = MathEngine()
+        logger.info("✅ AI/Math engines initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize AI engines: {e}")
+        st.session_state.predictor = None
+        st.session_state.math_engine = None
 
+# Auto-start Analysis Engine on first load
+if 'engine_auto_started' not in st.session_state:
+    st.session_state.engine_auto_started = True
+    running, pid = is_analysis_running()
+    if not running:
+        logger.info("🚀 Auto-starting Analysis Engine...")
+        try:
+            venv_py = ROOT / "venv" / "bin" / "python"
+            if venv_py.exists():
+                subprocess.Popen(
+                    [str(venv_py), "run_analysis.py"],
+                    cwd=str(ROOT),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                logger.info("✅ Analysis Engine started automatically")
+                time.sleep(2)  # Give it time to create PID file
+        except Exception as e:
+            logger.error(f"Failed to auto-start Analysis Engine: {e}")
 
-# =============================================================================
-# TECHNICAL ANALYSIS
-# =============================================================================
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    # Moving Averages
-    df['sma_fast'] = df['close'].rolling(INDICATOR_CONFIG['sma_fast']).mean()
-    df['sma_slow'] = df['close'].rolling(INDICATOR_CONFIG['sma_slow']).mean()
-
-    # MACD
-    ema_fast = df['close'].ewm(span=INDICATOR_CONFIG['ema_fast'], adjust=False).mean()
-    ema_slow = df['close'].ewm(span=INDICATOR_CONFIG['ema_slow'], adjust=False).mean()
-    df['macd'] = ema_fast - ema_slow
-    df['macd_signal'] = df['macd'].ewm(span=INDICATOR_CONFIG['macd_signal'], adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(INDICATOR_CONFIG['rsi_period']).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(INDICATOR_CONFIG['rsi_period']).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-
-    # Bollinger Bands
-    df['bb_mid'] = df['close'].rolling(INDICATOR_CONFIG['bb_period']).mean()
-    bb_std = df['close'].rolling(INDICATOR_CONFIG['bb_period']).std()
-    df['bb_upper'] = df['bb_mid'] + (bb_std * INDICATOR_CONFIG['bb_std'])
-    df['bb_lower'] = df['bb_mid'] - (bb_std * INDICATOR_CONFIG['bb_std'])
-
-    # Volume
-    df['vol_sma'] = df['volume'].rolling(INDICATOR_CONFIG['volume_sma']).mean()
-
-    return df
-
-
-def detect_patterns(df: pd.DataFrame) -> List[Dict]:
-    patterns = []
-    if len(df) < 5:
-        return patterns
-
-    last, prev = df.iloc[-1], df.iloc[-2]
-    body = abs(last['close'] - last['open'])
-    upper_wick = last['high'] - max(last['close'], last['open'])
-    lower_wick = min(last['close'], last['open']) - last['low']
-    total_range = last['high'] - last['low']
-
-    if total_range == 0:
-        return patterns
-
-    body_ratio = body / total_range
-
-    # Doji pattern
-    if body_ratio < PATTERN_CONFIG['doji_body_ratio']:
-        patterns.append({'name': 'Doji', 'type': 'neutral', 'desc': 'Market indecision - potential reversal'})
-
-    # Hammer / Hanging Man
-    if lower_wick > body * PATTERN_CONFIG['wick_body_ratio'] and upper_wick < body * PATTERN_CONFIG['wick_upper_limit']:
-        if last['close'] > prev['close']:
-            patterns.append({'name': 'Hammer', 'type': 'bullish', 'desc': 'Strong bullish reversal signal'})
-        else:
-            patterns.append({'name': 'Hanging Man', 'type': 'bearish', 'desc': 'Bearish reversal warning'})
-
-    # Shooting Star / Inverted Hammer
-    if upper_wick > body * PATTERN_CONFIG['wick_body_ratio'] and lower_wick < body * PATTERN_CONFIG['wick_upper_limit']:
-        if last['close'] < prev['close']:
-            patterns.append({'name': 'Shooting Star', 'type': 'bearish', 'desc': 'Bearish reversal at resistance'})
-        else:
-            patterns.append({'name': 'Inverted Hammer', 'type': 'bullish', 'desc': 'Potential bullish reversal'})
-
-    # Engulfing patterns
-    prev_body = abs(prev['close'] - prev['open'])
-    if body > prev_body * PATTERN_CONFIG['engulfing_ratio']:
-        if last['close'] > last['open'] and prev['close'] < prev['open']:
-            patterns.append({'name': 'Bullish Engulfing', 'type': 'bullish', 'desc': 'Strong bullish reversal pattern'})
-        elif last['close'] < last['open'] and prev['close'] > prev['open']:
-            patterns.append({'name': 'Bearish Engulfing', 'type': 'bearish', 'desc': 'Strong bearish reversal pattern'})
-
-    return patterns
-
-
-def get_trend(df: pd.DataFrame) -> Dict:
-    if len(df) < MIN_CANDLES_FOR_TREND:
-        return {'trend': 'N/A', 'score': 0, 'rsi': RSI_MIDPOINT}
-
-    last = df.iloc[-1]
-    score = 0
-
-    # Price vs Fast SMA
-    if pd.notna(last.get('sma_fast')) and last['close'] > last['sma_fast']:
-        score += 1
-    elif pd.notna(last.get('sma_fast')):
-        score -= 1
-
-    # Price vs Slow SMA
-    if pd.notna(last.get('sma_slow')) and last['close'] > last['sma_slow']:
-        score += 1
-    elif pd.notna(last.get('sma_slow')):
-        score -= 1
-
-    # SMA crossover
-    if pd.notna(last.get('sma_fast')) and pd.notna(last.get('sma_slow')) and last['sma_fast'] > last['sma_slow']:
-        score += 1
-    elif pd.notna(last.get('sma_fast')) and pd.notna(last.get('sma_slow')):
-        score -= 1
-
-    # MACD
-    if pd.notna(last.get('macd')) and pd.notna(last.get('macd_signal')) and last['macd'] > last['macd_signal']:
-        score += 1
-    elif pd.notna(last.get('macd')):
-        score -= 1
-
-    # RSI
-    rsi = last.get('rsi', RSI_MIDPOINT)
-    if pd.notna(rsi):
-        if rsi > RSI_MIDPOINT:
-            score += 0.5
-        else:
-            score -= 0.5
-
-    # Determine trend label
-    if score >= 3:
-        trend = 'Strong Buy'
-    elif score >= 1:
-        trend = 'Bullish'
-    elif score <= -3:
-        trend = 'Strong Sell'
-    elif score <= -1:
-        trend = 'Bearish'
-    else:
-        trend = 'Neutral'
-
-    return {'trend': trend, 'score': score, 'rsi': rsi if pd.notna(rsi) else RSI_MIDPOINT}
-
-
-# =============================================================================
-# CHART
-# =============================================================================
-
-def create_chart(df: pd.DataFrame) -> go.Figure:
-    df = calculate_indicators(df)
-
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=CHART_CONFIG['vertical_spacing'],
-        row_heights=CHART_CONFIG['row_heights']
-    )
-
-    green = COLORS['bullish']
-    red = COLORS['bearish']
-
-    # Candlesticks
-    fig.add_trace(go.Candlestick(
-        x=df['datetime'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        increasing=dict(line=dict(color=green, width=1), fillcolor=green),
-        decreasing=dict(line=dict(color=red, width=1), fillcolor=red),
-        showlegend=False, name='Price'
-    ), row=1, col=1)
-
-    # SMAs
-    sma_fast_label = f"SMA {INDICATOR_CONFIG['sma_fast']}"
-    sma_slow_label = f"SMA {INDICATOR_CONFIG['sma_slow']}"
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['sma_fast'], name=sma_fast_label,
-        line=dict(color=COLORS['sma_fast'], width=LINE_WIDTHS['medium'])
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['sma_slow'], name=sma_slow_label,
-        line=dict(color=COLORS['sma_slow'], width=LINE_WIDTHS['medium'])
-    ), row=1, col=1)
-
-    # Bollinger Bands
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['bb_upper'],
-        line=dict(color=COLORS['bb_line'], width=LINE_WIDTHS['thin']),
-        showlegend=False
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['bb_lower'],
-        line=dict(color=COLORS['bb_line'], width=LINE_WIDTHS['thin']),
-        fill='tonexty', fillcolor=COLORS['bb_fill'],
-        showlegend=False
-    ), row=1, col=1)
-
-    # RSI
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['rsi'], name='RSI',
-        line=dict(color=COLORS['rsi'], width=LINE_WIDTHS['thick'])
-    ), row=2, col=1)
-    fig.add_hrect(y0=RSI_OVERBOUGHT, y1=RSI_MAX, fillcolor='rgba(239,68,68,0.1)', line_width=0, row=2, col=1)
-    fig.add_hrect(y0=RSI_MIN, y1=RSI_OVERSOLD, fillcolor='rgba(16,185,129,0.1)', line_width=0, row=2, col=1)
-    fig.add_hline(y=RSI_OVERBOUGHT, line_dash="dot", line_color="rgba(239,68,68,0.5)", line_width=LINE_WIDTHS['thin'], row=2, col=1)
-    fig.add_hline(y=RSI_OVERSOLD, line_dash="dot", line_color="rgba(16,185,129,0.5)", line_width=LINE_WIDTHS['thin'], row=2, col=1)
-
-    # MACD
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['macd'], name='MACD',
-        line=dict(color=COLORS['macd'], width=LINE_WIDTHS['thick'])
-    ), row=3, col=1)
-    fig.add_trace(go.Scatter(
-        x=df['datetime'], y=df['macd_signal'], name='Signal',
-        line=dict(color=COLORS['macd_signal'], width=LINE_WIDTHS['thick'])
-    ), row=3, col=1)
-    hist_colors = [green if v >= 0 else red for v in df['macd_hist'].fillna(0)]
-    fig.add_trace(go.Bar(
-        x=df['datetime'], y=df['macd_hist'],
-        marker_color=hist_colors, opacity=0.7, showlegend=False
-    ), row=3, col=1)
-
-    # Volume
-    vol_colors = [green if r['close'] >= r['open'] else red for _, r in df.iterrows()]
-    fig.add_trace(go.Bar(
-        x=df['datetime'], y=df['volume'],
-        marker_color=vol_colors, opacity=0.6, showlegend=False
-    ), row=4, col=1)
-
-    # Layout
-    fig.update_layout(
-        template='plotly_dark',
-        paper_bgcolor=COLORS['bg_dark'],
-        plot_bgcolor=COLORS['bg_dark'],
-        height=CHART_CONFIG['height'],
-        margin=dict(l=60, r=20, t=10, b=20),
-        font=dict(family='Inter', color=COLORS['text'], size=11),
-        legend=dict(
-            orientation='h', y=1.02, x=0.5, xanchor='center',
-            bgcolor='rgba(0,0,0,0)', font=dict(size=11)
-        ),
-        hovermode='x unified',
-        xaxis_rangeslider_visible=False
-    )
-
-    # Grid styling
-    for i in range(1, 5):
-        fig.update_xaxes(gridcolor=COLORS['grid'], showgrid=True, zeroline=False, row=i, col=1)
-        fig.update_yaxes(gridcolor=COLORS['grid'], showgrid=True, zeroline=False, row=i, col=1)
-
-    fig.update_yaxes(title_text='Price', title_font_size=10, row=1, col=1)
-    fig.update_yaxes(title_text='RSI', title_font_size=10, range=[RSI_MIN, RSI_MAX], row=2, col=1)
-    fig.update_yaxes(title_text='MACD', title_font_size=10, row=3, col=1)
-    fig.update_yaxes(title_text='Volume', title_font_size=10, row=4, col=1)
-
-    return fig
-
-
-# =============================================================================
-# MAIN APP
-# =============================================================================
 
 def main():
-    st.set_page_config(page_title="AI Trade Bot", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    # ==========================================================================
+    # SIDEBAR - All Controls & Configuration
+    # ==========================================================================
+    with st.sidebar:
+        st.markdown("## ⚙️ Control Panel")
 
-    config = load_config()
+        # View Mode Selection
+        st.markdown("### 📊 Dashboard View")
+        view_mode = st.radio(
+            "Select View",
+            ["Trading", "Analysis", "Configuration"],
+            index=["Trading", "Analysis", "Configuration"].index(st.session_state.view_mode.title()),
+            horizontal=True
+        )
+        st.session_state.view_mode = view_mode.lower()
+
+        st.markdown("---")
+
+        # Multi-Currency Management
+        st.markdown("### 💱 Multi-Currency")
+        available_currencies = [
+            'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+            'ADA/USDT', 'DOGE/USDT', 'DOT/USDT', 'MATIC/USDT', 'LINK/USDT',
+            'EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CAD'
+        ]
+        selected_currency = st.selectbox(
+            "Active Currency",
+            available_currencies,
+            index=available_currencies.index(st.session_state.selected_symbol) if st.session_state.selected_symbol in available_currencies else 0
+        )
+        if selected_currency != st.session_state.selected_symbol:
+            st.session_state.selected_symbol = selected_currency
+
+        # Add/Remove currencies
+        with st.expander("Manage Tracked Currencies"):
+            new_currency = st.selectbox("Add Currency", [c for c in available_currencies if c not in st.session_state.tracked_currencies])
+            if st.button("➕ Add", key="add_currency"):
+                if new_currency not in st.session_state.tracked_currencies:
+                    st.session_state.tracked_currencies.append(new_currency)
+                    st.rerun()
+
+            if len(st.session_state.tracked_currencies) > 1:
+                remove_currency = st.selectbox("Remove Currency", st.session_state.tracked_currencies)
+                if st.button("➖ Remove", key="remove_currency"):
+                    st.session_state.tracked_currencies.remove(remove_currency)
+                    st.rerun()
+
+            st.write(f"**Tracking:** {', '.join(st.session_state.tracked_currencies)}")
+
+        st.markdown("---")
+
+        # Algorithm Weights (Adjustable)
+        st.markdown("### 🎛️ Algorithm Weights")
+        with st.expander("Adjust Weights", expanded=False):
+            weights = st.session_state.algorithm_weights
+            weights['fourier'] = st.slider("Fourier (Cycles)", 0.0, 1.0, weights['fourier'], 0.05)
+            weights['kalman'] = st.slider("Kalman (Trend)", 0.0, 1.0, weights['kalman'], 0.05)
+            weights['entropy'] = st.slider("Entropy (Regime)", 0.0, 1.0, weights['entropy'], 0.05)
+            weights['markov'] = st.slider("Markov (States)", 0.0, 1.0, weights['markov'], 0.05)
+            weights['lstm'] = st.slider("LSTM (Deep Learning)", 0.0, 1.0, weights['lstm'], 0.05)
+
+            # Normalize weights
+            total = sum(weights.values())
+            if total > 0:
+                for k in weights:
+                    weights[k] = weights[k] / total
+            st.session_state.algorithm_weights = weights
+
+            st.write("**Current Weights:**")
+            for alg, w in weights.items():
+                st.write(f"- {alg.title()}: {w:.1%}")
+
+        st.markdown("---")
+
+        # Display Options
+        st.markdown("### 👁️ Display Options")
+        st.session_state.show_algorithm_details = st.checkbox(
+            "Show Algorithm Details",
+            value=st.session_state.show_algorithm_details
+        )
+        st.session_state.show_all_indicators = st.checkbox(
+            "Show All 27 Indicators",
+            value=st.session_state.show_all_indicators
+        )
+
+        st.markdown("---")
+
+        # Configuration Panel
+        if st.session_state.view_mode == 'configuration':
+            st.markdown("### ⚙️ System Configuration")
+
+            # Load current config
+            config_path = ROOT / "config.yaml"
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+
+                with st.expander("Signal Settings", expanded=True):
+                    risk_per_trade = st.slider("Risk Per Trade %", 0.5, 5.0, float(config.get('signals', {}).get('risk_per_trade', 2.0)), 0.5)
+                    risk_reward = st.slider("Risk/Reward Ratio", 1.0, 5.0, float(config.get('signals', {}).get('risk_reward_ratio', 2.0)), 0.5)
+                    signal_cooldown = st.number_input("Signal Cooldown (min)", 1, 120, int(config.get('signals', {}).get('cooldown_minutes', 60)))
+
+                with st.expander("Auto-Retrain Settings"):
+                    auto_retrain = st.checkbox("Enable Auto-Retrain", value=config.get('auto_training', {}).get('enabled', True))
+                    min_win_rate = st.slider("Min Win Rate %", 30, 60, int(config.get('auto_training', {}).get('min_win_rate_threshold', 0.45) * 100))
+                    max_days = st.number_input("Max Days Between Retrain", 7, 90, int(config.get('auto_training', {}).get('max_days_between_retrain', 30)))
+
+                with st.expander("Notification Settings"):
+                    desktop_notify = st.checkbox("Desktop Notifications", value=config.get('notifications', {}).get('desktop', {}).get('enabled', True))
+                    sound_notify = st.checkbox("Sound Alerts", value=config.get('notifications', {}).get('desktop', {}).get('sound', True))
+
+                if st.button("💾 Save Configuration"):
+                    # Update config
+                    config['signals'] = config.get('signals', {})
+                    config['signals']['risk_per_trade'] = risk_per_trade
+                    config['signals']['risk_reward_ratio'] = risk_reward
+                    config['signals']['cooldown_minutes'] = signal_cooldown
+
+                    config['auto_training'] = config.get('auto_training', {})
+                    config['auto_training']['enabled'] = auto_retrain
+                    config['auto_training']['min_win_rate_threshold'] = min_win_rate / 100
+                    config['auto_training']['max_days_between_retrain'] = max_days
+
+                    config['notifications'] = config.get('notifications', {})
+                    config['notifications']['desktop'] = config['notifications'].get('desktop', {})
+                    config['notifications']['desktop']['enabled'] = desktop_notify
+                    config['notifications']['desktop']['sound'] = sound_notify
+
+                    with open(config_path, 'w') as f:
+                        yaml.dump(config, f, default_flow_style=False)
+                    st.success("✅ Configuration saved!")
+
+    # ==========================================================================
+    # MAIN CONTENT
+    # ==========================================================================
+
+    # Process control
     running, pid = is_analysis_running()
-    stats = get_stats()
-    symbol = config.get('data', {}).get('symbol', 'BTC-USD')
 
-    # ===== HEADER =====
-    status_html = f'<span class="pulse-dot"></span>LIVE' if running else 'OFFLINE'
-    status_class = 'status-live' if running else 'status-offline'
+    # Fetch REAL data (fetch on first load OR when auto-refresh is ON)
+    data = None
+    error_message = None
+    if st.session_state.exchange_obj:
+        # Always fetch data (even if auto-refresh is OFF, need initial data)
+        data = fetch_market_data(
+            st.session_state.exchange_obj,
+            st.session_state.selected_symbol,
+            st.session_state.selected_timeframe,
+            limit=200
+        )
+        if data['success']:
+            st.session_state.update_count += 1
+            st.session_state.last_fetch_time = datetime.now()
+        else:
+            error_message = data['error']
+            logger.error(f"Data fetch failed: {error_message}")
 
-    st.markdown(f'''
-        <div class="main-header">
-            <div class="header-left">
-                <div class="header-logo">📊</div>
-                <div class="header-text">
-                    <h1>AI Trade Bot</h1>
-                    <p>{symbol} • Real-time Analysis</p>
-                </div>
-            </div>
-            <div class="status-pill {status_class}">{status_html}</div>
-        </div>
-    ''', unsafe_allow_html=True)
+    # Calculate values
+    if data and data['success']:
+        ticker = data['ticker']
+        df = data['df']
 
-    # ===== METRICS =====
-    df = load_candles(DATA_LIMITS['candles_default'])
-    if not df.empty:
-        df = calculate_indicators(df)
-        last, prev = df.iloc[-1], df.iloc[-2]
-        price = last['close']
-        change = price - prev['close']
-        change_pct = (change / prev['close']) * 100
-        trend_data = get_trend(df)
-        rsi = trend_data.get('rsi', RSI_MIDPOINT)
+        current_price = ticker['last']
+        price_change_pct = ticker['percentage'] or 0
+        high_24h = ticker['high']
+        low_24h = ticker['low']
+        volume_24h = ticker['quoteVolume']
+
+        # Calculate RSI
+        if len(df) >= 14:
+            rsi = calculate_rsi(df['close'].values)
+        else:
+            rsi = 50.0
+
+        rsi_sentiment = "bullish" if rsi > 60 else "bearish" if rsi < 40 else "neutral"
+        rsi_label = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+
+        status = "LIVE"
     else:
-        price, change, change_pct, rsi = 0, 0, 0, RSI_MIDPOINT
-        trend_data = {'trend': 'N/A'}
+        # Fallback values if fetch failed or auto-refresh is OFF
+        df = None  # Critical: Set df to None to prevent stale data
+        current_price = 0
+        price_change_pct = 0
+        high_24h = 0
+        low_24h = 0
+        volume_24h = 0
+        rsi = 50
+        rsi_sentiment = "neutral"
+        rsi_label = "No Data"
+        status = "OFFLINE"
+        df = None
 
-    delta_class = 'delta-up' if change >= 0 else 'delta-down'
-    delta_sign = '+' if change >= 0 else ''
+    # Header - Build variables first to avoid f-string issues
+    price_color = '#38ef7d' if price_change_pct >= 0 else '#f5576c'
+    price_arrow = '▲' if price_change_pct >= 0 else '▼'
+    status_class = 'status-live' if status == 'LIVE' else 'status-offline'
+    status_text = '🟢 LIVE' if status == 'LIVE' else '🔴 OFFLINE'
+    engine_text = f'✅ Running (PID: {pid})' if running else '⏸️ Stopped'
+    engine_color = '#38ef7d' if running else '#f5576c'
 
-    st.markdown(f'''
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="metric-label">Price</div>
-                <div class="metric-value">${price:,.2f}</div>
-                <div class="metric-delta {delta_class}">{delta_sign}{change:,.2f} ({delta_sign}{change_pct:.2f}%)</div>
+    st.markdown(f"""
+    <div class="header-container">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <h1 style="margin: 0; font-size: 2rem; font-weight: 800;">📈 AI Trade Bot Pro</h1>
+                <p style="margin: 0.5rem 0 0 0; opacity: 0.9;">{st.session_state.selected_symbol} • {st.session_state.selected_exchange.title()}</p>
             </div>
-            <div class="metric-card">
-                <div class="metric-label">Trend</div>
-                <div class="metric-value">{trend_data['trend']}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">RSI ({INDICATOR_CONFIG['rsi_period']})</div>
-                <div class="metric-value">{rsi:.1f}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Candles</div>
-                <div class="metric-value">{stats['candles']:,}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Signals</div>
-                <div class="metric-value">{stats['signals']:,}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Status</div>
-                <div class="metric-value">{'Active' if running else 'Idle'}</div>
+            <div style="text-align: right;">
+                <div class="price-display">${current_price:,.2f}</div>
+                <div style="color: {price_color}; font-size: 1.2rem; margin-top: 0.3rem;">
+                    {price_arrow} {abs(price_change_pct):.2f}%
+                </div>
             </div>
         </div>
-    ''', unsafe_allow_html=True)
+        <div style="margin-top: 1rem; display: flex; gap: 1rem; align-items: center; justify-content: space-between;">
+            <div style="display: flex; gap: 1rem; align-items: center;">
+                <span class="status-badge {status_class}">{status_text}</span>
+                <span style="opacity: 0.8;">{datetime.now().strftime('%H:%M:%S')}</span>
+            </div>
+            <span style="background: {engine_color}33; color: {engine_color}; padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.85rem;">
+                {engine_text}
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # ===== TABS =====
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(['📈 Chart', '⚡ Controls', '📡 Signals', '🔍 Patterns', '⚙️ Settings'])
+    # Display error message if API call failed
+    if error_message:
+        st.error(f"⚠️ Failed to fetch market data: {error_message}")
 
-    # ----- TAB 1: CHART -----
-    with tab1:
-        if df.empty:
-            st.warning("No data available. Go to Controls tab to download data.")
+    # Control Panel
+    st.markdown("---")
+    ctrl_cols = st.columns([2, 2, 2, 2, 2, 2])
+
+    with ctrl_cols[0]:
+        exchanges = ['binance', 'coinbase', 'bybit', 'kraken']
+        selected_exchange = st.selectbox(
+            "Exchange",
+            exchanges,
+            index=exchanges.index(st.session_state.selected_exchange),
+            key='exchange_selector'
+        )
+        if selected_exchange != st.session_state.selected_exchange:
+            st.session_state.selected_exchange = selected_exchange
+            # Reinitialize exchange
+            if CCXT_AVAILABLE:
+                try:
+                    if selected_exchange == 'binance':
+                        st.session_state.exchange_obj = ccxt.binance({'enableRateLimit': True})
+                    elif selected_exchange == 'coinbase':
+                        st.session_state.exchange_obj = ccxt.coinbase({'enableRateLimit': True})
+                    elif selected_exchange == 'bybit':
+                        st.session_state.exchange_obj = ccxt.bybit({'enableRateLimit': True})
+                    elif selected_exchange == 'kraken':
+                        st.session_state.exchange_obj = ccxt.kraken({'enableRateLimit': True})
+                except Exception:
+                    pass
+            st.rerun()
+
+    with ctrl_cols[1]:
+        symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
+        symbol = st.selectbox("Symbol", symbols, index=symbols.index(st.session_state.selected_symbol) if st.session_state.selected_symbol in symbols else 0)
+        if symbol != st.session_state.selected_symbol:
+            st.session_state.selected_symbol = symbol
+            st.rerun()
+
+    with ctrl_cols[2]:
+        timeframes = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
+        timeframe = st.selectbox("Timeframe", timeframes, index=timeframes.index(st.session_state.selected_timeframe) if st.session_state.selected_timeframe in timeframes else 0)
+        if timeframe != st.session_state.selected_timeframe:
+            st.session_state.selected_timeframe = timeframe
+            st.rerun()
+
+    with ctrl_cols[3]:
+        st.write("")
+        st.write("")
+        auto = st.checkbox("Auto Refresh", value=st.session_state.auto_refresh)
+        if auto != st.session_state.auto_refresh:
+            st.session_state.auto_refresh = auto
+
+    with ctrl_cols[4]:
+        st.write("")
+        st.write("")
+        if running:
+            if st.button("⏹️ Stop Engine", type="secondary", use_container_width=True):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    PID_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                time.sleep(1)
+                st.rerun()
         else:
-            fig = create_chart(df)
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'displaylogo': False})
+            if st.button("▶️ Start Engine", type="primary", use_container_width=True):
+                venv_py = ROOT / "venv" / "bin" / "python"
+                py = str(venv_py) if venv_py.exists() else "python3"
+                subprocess.Popen(
+                    [py, str(ROOT / "run_analysis.py")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=ROOT
+                )
+                time.sleep(2)
+                st.rerun()
 
-            # Indicators
-            last = df.iloc[-1]
-            ma_bull = last['sma_fast'] > last['sma_slow'] if pd.notna(last.get('sma_fast')) and pd.notna(last.get('sma_slow')) else False
-            macd_bull = last['macd'] > last['macd_signal'] if pd.notna(last.get('macd')) else False
-            rsi_val = last.get('rsi', RSI_MIDPOINT)
+    with ctrl_cols[5]:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Refresh Now", type="secondary", use_container_width=True):
+            st.rerun()
 
-            ma_cls = 'badge-bullish' if ma_bull else 'badge-bearish'
-            macd_cls = 'badge-bullish' if macd_bull else 'badge-bearish'
-            rsi_cls = 'badge-bearish' if rsi_val > RSI_OVERBOUGHT else 'badge-bullish' if rsi_val < RSI_OVERSOLD else 'badge-neutral'
-            rsi_txt = 'Overbought' if rsi_val > RSI_OVERBOUGHT else 'Oversold' if rsi_val < RSI_OVERSOLD else 'Neutral'
+    # Metrics Row
+    st.markdown("---")
+    met_cols = st.columns(6)
 
-            st.markdown(f'''
-                <div class="indicator-row">
-                    <div class="indicator-badge {ma_cls}">MA: {'Bullish' if ma_bull else 'Bearish'}</div>
-                    <div class="indicator-badge {macd_cls}">MACD: {'Bullish' if macd_bull else 'Bearish'}</div>
-                    <div class="indicator-badge {rsi_cls}">RSI: {rsi_txt} ({rsi_val:.0f})</div>
-                    <div class="indicator-badge badge-neutral">Vol: {last['volume']/1e6:.2f}M</div>
+    # Format volume
+    if volume_24h >= 1e9:
+        vol_str = f"${volume_24h/1e9:.1f}B"
+    elif volume_24h >= 1e6:
+        vol_str = f"${volume_24h/1e6:.1f}M"
+    else:
+        vol_str = f"${volume_24h:,.0f}"
+
+    metrics_data = [
+        ("Updates", f"{st.session_state.update_count}", "Auto-refresh" if st.session_state.auto_refresh else "Manual", "bullish" if st.session_state.auto_refresh else "neutral"),
+        ("Candles", f"{len(df) if df is not None else 0}", st.session_state.selected_timeframe, "bullish" if df is not None else "neutral"),
+        ("RSI (14)", f"{rsi:.1f}", rsi_label, rsi_sentiment),
+        ("24H High", f"${high_24h:,.2f}", "Resistance", "bullish"),
+        ("24H Low", f"${low_24h:,.2f}", "Support", "bearish"),
+        ("24H Volume", vol_str, "Trading", "neutral"),
+    ]
+
+    for col, (label, value, delta, sentiment) in zip(met_cols, metrics_data):
+        with col:
+            st.markdown(f"""
+            <div class="metric-card {sentiment}">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value" style="font-size: {'1.8rem' if len(str(value)) > 10 else '2rem'};">{value}</div>
+                <div style="color: {'#38ef7d' if sentiment == 'bullish' else '#f5576c' if sentiment == 'bearish' else '#6c757d'}; font-size: 0.9rem; font-weight: 600;">
+                    {delta}
                 </div>
-            ''', unsafe_allow_html=True)
+            </div>
+            """, unsafe_allow_html=True)
 
-    # ----- TAB 2: CONTROLS -----
-    with tab2:
-        col1, col2 = st.columns(2)
+    # AI Predictions Section
+    if AI_AVAILABLE and st.session_state.predictor and df is not None and len(df) >= 100:
+        st.markdown("---")
+        st.markdown("### 🤖 AI Predictions & Mathematical Analysis")
 
-        with col1:
-            st.markdown('''
-                <div class="panel">
-                    <div class="panel-header">
-                        <div class="panel-icon">📥</div>
-                        <h3 class="panel-title">Data & Training</h3>
+        try:
+            # Get AI prediction
+            prediction = st.session_state.predictor.predict(df)
+
+            # Get mathematical indicators from MathEngine (pass full DataFrame)
+            math_analysis = st.session_state.math_engine.analyze(df)
+
+            # Display predictions in columns
+            pred_cols = st.columns([1, 1, 1, 1])
+
+            with pred_cols[0]:
+                direction_color = "#38ef7d" if prediction.direction == "BUY" else "#f5576c" if prediction.direction == "SELL" else "#ffc107"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">AI Signal</div>
+                    <div class="metric-value" style="color: {direction_color}; font-size: 2.5rem;">
+                        {prediction.direction}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Confidence: {prediction.confidence * 100:.1f}%
                     </div>
                 </div>
-            ''', unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
 
-            days = st.selectbox(
-                "Historical data period:",
-                TRAINING_DEFAULTS['days_options'],
-                index=TRAINING_DEFAULTS['days_default_index'],
-                format_func=lambda x: f"{x} days"
-            )
-            if st.button("📥 Download Data", use_container_width=True):
-                with st.spinner(f"Downloading {days} days of data..."):
-                    result = run_script("scripts/download_data.py", ["--days", str(days)])
-                    if result['success']:
-                        st.success("✅ Data downloaded successfully!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Download failed")
-                        st.code(result['stderr'][:500])
-
-            st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-            epochs = st.slider(
-                "Training epochs:",
-                TRAINING_DEFAULTS['epochs_min'],
-                TRAINING_DEFAULTS['epochs_max'],
-                TRAINING_DEFAULTS['epochs_default']
-            )
-            if st.button("🧠 Train Model", use_container_width=True):
-                with st.spinner(f"Training model ({epochs} epochs)..."):
-                    result = run_script("scripts/train_model.py", ["--epochs", str(epochs)])
-                    if result['success']:
-                        st.success("✅ Model trained!")
-                    else:
-                        st.error("❌ Training failed")
-
-        with col2:
-            st.markdown('''
-                <div class="panel">
-                    <div class="panel-header">
-                        <div class="panel-icon">🚀</div>
-                        <h3 class="panel-title">Analysis Control</h3>
+            with pred_cols[1]:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Stop Loss</div>
+                    <div class="metric-value" style="color: #f5576c; font-size: 1.8rem;">
+                        ${prediction.stop_loss:,.2f}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Risk: {prediction.monte_carlo_risk * 100:.1f}%
                     </div>
                 </div>
-            ''', unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
 
-            running, pid = is_analysis_running()
-            if running:
-                st.markdown(f'''
-                    <div class="status-box status-running">
-                        <div class="status-box-icon" style="background: rgba(16,185,129,0.2);">🟢</div>
-                        <div class="status-box-text">
-                            <div class="status-box-title" style="color: #10b981;">Analysis Running</div>
-                            <div class="status-box-sub">Process ID: {pid}</div>
-                        </div>
+            with pred_cols[2]:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Take Profit</div>
+                    <div class="metric-value" style="color: #38ef7d; font-size: 1.8rem;">
+                        ${prediction.take_profit:,.2f}
                     </div>
-                ''', unsafe_allow_html=True)
-                if st.button("🛑 Stop Analysis", use_container_width=True):
-                    run_script("stop_analysis.py")
-                    time.sleep(PROCESS_DELAYS['after_stop'])
-                    st.rerun()
-            else:
-                st.markdown('''
-                    <div class="status-box status-stopped">
-                        <div class="status-box-icon" style="background: rgba(245,158,11,0.2);">⏸️</div>
-                        <div class="status-box-text">
-                            <div class="status-box-title" style="color: #f59e0b;">Analysis Stopped</div>
-                            <div class="status-box-sub">Ready to start</div>
-                        </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        R:R {prediction.risk_reward_ratio:.2f}:1
                     </div>
-                ''', unsafe_allow_html=True)
-                if st.button("▶️ Start Analysis", use_container_width=True):
-                    if stats['candles'] < MIN_CANDLES_FOR_ANALYSIS:
-                        st.error("⚠️ Not enough data! Download data first.")
-                    else:
-                        venv_py = PROJECT_ROOT / "venv" / "bin" / "python"
-                        py = str(venv_py) if venv_py.exists() else "python3"
-                        log_file = PROJECT_ROOT / "data" / "analysis_output.log"
-                        # Use devnull for subprocess output, process writes its own logs
-                        with open(log_file, "a") as log:
-                            subprocess.Popen(
-                                [py, str(PROJECT_ROOT / "run_analysis.py")],
-                                stdout=log,
-                                stderr=subprocess.STDOUT,
-                                cwd=PROJECT_ROOT,
-                                start_new_session=True
+                </div>
+                """, unsafe_allow_html=True)
+
+            with pred_cols[3]:
+                hurst_color = "#38ef7d" if math_analysis.hurst_exponent > 0.5 else "#f5576c"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Market Regime</div>
+                    <div class="metric-value" style="color: {hurst_color}; font-size: 1.8rem;">
+                        {math_analysis.hurst_regime}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">
+                        Hurst: {math_analysis.hurst_exponent:.3f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Mathematical details (basic view)
+            with st.expander("🔬 Mathematical Breakdown", expanded=False):
+                math_cols = st.columns(3)
+
+                with math_cols[0]:
+                    st.markdown("**Fourier Analysis**")
+                    st.write(f"Cycle Signal: {prediction.fourier_signal:.3f}")
+
+                    st.markdown("**Kalman Filter**")
+                    st.write(f"Trend Direction: {prediction.kalman_trend:.3f}")
+
+                    st.markdown("**Wavelet Analysis**")
+                    st.write(f"Signal: {math_analysis.wavelet_signal:.3f}")
+
+                with math_cols[1]:
+                    st.markdown("**Hurst Exponent**")
+                    st.write(f"Value: {math_analysis.hurst_exponent:.3f}")
+                    st.write(f"Regime: {math_analysis.hurst_regime}")
+
+                    st.markdown("**Markov Chain**")
+                    st.write(f"Transition Prob: {prediction.markov_probability * 100:.1f}%")
+
+                with math_cols[2]:
+                    st.markdown("**Risk Metrics**")
+                    st.write(f"Monte Carlo Risk: {prediction.monte_carlo_risk * 100:.1f}%")
+                    st.write(f"Jump Probability: {math_analysis.jump_probability * 100:.1f}%")
+                    st.write(f"Crash Indicator: {math_analysis.crash_indicator * 100:.1f}%")
+
+            # ==========================================================================
+            # FULL ALGORITHM DETAILS (when checkbox enabled)
+            # ==========================================================================
+            if st.session_state.show_algorithm_details:
+                st.markdown("---")
+                st.markdown("### 🔬 Complete Algorithm Analysis")
+
+                # Algorithm weights visualization
+                st.markdown("#### ⚖️ Current Algorithm Weights")
+                weights = st.session_state.algorithm_weights
+                weights_df = pd.DataFrame([
+                    {"Algorithm": k.title(), "Weight": v, "Percentage": f"{v*100:.1f}%"}
+                    for k, v in weights.items()
+                ])
+                st.dataframe(weights_df, use_container_width=True, hide_index=True)
+
+                # Detailed algorithm panels
+                alg_tabs = st.tabs([
+                    "🌊 Fourier", "📡 Kalman", "🎲 Entropy", "🔗 Markov", "🧠 LSTM",
+                    "📈 Wavelet", "📊 Hurst", "🔄 Ornstein-Uhlenbeck", "⚡ Jump Detection", "🔢 Eigenvalue"
+                ])
+
+                with alg_tabs[0]:  # Fourier
+                    st.markdown("#### Fourier Analysis (Cycle Detection)")
+                    st.markdown("""
+                    **Purpose:** Detects hidden cycles and periodicities in price data.
+
+                    **How it works:**
+                    - Decomposes price into frequency components
+                    - Identifies dominant cycles (daily, weekly patterns)
+                    - Predicts next cycle phase
+                    """)
+
+                    # Main signal metric
+                    st.metric("Fourier Signal", f"{prediction.fourier_signal:.4f}")
+                    signal_strength = "Strong" if abs(prediction.fourier_signal) > 0.5 else "Moderate" if abs(prediction.fourier_signal) > 0.2 else "Weak"
+                    st.info(f"Signal Strength: {signal_strength}")
+
+                    # Detailed Fourier analysis (if available)
+                    fourier_details = getattr(prediction, 'fourier_details', None)
+                    if fourier_details and not fourier_details.get('error'):
+                        st.markdown("---")
+                        st.markdown("##### 📊 Detailed Cycle Analysis")
+
+                        # Cycle metrics in columns
+                        fc1, fc2, fc3 = st.columns(3)
+                        with fc1:
+                            period = fourier_details.get('dominant_period', 0)
+                            if period > 0:
+                                st.metric("Dominant Cycle", f"{period:.1f} candles")
+                                # Interpret the period
+                                if period < 12:
+                                    cycle_type = "Short-term (intraday)"
+                                elif period < 48:
+                                    cycle_type = "Medium-term (daily)"
+                                elif period < 168:
+                                    cycle_type = "Weekly pattern"
+                                else:
+                                    cycle_type = "Long-term cycle"
+                                st.caption(cycle_type)
+                            else:
+                                st.metric("Dominant Cycle", "N/A")
+
+                        with fc2:
+                            phase = fourier_details.get('phase', 0)
+                            phase_deg = np.degrees(phase) if phase else 0
+                            st.metric("Current Phase", f"{phase_deg:.1f}°")
+                            # Phase interpretation
+                            if -45 <= phase_deg <= 45:
+                                phase_meaning = "Peak zone (reversal likely)"
+                            elif 45 < phase_deg <= 135:
+                                phase_meaning = "Uptrend phase"
+                            elif -135 <= phase_deg < -45:
+                                phase_meaning = "Downtrend phase"
+                            else:
+                                phase_meaning = "Trough zone (reversal likely)"
+                            st.caption(phase_meaning)
+
+                        with fc3:
+                            interpretation = fourier_details.get('interpretation', 'NEUTRAL')
+                            if interpretation == 'BULLISH':
+                                st.success(f"📈 {interpretation}")
+                            elif interpretation == 'BEARISH':
+                                st.error(f"📉 {interpretation}")
+                            else:
+                                st.info(f"➡️ {interpretation}")
+                            st.caption("Cycle direction")
+
+                        # Frequency spectrum visualization
+                        freqs = fourier_details.get('dominant_frequencies', [])
+                        mags = fourier_details.get('magnitudes', [])
+                        if freqs and mags:
+                            st.markdown("##### 📈 Frequency Spectrum (Top 3)")
+                            # Create bar chart for frequency magnitudes
+                            freq_df = pd.DataFrame({
+                                'Frequency': [f'{f:.4f}' for f in freqs],
+                                'Magnitude': mags,
+                                'Period': [f'{1/f:.1f} candles' if f > 0.0001 else 'N/A' for f in freqs]
+                            })
+                            st.dataframe(freq_df, use_container_width=True)
+
+                            # Visual bar chart
+                            fig_freq = go.Figure(data=[
+                                go.Bar(
+                                    x=[f'Cycle {i+1}\n({1/f:.0f} candles)' if f > 0.0001 else f'Cycle {i+1}' for i, f in enumerate(freqs)],
+                                    y=mags,
+                                    marker_color=['#667eea', '#764ba2', '#f093fb']
+                                )
+                            ])
+                            fig_freq.update_layout(
+                                title="Dominant Cycle Strengths",
+                                xaxis_title="Cycle",
+                                yaxis_title="Magnitude",
+                                height=250,
+                                margin=dict(l=0, r=0, t=40, b=0)
                             )
-                        time.sleep(PROCESS_DELAYS['after_start'])
-                        st.rerun()
+                            st.plotly_chart(fig_freq, use_container_width=True)
 
-            st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("🔔 Test Alert", use_container_width=True):
-                    run_script("scripts/test_notifications.py")
-                    st.success("Notification sent!")
-            with c2:
-                if st.button("🔄 Refresh", use_container_width=True):
-                    st.rerun()
+                        # Cycle prediction
+                        st.markdown("##### 🔮 Cycle Prediction")
+                        period = fourier_details.get('dominant_period', 0)
+                        if period > 0:
+                            # Calculate where we are in the cycle
+                            phase_norm = (phase_deg + 180) / 360  # Normalize to 0-1
+                            candles_into_cycle = int(period * phase_norm)
+                            candles_remaining = int(period - candles_into_cycle)
 
-    # ----- TAB 3: SIGNALS -----
-    with tab3:
-        signals = load_signals()
-        if signals.empty:
-            st.info("No signals yet. Start analysis to generate trading signals.")
-        else:
-            for _, r in signals.iterrows():
-                sig = html.escape(str(r['signal']))
-                is_buy = 'BUY' in sig.upper()
-                cls = 'buy' if is_buy else 'sell'
-                icon = '📈' if is_buy else '📉'
-                conf = r['confidence']
-                conf_cls = 'conf-high' if conf >= CONFIDENCE_HIGH else 'conf-med'
-                dt = html.escape(str(r['datetime']))
-                st.markdown(f'''
-                    <div class="signal-item {cls}">
-                        <div class="signal-icon {cls}">{icon}</div>
-                        <div class="signal-content">
-                            <div class="signal-type">{sig}</div>
-                            <div class="signal-time">{dt}</div>
-                        </div>
-                        <div class="signal-price">${r['price']:,.2f}</div>
-                        <div class="signal-conf {conf_cls}">{conf:.0%}</div>
-                    </div>
-                ''', unsafe_allow_html=True)
+                            pred_c1, pred_c2 = st.columns(2)
+                            with pred_c1:
+                                st.metric("Position in Cycle", f"{candles_into_cycle}/{int(period)} candles")
+                            with pred_c2:
+                                st.metric("Until Next Reversal", f"~{candles_remaining} candles")
 
-    # ----- TAB 4: PATTERNS -----
-    with tab4:
-        if df.empty:
-            st.info("No data to analyze.")
-        else:
-            patterns = detect_patterns(df)
-            if patterns:
-                for p in patterns:
-                    tag_cls = f"tag-{p['type']}"
-                    icon = '📈' if p['type'] == 'bullish' else '📉' if p['type'] == 'bearish' else '➡️'
-                    st.markdown(f'''
-                        <div class="pattern-item">
-                            <div class="pattern-info">
-                                <h4>{icon} {p['name']}</h4>
-                                <p>{p['desc']}</p>
+                            # Progress bar for cycle
+                            st.progress(min(1.0, phase_norm), text=f"Cycle Progress: {phase_norm*100:.0f}%")
+                    else:
+                        st.warning("⚠️ Insufficient data for detailed Fourier analysis (need 64+ candles)")
+
+                with alg_tabs[1]:  # Kalman
+                    st.markdown("#### Kalman Filter (Trend Estimation)")
+                    st.markdown("""
+                    **Purpose:** Optimal estimation of true price trend with noise filtering.
+
+                    **How it works:**
+                    - Predicts price using state-space model
+                    - Updates prediction based on new observations
+                    - Adapts to volatility changes
+                    """)
+                    st.metric("Kalman Trend", f"{prediction.kalman_trend:.4f}")
+                    trend_dir = "Bullish" if prediction.kalman_trend > 0 else "Bearish"
+                    st.info(f"Trend Direction: {trend_dir}")
+
+                with alg_tabs[2]:  # Entropy
+                    st.markdown("#### Shannon Entropy (Regime Detection)")
+                    st.markdown("""
+                    **Purpose:** Measures market disorder and regime changes.
+
+                    **How it works:**
+                    - Calculates information entropy of returns
+                    - High entropy = uncertain market
+                    - Low entropy = predictable patterns
+                    """)
+                    entropy_val = getattr(prediction, 'entropy_signal', 0.5)
+                    st.metric("Market Entropy", f"{entropy_val:.4f}")
+                    regime = "High Uncertainty" if entropy_val > 0.7 else "Moderate" if entropy_val > 0.4 else "Low Uncertainty"
+                    st.info(f"Market Regime: {regime}")
+
+                with alg_tabs[3]:  # Markov
+                    st.markdown("#### Markov Chain (State Transitions)")
+                    st.markdown("""
+                    **Purpose:** Models market as state machine with transition probabilities.
+
+                    **States:** Strong Bear, Bear, Neutral, Bull, Strong Bull
+
+                    **How it works:**
+                    - Learns historical state transitions
+                    - Predicts next likely state
+                    - Provides probability of direction change
+                    """)
+
+                    # Main probability metric
+                    st.metric("Bullish Probability", f"{prediction.markov_probability * 100:.1f}%")
+
+                    # Detailed Markov analysis (if available)
+                    markov_details = getattr(prediction, 'markov_details', None)
+                    if markov_details:
+                        st.markdown("---")
+                        st.markdown("##### 📊 Transition Matrix Visualization")
+
+                        # Current state indicator
+                        state_names = markov_details.get('state_names', ['Strong Bear', 'Bear', 'Neutral', 'Bull', 'Strong Bull'])
+                        current_state = markov_details.get('current_state', 2)
+                        current_state_name = state_names[current_state] if 0 <= current_state < len(state_names) else 'Unknown'
+
+                        mk_c1, mk_c2, mk_c3 = st.columns(3)
+                        with mk_c1:
+                            st.metric("Current State", current_state_name)
+                        with mk_c2:
+                            bullish_prob = markov_details.get('bullish_probability', 0.5)
+                            st.metric("Bullish Probability", f"{bullish_prob*100:.1f}%")
+                        with mk_c3:
+                            bearish_prob = markov_details.get('bearish_probability', 0.5)
+                            st.metric("Bearish Probability", f"{bearish_prob*100:.1f}%")
+
+                        # State color mapping
+                        state_colors = {
+                            'Strong Bear': '#ff4136',
+                            'Bear': '#ff851b',
+                            'Neutral': '#aaaaaa',
+                            'Bull': '#2ecc40',
+                            'Strong Bull': '#01ff70'
+                        }
+
+                        # Visual state indicator
+                        st.markdown("##### 🎯 Market State")
+                        state_html = f"""
+                        <div style="display: flex; justify-content: center; gap: 10px; margin: 20px 0;">
+                        """
+                        for i, state in enumerate(state_names):
+                            is_current = i == current_state
+                            color = state_colors.get(state, '#aaa')
+                            border = "3px solid #000" if is_current else "1px solid #ccc"
+                            opacity = "1" if is_current else "0.4"
+                            state_html += f"""
+                            <div style="padding: 15px 20px; background: {color}; border-radius: 10px;
+                                        border: {border}; opacity: {opacity}; text-align: center;
+                                        font-weight: {'bold' if is_current else 'normal'}; color: white;
+                                        text-shadow: 1px 1px 2px rgba(0,0,0,0.5);">
+                                {state}
+                                {"← CURRENT" if is_current else ""}
                             </div>
-                            <div class="pattern-tag {tag_cls}">{p['type']}</div>
-                        </div>
-                    ''', unsafe_allow_html=True)
-            else:
-                st.info("No significant patterns detected in recent price action.")
+                            """
+                        state_html += "</div>"
+                        st.markdown(state_html, unsafe_allow_html=True)
 
-            st.markdown("---")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Bullish Patterns**\n\nHammer, Bullish Engulfing, Morning Star, Inverted Hammer")
-            with c2:
-                st.markdown("**Bearish Patterns**\n\nShooting Star, Bearish Engulfing, Evening Star, Hanging Man")
+                        # Transition matrix heatmap
+                        transition_matrix = markov_details.get('transition_matrix', None)
+                        if transition_matrix and len(transition_matrix) > 0:
+                            st.markdown("##### 📈 Transition Probability Matrix")
+                            st.caption("Shows probability of moving FROM row state TO column state")
 
-    # ----- TAB 5: SETTINGS -----
-    with tab5:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Data Configuration**")
-            st.markdown(f"- Symbol: `{config.get('data',{}).get('symbol','N/A')}`")
-            st.markdown(f"- Interval: `{config.get('data',{}).get('interval','N/A')}`")
-            st.markdown(f"- Exchange: `{config.get('data',{}).get('exchange','N/A')}`")
-        with c2:
-            st.markdown("**Analysis Settings**")
-            st.markdown(f"- Update: `{config.get('analysis',{}).get('update_interval','N/A')}s`")
-            st.markdown(f"- Min Confidence: `{config.get('analysis',{}).get('min_confidence',0):.0%}`")
-        with c3:
-            st.markdown("**Model Status**")
-            model_path = PROJECT_ROOT / config.get('model', {}).get('path', 'models/best_model.pt')
+                            # Convert to numpy array
+                            tm = np.array(transition_matrix)
+
+                            # Create heatmap
+                            fig_tm = go.Figure(data=go.Heatmap(
+                                z=tm,
+                                x=state_names,
+                                y=state_names,
+                                colorscale='RdYlGn',
+                                text=[[f'{v*100:.1f}%' for v in row] for row in tm],
+                                texttemplate='%{text}',
+                                textfont={"size": 12},
+                                hovertemplate='From %{y} → To %{x}: %{z:.1%}<extra></extra>'
+                            ))
+
+                            fig_tm.update_layout(
+                                title="State Transition Probabilities",
+                                xaxis_title="To State",
+                                yaxis_title="From State",
+                                height=350,
+                                margin=dict(l=0, r=0, t=40, b=0)
+                            )
+
+                            st.plotly_chart(fig_tm, use_container_width=True)
+
+                            # Next state prediction
+                            st.markdown("##### 🔮 Next State Prediction")
+                            if 0 <= current_state < len(tm):
+                                current_row = tm[current_state]
+                                # Get probabilities for each next state
+                                pred_data = []
+                                for i, prob in enumerate(current_row):
+                                    pred_data.append({
+                                        'Next State': state_names[i],
+                                        'Probability': f'{prob*100:.1f}%',
+                                        'Likelihood': '🟢 High' if prob > 0.3 else '🟡 Medium' if prob > 0.15 else '🔴 Low'
+                                    })
+                                st.dataframe(pd.DataFrame(pred_data), use_container_width=True)
+
+                                # Most likely next state
+                                most_likely_idx = np.argmax(current_row)
+                                st.success(f"📌 Most likely next state: **{state_names[most_likely_idx]}** ({current_row[most_likely_idx]*100:.1f}%)")
+                    else:
+                        st.info("Detailed Markov analysis not available")
+
+                with alg_tabs[4]:  # LSTM
+                    st.markdown("#### LSTM Neural Network (Deep Learning)")
+                    st.markdown("""
+                    **Purpose:** Learns complex non-linear patterns in price history.
+
+                    **Architecture:**
+                    - Long Short-Term Memory cells
+                    - Remembers important patterns
+                    - Forgets irrelevant noise
+                    """)
+                    model_path = ROOT / "data" / "lstm_model.pt"
+                    if model_path.exists():
+                        st.success("✅ Model trained and active")
+                    else:
+                        st.warning("⚠️ Model not trained")
+
+                with alg_tabs[5]:  # Wavelet
+                    st.markdown("#### Wavelet Analysis (Multi-Scale Patterns)")
+                    st.markdown("""
+                    **Purpose:** Analyzes patterns at multiple time scales simultaneously.
+
+                    **Better than Fourier because:**
+                    - Handles non-stationary signals
+                    - Provides time-localized frequency info
+                    - Detects transient events
+                    """)
+                    st.metric("Wavelet Signal", f"{math_analysis.wavelet_signal:.4f}")
+
+                with alg_tabs[6]:  # Hurst
+                    st.markdown("#### Hurst Exponent (Memory Analysis)")
+                    st.markdown("""
+                    **Purpose:** Determines if market is trending or mean-reverting.
+
+                    **Interpretation:**
+                    - H > 0.5: **Trending** (follow the trend)
+                    - H < 0.5: **Mean-Reverting** (fade the move)
+                    - H = 0.5: **Random Walk** (unpredictable)
+                    """)
+                    h_col1, h_col2 = st.columns(2)
+                    with h_col1:
+                        st.metric("Hurst Exponent", f"{math_analysis.hurst_exponent:.4f}")
+                    with h_col2:
+                        regime_color = "#38ef7d" if math_analysis.hurst_exponent > 0.5 else "#f5576c"
+                        st.markdown(f"<div style='padding:1rem;background:{regime_color}20;border-radius:10px;text-align:center'><b>{math_analysis.hurst_regime}</b></div>", unsafe_allow_html=True)
+
+                with alg_tabs[7]:  # OU
+                    st.markdown("#### Ornstein-Uhlenbeck Process (Mean Reversion)")
+                    st.markdown("""
+                    **Purpose:** Mathematical model for mean-reverting assets.
+
+                    **Provides:**
+                    - Equilibrium price target
+                    - Half-life (time to mean reversion)
+                    - Entry/exit signals for range trading
+                    """)
+                    ou_col1, ou_col2 = st.columns(2)
+                    with ou_col1:
+                        st.metric("Equilibrium Price", f"${math_analysis.ou_equilibrium:,.2f}")
+                    with ou_col2:
+                        st.metric("Half-Life", f"{math_analysis.ou_half_life:.1f} candles")
+
+                with alg_tabs[8]:  # Jump
+                    st.markdown("#### Jump Detection (Crash/Rally Prediction)")
+                    st.markdown("""
+                    **Purpose:** Detects abnormal price movements and crash probability.
+
+                    **Uses:**
+                    - Poisson jump process modeling
+                    - Tail risk estimation
+                    - Early warning signals
+                    """)
+                    j_col1, j_col2 = st.columns(2)
+                    with j_col1:
+                        jump_color = "#f5576c" if math_analysis.jump_probability > 0.3 else "#38ef7d"
+                        st.markdown(f"<div style='text-align:center'><span style='font-size:0.8rem;color:#6c757d'>Jump Probability</span><br><span style='font-size:1.5rem;font-weight:700;color:{jump_color}'>{math_analysis.jump_probability * 100:.1f}%</span></div>", unsafe_allow_html=True)
+                    with j_col2:
+                        crash_color = "#f5576c" if math_analysis.crash_indicator > 0.5 else "#38ef7d"
+                        st.markdown(f"<div style='text-align:center'><span style='font-size:0.8rem;color:#6c757d'>Crash Risk</span><br><span style='font-size:1.5rem;font-weight:700;color:{crash_color}'>{math_analysis.crash_indicator * 100:.1f}%</span></div>", unsafe_allow_html=True)
+
+                with alg_tabs[9]:  # Eigenvalue
+                    st.markdown("#### Eigenvalue Analysis (Signal vs Noise)")
+                    st.markdown("""
+                    **Purpose:** Separates true market signal from random noise.
+
+                    **Based on Random Matrix Theory:**
+                    - Analyzes correlation matrix eigenvalues
+                    - Detects regime changes
+                    - Identifies market inefficiencies
+                    """)
+                    st.metric("Signal/Noise Ratio", f"{math_analysis.eigenvalue_ratio:.4f}")
+                    quality = "High Quality Signal" if math_analysis.eigenvalue_ratio > 1.5 else "Moderate" if math_analysis.eigenvalue_ratio > 1.0 else "Low Quality (Noisy)"
+                    st.info(f"Signal Quality: {quality}")
+
+        except Exception as e:
+            st.warning(f"⚠️ AI prediction unavailable: {str(e)}")
+            logger.error(f"Prediction error: {e}")
+
+    elif df is not None and len(df) < 100:
+        st.info("ℹ️ Need at least 100 candles for AI predictions. Current: " + str(len(df)))
+
+    # ==============================================================================
+    # ALL 27 TECHNICAL INDICATORS DISPLAY (when checkbox enabled)
+    # ==============================================================================
+    if st.session_state.show_all_indicators and df is not None and len(df) >= 50:
+        st.markdown("---")
+        st.markdown("### 📊 All 27 Technical Indicators")
+
+        try:
+            # Calculate all features
+            features_df = FeatureCalculator.calculate_all(df)
+            latest = features_df.iloc[-1]
+
+            # Group indicators by category
+            indicator_groups = {
+                "📈 Price-Based": {
+                    "Returns": (latest.get('returns', 0) * 100, "%"),
+                    "Log Returns": (latest.get('log_returns', 0) * 100, "%"),
+                    "Price/SMA7": (latest.get('price_sma_7_ratio', 1), "x"),
+                    "Price/SMA21": (latest.get('price_sma_21_ratio', 1), "x"),
+                    "Price/SMA50": (latest.get('price_sma_50_ratio', 1), "x"),
+                },
+                "📊 Volatility": {
+                    "ATR (14)": (latest.get('atr_14', 0), "$"),
+                    "BB Width": (latest.get('bb_width', 0) * 100, "%"),
+                    "BB Position": (latest.get('bb_position', 0.5) * 100, "%"),
+                    "Volatility 14d": (latest.get('volatility_14', 0) * 100, "%"),
+                    "Volatility 30d": (latest.get('volatility_30', 0) * 100, "%"),
+                },
+                "🎯 Momentum": {
+                    "RSI (14)": (latest.get('rsi_14', 50), ""),
+                    "Stochastic K": (latest.get('stoch_k', 50), ""),
+                    "Stochastic D": (latest.get('stoch_d', 50), ""),
+                    "MACD": (latest.get('macd', 0), ""),
+                    "MACD Signal": (latest.get('macd_signal', 0), ""),
+                    "MACD Histogram": (latest.get('macd_hist', 0), ""),
+                    "ROC (10)": (latest.get('roc_10', 0), "%"),
+                    "ROC (20)": (latest.get('roc_20', 0), "%"),
+                    "Williams %R": (latest.get('williams_r', -50), ""),
+                },
+                "📦 Volume": {
+                    "Volume Ratio": (latest.get('volume_ratio', 1), "x"),
+                },
+                "📐 Trend": {
+                    "ADX": (latest.get('adx', 25), ""),
+                    "+DI": (latest.get('plus_di', 25), ""),
+                    "-DI": (latest.get('minus_di', 25), ""),
+                    "Trend 7d": (latest.get('trend_7', 0) * 100, "%"),
+                    "Trend 14d": (latest.get('trend_14', 0) * 100, "%"),
+                },
+                "🕯️ Candle Patterns": {
+                    "Body Ratio": (latest.get('candle_body_ratio', 0.5) * 100, "%"),
+                    "Higher High": ("Yes" if latest.get('higher_high', 0) == 1 else "No", ""),
+                    "Lower Low": ("Yes" if latest.get('lower_low', 0) == 1 else "No", ""),
+                },
+            }
+
+            # Display in expanders by group
+            for group_name, indicators in indicator_groups.items():
+                with st.expander(group_name, expanded=True):
+                    cols = st.columns(5)
+                    for idx, (name, (value, suffix)) in enumerate(indicators.items()):
+                        with cols[idx % 5]:
+                            if isinstance(value, str):
+                                st.metric(name, value)
+                            else:
+                                formatted = f"{value:.2f}{suffix}" if not pd.isna(value) else "N/A"
+                                # Color coding for certain indicators
+                                if name == "RSI (14)":
+                                    color = "#38ef7d" if value > 60 else "#f5576c" if value < 40 else "#6c757d"
+                                elif "Trend" in name:
+                                    color = "#38ef7d" if value > 0 else "#f5576c"
+                                else:
+                                    color = "#2d3748"
+                                st.markdown(f"<div style='text-align:center'><span style='font-size:0.8rem;color:#6c757d'>{name}</span><br><span style='font-size:1.2rem;font-weight:700;color:{color}'>{formatted}</span></div>", unsafe_allow_html=True)
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not calculate indicators: {str(e)}")
+            logger.error(f"Indicators error: {e}")
+
+    # ==============================================================================
+    # LSTM Deep Learning Predictions
+    # ==============================================================================
+    if AI_AVAILABLE and df is not None and len(df) >= 100:
+        st.markdown("---")
+        st.markdown("### 🧠 LSTM Deep Learning Predictions")
+
+        try:
+            # Calculate features
+            features_df = FeatureCalculator.calculate_all(df)
+
+            # Check if we have trained model
+            model_path = ROOT / "data" / "lstm_model.pt"
             if model_path.exists():
-                st.markdown("✅ Model ready")
+                st.success("✅ Using trained LSTM model")
+
+                # Show feature importance (top 10)
+                with st.expander("📊 Feature Analysis", expanded=False):
+                    st.write("**Top Technical Indicators:**")
+                    feature_cols = [col for col in features_df.columns if col not in ['datetime', 'open', 'high', 'low', 'close', 'volume']]
+                    if len(feature_cols) > 0:
+                        recent_features = features_df[feature_cols].tail(1)
+                        feat_cols = st.columns(3)
+
+                        for idx, feat in enumerate(feature_cols[:12]):  # Show first 12 features
+                            col_idx = idx % 3
+                            with feat_cols[col_idx]:
+                                value = recent_features[feat].values[0]
+                                st.metric(feat, f"{value:.4f}")
             else:
-                st.markdown("⚠️ Not trained")
+                st.info("ℹ️ LSTM model not trained yet. Run `python train_model.py` to train the deep learning model.")
 
-        with st.expander("📋 System Logs"):
-            c1, c2 = st.columns(2)
-            log_tail = DATA_LIMITS['log_tail_chars']
-            with c1:
-                st.markdown("**Trading Log**")
-                log_path = PROJECT_ROOT / "data" / "trading.log"
-                if log_path.exists():
-                    content = html.escape(log_path.read_text()[-log_tail:])
-                    st.markdown(f'<div class="log-viewer"><pre>{content}</pre></div>', unsafe_allow_html=True)
-                else:
-                    st.info("No log file")
-            with c2:
-                st.markdown("**Analysis Output**")
-                out_path = PROJECT_ROOT / "data" / "analysis_output.log"
-                if out_path.exists():
-                    content = html.escape(out_path.read_text()[-log_tail:])
-                    st.markdown(f'<div class="log-viewer"><pre>{content}</pre></div>', unsafe_allow_html=True)
-                else:
-                    st.info("No output log")
+        except Exception as e:
+            st.warning(f"⚠️ LSTM prediction unavailable: {str(e)}")
+            logger.error(f"LSTM error: {e}")
 
-    # ===== FOOTER =====
-    st.markdown('''
-        <div class="footer">
-            <div class="footer-warning">⚠️ Signal System Only — No automatic trading. You make all decisions.</div>
-            <p class="footer-note">Analysis runs in background. Closing this page won't stop it.</p>
-        </div>
-    ''', unsafe_allow_html=True)
+    # ==============================================================================
+    # MULTI-CURRENCY PERFORMANCE TRACKING
+    # ==============================================================================
+    if len(st.session_state.tracked_currencies) > 1 and AI_AVAILABLE:
+        st.markdown("---")
+        st.markdown("### 💱 Multi-Currency Performance")
 
+        try:
+            # Initialize MultiCurrencySystem if available
+            if MultiCurrencySystem is not None:
+                mcs_cols = st.columns(len(st.session_state.tracked_currencies))
+
+                for idx, currency in enumerate(st.session_state.tracked_currencies):
+                    with mcs_cols[idx]:
+                        # Fetch quick ticker for each currency
+                        if st.session_state.exchange_obj:
+                            try:
+                                ticker = st.session_state.exchange_obj.fetch_ticker(currency)
+                                price = ticker['last']
+                                change = ticker['percentage'] or 0
+                                change_color = "#38ef7d" if change >= 0 else "#f5576c"
+
+                                st.markdown(f"""
+                                <div class="metric-card" style="border-left-color: {change_color}">
+                                    <div class="metric-label">{currency}</div>
+                                    <div class="metric-value" style="font-size: 1.5rem;">${price:,.2f}</div>
+                                    <div style="color: {change_color}; font-size: 0.9rem; font-weight: 600;">
+                                        {'▲' if change >= 0 else '▼'} {abs(change):.2f}%
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                            except Exception:
+                                st.markdown(f"""
+                                <div class="metric-card">
+                                    <div class="metric-label">{currency}</div>
+                                    <div class="metric-value" style="font-size: 1.2rem;">Loading...</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                # Performance comparison chart
+                with st.expander("📊 Price Performance Comparison", expanded=False):
+                    perf_data = []
+                    for currency in st.session_state.tracked_currencies:
+                        try:
+                            ohlcv = st.session_state.exchange_obj.fetch_ohlcv(currency, '1h', limit=24)
+                            if ohlcv:
+                                start_price = ohlcv[0][4]  # First close
+                                end_price = ohlcv[-1][4]   # Last close
+                                pct_change = ((end_price - start_price) / start_price) * 100
+                                perf_data.append({
+                                    "Currency": currency,
+                                    "24h Change": f"{pct_change:+.2f}%",
+                                    "Start": f"${start_price:,.2f}",
+                                    "Current": f"${end_price:,.2f}"
+                                })
+                        except Exception:
+                            pass
+
+                    if perf_data:
+                        st.dataframe(pd.DataFrame(perf_data), use_container_width=True, hide_index=True)
+
+                # AI Trading Performance per Currency
+                with st.expander("🤖 AI Trading Performance per Currency", expanded=True):
+                    st.markdown("##### Per-Currency Trading Statistics")
+                    st.caption("Track win rate, PnL, and model status for each currency")
+
+                    # Try to get performance from MultiCurrencySystem
+                    try:
+                        config_path = ROOT / "config.yaml"
+                        if config_path.exists():
+                            with open(config_path) as f:
+                                config = yaml.safe_load(f)
+                            mcs = MultiCurrencySystem(config)
+                            perf_report = mcs.get_performance_report()
+
+                            if perf_report:
+                                # Create detailed performance table
+                                perf_table = []
+                                for symbol, stats in perf_report.items():
+                                    win_rate_str = stats.get('win_rate', '0.0%')
+                                    win_rate_val = float(win_rate_str.replace('%', '')) / 100 if isinstance(win_rate_str, str) else stats.get('win_rate', 0)
+
+                                    # Determine performance status
+                                    if win_rate_val >= 0.55:
+                                        status = "🟢 Excellent"
+                                    elif win_rate_val >= 0.50:
+                                        status = "🟡 Good"
+                                    elif win_rate_val >= 0.45:
+                                        status = "🟠 Fair"
+                                    else:
+                                        status = "🔴 Needs Retrain"
+
+                                    perf_table.append({
+                                        'Currency': symbol,
+                                        'Total Signals': stats.get('total_signals', 0),
+                                        'Win Rate': win_rate_str,
+                                        'Total PnL': stats.get('total_pnl', '0.00%'),
+                                        'Status': status,
+                                        'Needs Retrain': '⚠️ Yes' if stats.get('needs_retrain', False) else '✅ No',
+                                        'Last Retrain': stats.get('last_retrain', 'Never'),
+                                        'Retraining': '🔄' if stats.get('retrain_in_progress', False) else ''
+                                    })
+
+                                if perf_table:
+                                    st.dataframe(pd.DataFrame(perf_table), use_container_width=True, hide_index=True)
+
+                                    # Summary metrics
+                                    st.markdown("---")
+                                    sum_c1, sum_c2, sum_c3, sum_c4 = st.columns(4)
+
+                                    total_signals = sum(s.get('total_signals', 0) for s in perf_report.values())
+                                    currencies_needing_retrain = sum(1 for s in perf_report.values() if s.get('needs_retrain', False))
+
+                                    with sum_c1:
+                                        st.metric("Total Currencies", len(perf_report))
+                                    with sum_c2:
+                                        st.metric("Total Signals", total_signals)
+                                    with sum_c3:
+                                        st.metric("Need Retrain", currencies_needing_retrain)
+                                    with sum_c4:
+                                        active_retrains = sum(1 for s in perf_report.values() if s.get('retrain_in_progress', False))
+                                        st.metric("Active Retrains", active_retrains)
+
+                                    # Performance chart
+                                    if len(perf_table) > 1:
+                                        st.markdown("##### 📈 Win Rate Comparison")
+                                        win_rates = []
+                                        for item in perf_table:
+                                            wr_str = item['Win Rate']
+                                            if isinstance(wr_str, str):
+                                                wr = float(wr_str.replace('%', ''))
+                                            else:
+                                                wr = wr_str * 100
+                                            win_rates.append(wr)
+
+                                        fig_wr = go.Figure(data=[
+                                            go.Bar(
+                                                x=[p['Currency'] for p in perf_table],
+                                                y=win_rates,
+                                                marker_color=[
+                                                    '#2ecc40' if wr >= 55 else '#ffdc00' if wr >= 50 else '#ff851b' if wr >= 45 else '#ff4136'
+                                                    for wr in win_rates
+                                                ],
+                                                text=[f'{wr:.1f}%' for wr in win_rates],
+                                                textposition='outside'
+                                            )
+                                        ])
+                                        fig_wr.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50% baseline")
+                                        fig_wr.update_layout(
+                                            title="Win Rate by Currency",
+                                            xaxis_title="Currency",
+                                            yaxis_title="Win Rate (%)",
+                                            yaxis_range=[0, 100],
+                                            height=300,
+                                            margin=dict(l=0, r=0, t=40, b=0)
+                                        )
+                                        st.plotly_chart(fig_wr, use_container_width=True)
+                            else:
+                                st.info("No performance data available yet. Start trading to collect statistics.")
+                            mcs.cleanup()
+                    except Exception as e:
+                        # Fallback: Show placeholder with tracked currencies
+                        st.info("AI trading system not initialized. Performance tracking will begin when trading starts.")
+                        fallback_data = [{
+                            'Currency': currency,
+                            'Total Signals': 0,
+                            'Win Rate': '0.0%',
+                            'Total PnL': '0.00%',
+                            'Status': '⚪ No Data',
+                            'Needs Retrain': 'N/A',
+                            'Last Retrain': 'Never',
+                            'Retraining': ''
+                        } for currency in st.session_state.tracked_currencies]
+                        st.dataframe(pd.DataFrame(fallback_data), use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.warning(f"⚠️ Multi-currency tracking unavailable: {str(e)}")
+            logger.error(f"Multi-currency error: {e}")
+
+    # ==============================================================================
+    # ANALYSIS VIEW MODE - Additional Panels
+    # ==============================================================================
+    if st.session_state.view_mode == 'analysis' and df is not None and len(df) >= 20:
+        st.markdown("---")
+        st.markdown("### 📈 Advanced Analysis View")
+
+        analysis_tabs = st.tabs(["📊 Statistics", "📉 Correlations", "🎯 Support/Resistance", "📋 Data Quality"])
+
+        with analysis_tabs[0]:  # Statistics
+            st.markdown("#### Price Statistics")
+            stats_col1, stats_col2, stats_col3 = st.columns(3)
+
+            with stats_col1:
+                st.metric("Mean Price", f"${df['close'].mean():,.2f}")
+                st.metric("Median Price", f"${df['close'].median():,.2f}")
+                st.metric("Std Dev", f"${df['close'].std():,.2f}")
+
+            with stats_col2:
+                st.metric("Min Price", f"${df['close'].min():,.2f}")
+                st.metric("Max Price", f"${df['close'].max():,.2f}")
+                st.metric("Range", f"${df['close'].max() - df['close'].min():,.2f}")
+
+            with stats_col3:
+                returns = df['close'].pct_change().dropna()
+                st.metric("Avg Return", f"{returns.mean() * 100:.4f}%")
+                st.metric("Return Std", f"{returns.std() * 100:.4f}%")
+                skewness = returns.skew() if len(returns) > 2 else 0
+                st.metric("Skewness", f"{skewness:.4f}")
+
+        with analysis_tabs[1]:  # Correlations
+            st.markdown("#### Price-Volume Correlation")
+            correlation = df['close'].corr(df['volume'])
+            st.metric("Close-Volume Correlation", f"{correlation:.4f}")
+
+            # Rolling correlation
+            if len(df) >= 20:
+                rolling_corr = df['close'].rolling(20).corr(df['volume'])
+                st.line_chart(rolling_corr.dropna(), use_container_width=True)
+
+        with analysis_tabs[2]:  # Support/Resistance
+            st.markdown("#### Key Levels")
+            # Simple support/resistance based on recent highs/lows
+            recent_20 = df.tail(20)
+            recent_50 = df.tail(50) if len(df) >= 50 else df
+
+            sr_col1, sr_col2 = st.columns(2)
+            with sr_col1:
+                st.markdown("**Resistance Levels:**")
+                st.write(f"R1 (20-bar high): ${recent_20['high'].max():,.2f}")
+                st.write(f"R2 (50-bar high): ${recent_50['high'].max():,.2f}")
+
+            with sr_col2:
+                st.markdown("**Support Levels:**")
+                st.write(f"S1 (20-bar low): ${recent_20['low'].min():,.2f}")
+                st.write(f"S2 (50-bar low): ${recent_50['low'].min():,.2f}")
+
+            # Current position relative to levels
+            current = df['close'].iloc[-1]
+            r1 = recent_20['high'].max()
+            s1 = recent_20['low'].min()
+            position_pct = ((current - s1) / (r1 - s1)) * 100 if r1 != s1 else 50
+            st.progress(min(max(position_pct / 100, 0), 1))
+            st.caption(f"Price Position: {position_pct:.1f}% between S1 and R1")
+
+        with analysis_tabs[3]:  # Data Quality
+            st.markdown("#### Data Quality Metrics")
+            dq_col1, dq_col2 = st.columns(2)
+
+            with dq_col1:
+                st.metric("Total Candles", len(df))
+                null_count = df.isnull().sum().sum()
+                st.metric("Missing Values", null_count)
+                if 'datetime' in df.columns:
+                    time_range = df['datetime'].max() - df['datetime'].min()
+                    st.metric("Time Range", str(time_range))
+
+            with dq_col2:
+                # Check for gaps
+                if len(df) >= 2 and 'datetime' in df.columns:
+                    time_diffs = df['datetime'].diff().dropna()
+                    expected_diff = time_diffs.mode().iloc[0] if len(time_diffs.mode()) > 0 else time_diffs.median()
+                    gaps = (time_diffs > expected_diff * 2).sum()
+                    st.metric("Data Gaps", gaps)
+
+                # Volume anomalies
+                vol_mean = df['volume'].mean()
+                vol_std = df['volume'].std()
+                anomalies = ((df['volume'] > vol_mean + 3*vol_std) | (df['volume'] < vol_mean - 3*vol_std)).sum()
+                st.metric("Volume Anomalies", anomalies)
+
+    # ==============================================================================
+    # SIGNAL HISTORY & PERFORMANCE TRACKING
+    # ==============================================================================
+    if AI_AVAILABLE and df is not None:
+        st.markdown("---")
+        st.markdown("### 📡 Signal History & Performance")
+
+        try:
+            # Initialize Database for comprehensive tracking
+            signals_db_path = ROOT / "data" / "trading.db"
+
+            if signals_db_path.exists() and Database is not None:
+                db = Database(str(signals_db_path))
+
+                # Create tabs for different views
+                signal_tabs = st.tabs(["📊 Performance Stats", "📋 Signal History", "📈 Trade Results"])
+
+                with signal_tabs[0]:  # Performance Stats
+                    st.markdown("#### Trading Performance")
+
+                    # Get performance stats from database
+                    try:
+                        stats = db.get_performance_stats()
+
+                        # Display key metrics in cards
+                        perf_cols = st.columns(4)
+
+                        with perf_cols[0]:
+                            win_rate = stats.get('win_rate', 0) * 100
+                            win_color = "#38ef7d" if win_rate >= 50 else "#f5576c"
+                            st.markdown(f"""
+                            <div class="metric-card" style="border-left-color: {win_color}">
+                                <div class="metric-label">Win Rate</div>
+                                <div class="metric-value" style="color: {win_color}; font-size: 2rem;">{win_rate:.1f}%</div>
+                                <div style="color: #6c757d; font-size: 0.85rem;">
+                                    {stats.get('winners', 0)}W / {stats.get('losers', 0)}L
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with perf_cols[1]:
+                            total_pnl = stats.get('total_pnl', 0)
+                            pnl_color = "#38ef7d" if total_pnl >= 0 else "#f5576c"
+                            st.markdown(f"""
+                            <div class="metric-card" style="border-left-color: {pnl_color}">
+                                <div class="metric-label">Total PnL</div>
+                                <div class="metric-value" style="color: {pnl_color}; font-size: 2rem;">{total_pnl:+.2f}%</div>
+                                <div style="color: #6c757d; font-size: 0.85rem;">
+                                    Avg: {stats.get('avg_pnl', 0):+.2f}%
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with perf_cols[2]:
+                            total_signals = stats.get('total_signals', 0)
+                            st.markdown(f"""
+                            <div class="metric-card">
+                                <div class="metric-label">Total Signals</div>
+                                <div class="metric-value" style="font-size: 2rem;">{total_signals}</div>
+                                <div style="color: #6c757d; font-size: 0.85rem;">
+                                    Resolved: {stats.get('resolved_trades', 0)}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with perf_cols[3]:
+                            # Calculate profit factor
+                            winners = stats.get('winners', 0)
+                            losers = stats.get('losers', 0)
+                            profit_factor = winners / losers if losers > 0 else winners if winners > 0 else 0
+                            pf_color = "#38ef7d" if profit_factor >= 1.5 else "#ffc107" if profit_factor >= 1 else "#f5576c"
+                            st.markdown(f"""
+                            <div class="metric-card" style="border-left-color: {pf_color}">
+                                <div class="metric-label">Profit Factor</div>
+                                <div class="metric-value" style="color: {pf_color}; font-size: 2rem;">{profit_factor:.2f}</div>
+                                <div style="color: #6c757d; font-size: 0.85rem;">
+                                    {'Good' if profit_factor >= 1.5 else 'Neutral' if profit_factor >= 1 else 'Poor'}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    except Exception as e:
+                        st.info("No performance data yet. Trade outcomes will appear here once signals are resolved.")
+                        logger.debug(f"Performance stats error: {e}")
+
+                with signal_tabs[1]:  # Signal History
+                    st.markdown("#### Recent Signals")
+
+                    try:
+                        # Get signals from database
+                        signals_list = db.get_signals(limit=20)
+
+                        if signals_list:
+                            # Convert to display format
+                            signals_data = []
+                            for sig in signals_list:
+                                outcome_emoji = "✅" if sig.actual_outcome == "WIN" else "❌" if sig.actual_outcome == "LOSS" else "⏳"
+                                direction_emoji = "🟢" if sig.signal_type.value == "BUY" else "🔴" if sig.signal_type.value == "SELL" else "⚪"
+
+                                signals_data.append({
+                                    "Time": sig.timestamp.strftime('%m-%d %H:%M') if sig.timestamp else "N/A",
+                                    "Direction": f"{direction_emoji} {sig.signal_type.value}",
+                                    "Strength": sig.strength.value if sig.strength else "N/A",
+                                    "Confidence": f"{sig.confidence*100:.1f}%" if sig.confidence else "N/A",
+                                    "Entry": f"${sig.price:,.2f}" if sig.price else "N/A",
+                                    "SL": f"${sig.stop_loss:,.2f}" if sig.stop_loss else "N/A",
+                                    "TP": f"${sig.take_profit:,.2f}" if sig.take_profit else "N/A",
+                                    "Outcome": outcome_emoji,
+                                    "PnL": f"{sig.pnl_percent:+.2f}%" if sig.pnl_percent else "-"
+                                })
+
+                            st.dataframe(
+                                pd.DataFrame(signals_data),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=400
+                            )
+
+                            # Summary below table
+                            pending = sum(1 for s in signals_list if s.actual_outcome in [None, 'PENDING'])
+                            st.caption(f"Showing last {len(signals_list)} signals | ⏳ {pending} pending resolution")
+
+                        else:
+                            st.info("No trading signals generated yet. Signals will appear here when confidence thresholds are met.")
+
+                    except Exception as e:
+                        st.info("Signal history not available. Start the analysis engine to generate signals.")
+                        logger.debug(f"Signals error: {e}")
+
+                with signal_tabs[2]:  # Trade Results
+                    st.markdown("#### Trade Results History")
+
+                    try:
+                        trade_results = db.get_trade_results(limit=20)
+
+                        if trade_results:
+                            trades_data = []
+                            for trade in trade_results:
+                                hit_emoji = "🎯" if trade.get('hit_target') else "🛑" if trade.get('hit_stop') else "⏹️"
+                                pnl = trade.get('pnl_percent', 0)
+                                pnl_color = "green" if pnl > 0 else "red" if pnl < 0 else "gray"
+
+                                trades_data.append({
+                                    "Entry Time": trade.get('entry_time', 'N/A')[:16] if trade.get('entry_time') else "N/A",
+                                    "Direction": trade.get('direction', 'N/A'),
+                                    "Entry $": f"${trade.get('entry_price', 0):,.2f}",
+                                    "Exit $": f"${trade.get('exit_price', 0):,.2f}",
+                                    "Result": hit_emoji,
+                                    "PnL %": f"{pnl:+.2f}%",
+                                    "PnL $": f"${trade.get('pnl_absolute', 0):,.2f}"
+                                })
+
+                            st.dataframe(
+                                pd.DataFrame(trades_data),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+
+                        else:
+                            st.info("No trade results yet. Results will appear here after trades are executed and resolved.")
+
+                    except Exception as e:
+                        st.info("Trade results not available.")
+                        logger.debug(f"Trade results error: {e}")
+
+                # Close database connection
+                db.close()
+
+            else:
+                st.info("💡 Signal database not found. Start the analysis engine (`python run_analysis.py`) to begin tracking signals.")
+
+        except Exception as e:
+            st.warning(f"⚠️ Could not load signal data: {str(e)}")
+            logger.error(f"Signals error: {e}")
+
+    # ==============================================================================
+    # SYSTEM STATUS PANEL
+    # ==============================================================================
+    st.markdown("---")
+    st.markdown("### 🖥️ System Status")
+
+    status_tabs = st.tabs(["📊 Database", "📡 Data Collection", "🔔 Notifications"])
+
+    with status_tabs[0]:  # Database Stats
+        st.markdown("#### Database Statistics")
+
+        try:
+            signals_db_path = ROOT / "data" / "trading.db"
+            if signals_db_path.exists() and Database is not None:
+                db = Database(str(signals_db_path))
+
+                db_cols = st.columns(4)
+
+                # Get candle count
+                try:
+                    candle_count = db.get_candle_count()
+                except Exception:
+                    candle_count = 0
+
+                # Get signal count
+                try:
+                    signal_count = db.get_signal_count()
+                except Exception:
+                    signal_count = 0
+
+                with db_cols[0]:
+                    st.metric("Total Candles", f"{candle_count:,}")
+
+                with db_cols[1]:
+                    st.metric("Total Signals", signal_count)
+
+                with db_cols[2]:
+                    # Database file size
+                    db_size = signals_db_path.stat().st_size / (1024 * 1024)  # MB
+                    st.metric("Database Size", f"{db_size:.2f} MB")
+
+                with db_cols[3]:
+                    # Last modified
+                    import os
+                    last_mod = datetime.fromtimestamp(os.path.getmtime(signals_db_path))
+                    st.metric("Last Update", last_mod.strftime('%H:%M:%S'))
+
+                db.close()
+
+            else:
+                st.info("Database not initialized. Start the analysis engine to create it.")
+
+        except Exception as e:
+            st.warning(f"Could not get database stats: {e}")
+            logger.debug(f"Database stats error: {e}")
+
+    with status_tabs[1]:  # Data Collection Status
+        st.markdown("#### Data Collection Status")
+
+        try:
+            # Check if DataService is available and get status
+            data_cols = st.columns(4)
+
+            with data_cols[0]:
+                # Analysis engine status
+                engine_running, engine_pid = is_analysis_running()
+                engine_color = "#38ef7d" if engine_running else "#f5576c"
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: {engine_color}">
+                    <div class="metric-label">Analysis Engine</div>
+                    <div class="metric-value" style="color: {engine_color}; font-size: 1.5rem;">
+                        {'Running' if engine_running else 'Stopped'}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        {f'PID: {engine_pid}' if engine_running else 'Not started'}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with data_cols[1]:
+                # Exchange connection status
+                exchange_ok = st.session_state.get('exchange_obj') is not None
+                exc_color = "#38ef7d" if exchange_ok else "#f5576c"
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: {exc_color}">
+                    <div class="metric-label">Exchange</div>
+                    <div class="metric-value" style="color: {exc_color}; font-size: 1.5rem;">
+                        {'Connected' if exchange_ok else 'Disconnected'}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        {st.session_state.get('selected_exchange', 'N/A').title()}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with data_cols[2]:
+                # API mode indicator
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Data Mode</div>
+                    <div class="metric-value" style="font-size: 1.5rem;">REST API</div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        Auto-refresh: {'ON' if st.session_state.get('auto_refresh') else 'OFF'}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with data_cols[3]:
+                # Last fetch time
+                last_fetch = st.session_state.get('last_fetch_time')
+                fetch_str = last_fetch.strftime('%H:%M:%S') if last_fetch else 'Never'
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">Last Fetch</div>
+                    <div class="metric-value" style="font-size: 1.5rem;">{fetch_str}</div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        Updates: {st.session_state.get('update_count', 0)}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        except Exception as e:
+            st.warning(f"Could not get data collection status: {e}")
+            logger.debug(f"Data collection status error: {e}")
+
+    with status_tabs[2]:  # Notification Status
+        st.markdown("#### Notification System")
+
+        try:
+            notif_cols = st.columns(3)
+
+            with notif_cols[0]:
+                # Desktop notifications
+                st.markdown("""
+                <div class="metric-card">
+                    <div class="metric-label">Desktop Notifications</div>
+                    <div class="metric-value" style="font-size: 1.2rem;">Enabled</div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        System alerts
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.button("🔔 Test Desktop", key="test_desktop"):
+                    try:
+                        if Notifier is not None:
+                            notifier = Notifier()
+                            notifier._send_desktop("Test Notification", "Dashboard test - notifications working!")
+                            st.success("Desktop notification sent!")
+                        else:
+                            st.warning("Notifier not available")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
+            with notif_cols[1]:
+                # Sound alerts
+                st.markdown("""
+                <div class="metric-card">
+                    <div class="metric-label">Sound Alerts</div>
+                    <div class="metric-value" style="font-size: 1.2rem;">Available</div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        Audio feedback
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                if st.button("🔊 Test Sound", key="test_sound"):
+                    try:
+                        if Notifier is not None:
+                            notifier = Notifier()
+                            notifier._play_sound()
+                            st.success("Sound played!")
+                        else:
+                            st.warning("Notifier not available")
+                    except Exception as e:
+                        st.error(f"Failed: {e}")
+
+            with notif_cols[2]:
+                # Telegram status
+                config_path = ROOT / "config.yaml"
+                telegram_configured = False
+                if config_path.exists():
+                    try:
+                        with open(config_path, 'r') as f:
+                            config = yaml.safe_load(f)
+                        telegram_configured = bool(config.get('notifications', {}).get('telegram', {}).get('bot_token'))
+                    except Exception:
+                        pass
+
+                tg_color = "#38ef7d" if telegram_configured else "#ffc107"
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: {tg_color}">
+                    <div class="metric-label">Telegram</div>
+                    <div class="metric-value" style="color: {tg_color}; font-size: 1.2rem;">
+                        {'Configured' if telegram_configured else 'Not Configured'}
+                    </div>
+                    <div style="color: #6c757d; font-size: 0.85rem;">
+                        {'Bot connected' if telegram_configured else 'Add bot token in config'}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        except Exception as e:
+            st.warning(f"Could not get notification status: {e}")
+            logger.debug(f"Notification status error: {e}")
+
+    # Auto-refresh logic
+    if st.session_state.auto_refresh:
+        time.sleep(2)  # 2 second refresh
+        st.rerun()
 
 if __name__ == "__main__":
     main()

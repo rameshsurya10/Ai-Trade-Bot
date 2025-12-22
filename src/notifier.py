@@ -6,7 +6,6 @@ Works even when browser/dashboard is closed!
 """
 
 import logging
-import os
 import subprocess
 import threading
 from datetime import datetime
@@ -175,33 +174,45 @@ class Notifier:
             logger.error(f"Desktop notification failed: {e}")
             self._send_desktop_fallback(title, message)
 
+    @staticmethod
+    def _sanitize_for_shell(text: str) -> str:
+        """Sanitize text to prevent command injection."""
+        # Remove or escape dangerous characters
+        dangerous_chars = ['`', '$', '\\', '"', "'", ';', '|', '&', '\n', '\r', '(', ')', '{', '}', '[', ']', '<', '>']
+        sanitized = text
+        for char in dangerous_chars:
+            sanitized = sanitized.replace(char, ' ')
+        # Limit length to prevent buffer issues
+        return sanitized[:200]
+
     def _send_desktop_fallback(self, title: str, message: str):
         """Fallback desktop notification using system commands."""
         try:
             import platform
             system = platform.system()
 
+            # Sanitize all inputs to prevent command injection
+            title_safe = self._sanitize_for_shell(title)
+            message_safe = self._sanitize_for_shell(message)
+
             if system == "Linux":
+                # Linux notify-send is safe with list arguments
                 subprocess.run(
-                    ['notify-send', title, message],
+                    ['notify-send', title_safe, message_safe],
                     timeout=5,
                     capture_output=True
                 )
             elif system == "Darwin":  # macOS
-                # Escape quotes to prevent command injection
-                title_safe = title.replace('\\', '\\\\').replace('"', '\\"')
-                message_safe = message.replace('\\', '\\\\').replace('"', '\\"')
+                # Use osascript with sanitized input
                 script = f'display notification "{message_safe}" with title "{title_safe}"'
                 subprocess.run(
                     ['osascript', '-e', script],
                     timeout=5,
-                    capture_output=True
+                    capture_output=True,
+                    check=False
                 )
             elif system == "Windows":
-                # Escape special characters for PowerShell
-                title_safe = title.replace('"', '`"').replace('$', '`$')
-                message_safe = message.replace('"', '`"').replace('$', '`$')
-                # Windows toast notification via PowerShell
+                # Windows toast notification via PowerShell with sanitized input
                 ps_script = f'''
                 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
                 $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -222,17 +233,34 @@ class Notifier:
         except Exception as e:
             logger.error(f"Desktop fallback failed: {e}")
 
+    def _validate_sound_path(self, path: str) -> Optional[str]:
+        """Validate sound file path to prevent path traversal attacks."""
+        if not path:
+            return None
+
+        try:
+            sound_path = Path(path).resolve()
+            # Only allow files with audio extensions
+            allowed_extensions = {'.wav', '.mp3', '.ogg', '.oga', '.aiff', '.aif', '.m4a'}
+            if sound_path.suffix.lower() not in allowed_extensions:
+                logger.warning(f"Sound file has invalid extension: {sound_path.suffix}")
+                return None
+            # Check file exists
+            if not sound_path.exists():
+                return None
+            return str(sound_path)
+        except Exception as e:
+            logger.warning(f"Invalid sound path: {e}")
+            return None
+
     def _play_sound(self):
         """Play alert sound."""
         try:
             import platform
             system = platform.system()
 
-            # Check for custom sound file
-            if self.sound_file and Path(self.sound_file).exists():
-                sound_path = self.sound_file
-            else:
-                sound_path = None
+            # Check and validate custom sound file
+            sound_path = self._validate_sound_path(self.sound_file)
 
             if system == "Linux":
                 if sound_path:
