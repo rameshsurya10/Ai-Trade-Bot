@@ -34,14 +34,22 @@ try:
     from src.data_service import DataService
     from src.core.database import Database
     from src.notifier import Notifier
+
+    # Import advanced dashboard features
+    from src.backtesting.visual_backtester import VisualBacktester
+    from src.paper_trading import PaperTradingSimulator, OrderSide, OrderType
+    from src.dashboard_features import render_backtesting_interface, render_paper_trading
+    from src.dashboard_features_part2 import render_portfolio_tracking, render_risk_management, render_realtime_alerts
+
     import yaml
     AI_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     AI_AVAILABLE = False
     MultiCurrencySystem = None
     DataService = None
     Database = None
     Notifier = None
+    logger.warning(f"AI modules not available: {e}")
 
 # Setup
 ROOT = Path(__file__).parent
@@ -273,12 +281,27 @@ if 'algorithm_weights' not in st.session_state:
     }
 # Dashboard view mode
 if 'view_mode' not in st.session_state:
-    st.session_state.view_mode = 'trading'  # trading, analysis, config
+    st.session_state.view_mode = 'trading'  # trading, analysis, config, advanced
 # Show advanced panels
 if 'show_algorithm_details' not in st.session_state:
     st.session_state.show_algorithm_details = False
 if 'show_all_indicators' not in st.session_state:
     st.session_state.show_all_indicators = False
+
+# Advanced Features - Paper Trading Simulator
+if 'paper_trader' not in st.session_state:
+    if AI_AVAILABLE:
+        st.session_state.paper_trader = PaperTradingSimulator(initial_capital=10000, commission=0.001)
+    else:
+        st.session_state.paper_trader = None
+
+# Advanced Features - Database
+if 'db' not in st.session_state:
+    if AI_AVAILABLE:
+        db_path = ROOT / "data" / "trading.db"
+        st.session_state.db = Database(str(db_path))
+    else:
+        st.session_state.db = None
 
 # Helper functions (defined before use)
 def is_analysis_running():
@@ -425,11 +448,16 @@ def main():
 
         # View Mode Selection
         st.markdown("### 📊 Dashboard View")
+        view_options = ["Trading", "Analysis", "Advanced", "Configuration"]
+        default_view = st.session_state.view_mode.title()
+        if default_view not in view_options:
+            default_view = "Trading"
+
         view_mode = st.radio(
             "Select View",
-            ["Trading", "Analysis", "Configuration"],
-            index=["Trading", "Analysis", "Configuration"].index(st.session_state.view_mode.title()),
-            horizontal=True
+            view_options,
+            index=view_options.index(default_view),
+            horizontal=False
         )
         st.session_state.view_mode = view_mode.lower()
 
@@ -1803,6 +1831,82 @@ def main():
         except Exception as e:
             st.warning(f"⚠️ Could not load signal data: {str(e)}")
             logger.error(f"Signals error: {e}")
+
+    # ==============================================================================
+    # UPDATE PAPER TRADING POSITIONS WITH CURRENT PRICES
+    # ==============================================================================
+    if st.session_state.paper_trader and data and data['success']:
+        # Update all positions with current market price
+        try:
+            prices = {st.session_state.selected_symbol: current_price}
+            st.session_state.paper_trader.update_positions(prices)
+        except Exception as e:
+            logger.debug(f"Could not update paper trading positions: {e}")
+
+    # ==============================================================================
+    # ADVANCED FEATURES VIEW - ALL 5 CRITICAL FEATURES
+    # ==============================================================================
+    if st.session_state.view_mode == 'advanced' and AI_AVAILABLE:
+        st.markdown("---")
+        st.markdown("## 🚀 Advanced Trading Features")
+        st.markdown("*Professional-grade tools for backtesting, paper trading, portfolio tracking, and risk management*")
+
+        # Create tabs for all 5 advanced features
+        feature_tabs = st.tabs([
+            "📊 Backtesting",
+            "💼 Paper Trading",
+            "💰 Portfolio",
+            "🛡️ Risk Management",
+            "🔔 Alerts"
+        ])
+
+        with feature_tabs[0]:  # BACKTESTING
+            if st.session_state.db:
+                render_backtesting_interface(st.session_state.db)
+            else:
+                st.error("Database not available. Please ensure AI modules are installed.")
+
+        with feature_tabs[1]:  # PAPER TRADING
+            if st.session_state.paper_trader and data and data['success']:
+                render_paper_trading(
+                    st.session_state.paper_trader,
+                    current_price,
+                    st.session_state.selected_symbol
+                )
+            else:
+                st.error("Paper trading not available. Please ensure AI modules are installed and market data is loaded.")
+
+        with feature_tabs[2]:  # PORTFOLIO TRACKING
+            if st.session_state.db:
+                render_portfolio_tracking(st.session_state.db, st.session_state.paper_trader)
+            else:
+                st.error("Portfolio tracking not available. Please ensure database is initialized.")
+
+        with feature_tabs[3]:  # RISK MANAGEMENT
+            if st.session_state.db:
+                render_risk_management(st.session_state.db, st.session_state.paper_trader)
+            else:
+                st.error("Risk management not available. Please ensure database is initialized.")
+
+        with feature_tabs[4]:  # REAL-TIME ALERTS
+            render_realtime_alerts()
+
+        st.markdown("---")
+
+    elif st.session_state.view_mode == 'advanced' and not AI_AVAILABLE:
+        st.markdown("---")
+        st.error("🚨 Advanced Features Unavailable")
+        st.warning("""
+        Advanced trading features require AI modules to be installed.
+
+        **To enable these features:**
+        ```bash
+        pip install -r requirements.txt
+        ```
+
+        Then restart the dashboard.
+        """)
+        st.markdown("---")
 
     # ==============================================================================
     # SYSTEM STATUS PANEL

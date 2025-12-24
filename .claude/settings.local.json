@@ -50,7 +50,14 @@
       "Skill(model-check)",
       "Skill(model-check:*)",
       "Bash(echo:*)",
-      "Bash(timeout 8 venv/bin/streamlit:*)"
+      "Bash(timeout 8 venv/bin/streamlit:*)",
+      "Skill(performance-check)",
+      "Skill(performance-check:*)",
+      "Skill(notebook-review)",
+      "Skill(notebook-review:*)",
+      "Bash(if [ -d \"venv\" ])",
+      "Bash(then echo \"✅ Virtual environment exists at venv/\")",
+      "Bash(else echo \"❌ No venv found\")"
     ]
   }
 }

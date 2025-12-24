@@ -317,7 +317,7 @@ class AnalysisEngine:
             raise FileNotFoundError(f"ML model required but not found: {self.model_path}")
 
         try:
-            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
+            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=True)
 
             input_size = len(self.feature_columns)
             self._model = LSTMModel(
