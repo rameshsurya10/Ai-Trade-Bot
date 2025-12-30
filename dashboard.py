@@ -27,9 +27,8 @@ except ImportError:
 
 # Import AI/Math modules for predictions and analysis
 try:
-    from src.advanced_predictor import AdvancedPredictor
-    from src.math_engine import MathEngine
-    from src.analysis_engine import FeatureCalculator
+    # New Unbreakable Predictor System
+    from src.ml import UnbreakablePredictor
     from src.multi_currency_system import MultiCurrencySystem
     from src.data_service import DataService
     from src.core.database import Database
@@ -45,10 +44,12 @@ try:
     AI_AVAILABLE = True
 except ImportError as e:
     AI_AVAILABLE = False
+    UnbreakablePredictor = None
     MultiCurrencySystem = None
     DataService = None
     Database = None
     Notifier = None
+    logger = logging.getLogger(__name__)
     logger.warning(f"AI modules not available: {e}")
 
 # Setup
@@ -407,16 +408,26 @@ if 'exchange_obj' not in st.session_state and CCXT_AVAILABLE:
         logger.error(f"Failed to initialize exchange: {e}")
         st.session_state.exchange_obj = None
 
-# Initialize AI/Math engines
+# Initialize AI/Math engines (New Unbreakable System)
 if 'predictor' not in st.session_state and AI_AVAILABLE:
     try:
-        st.session_state.predictor = AdvancedPredictor()
-        st.session_state.math_engine = MathEngine()
-        logger.info("✅ AI/Math engines initialized")
+        predictor = UnbreakablePredictor(
+            config_path=str(ROOT / "config.yaml"),
+            model_dir=str(ROOT / "models" / "unbreakable"),
+            use_gpu=True
+        )
+        # Try to load pre-trained models
+        model_path = ROOT / "models" / "unbreakable"
+        if model_path.exists() and (model_path / "regime_detector.joblib").exists():
+            predictor.load()
+            logger.info("✅ Loaded pre-trained Unbreakable Predictor")
+        else:
+            logger.info("⚠️ No pre-trained models found. Run: python scripts/train_model.py")
+        st.session_state.predictor = predictor
+        logger.info("✅ Unbreakable Predictor initialized")
     except Exception as e:
-        logger.error(f"Failed to initialize AI engines: {e}")
+        logger.error(f"Failed to initialize Unbreakable Predictor: {e}")
         st.session_state.predictor = None
-        st.session_state.math_engine = None
 
 # Auto-start Analysis Engine on first load
 if 'engine_auto_started' not in st.session_state:
@@ -789,481 +800,258 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-    # AI Predictions Section
+    # AI Predictions Section - Unbreakable Predictor System
     if AI_AVAILABLE and st.session_state.predictor and df is not None and len(df) >= 100:
         st.markdown("---")
-        st.markdown("### 🤖 AI Predictions & Mathematical Analysis")
+        st.markdown("### 🤖 AI Predictions & Ensemble Analysis")
 
         try:
-            # Get AI prediction
-            prediction = st.session_state.predictor.predict(df)
+            # Check if predictor is fitted
+            if not st.session_state.predictor._is_fitted:
+                st.warning("⚠️ Model not trained. Run: `python scripts/train_model.py` to train the model.")
+            else:
+                # Get AI prediction from Unbreakable Predictor
+                prediction = st.session_state.predictor.predict(df)
 
-            # Get mathematical indicators from MathEngine (pass full DataFrame)
-            math_analysis = st.session_state.math_engine.analyze(df)
+                # Display predictions in columns
+                pred_cols = st.columns([1, 1, 1, 1])
 
-            # Display predictions in columns
-            pred_cols = st.columns([1, 1, 1, 1])
-
-            with pred_cols[0]:
-                direction_color = "#38ef7d" if prediction.direction == "BUY" else "#f5576c" if prediction.direction == "SELL" else "#ffc107"
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">AI Signal</div>
-                    <div class="metric-value" style="color: {direction_color}; font-size: 2.5rem;">
-                        {prediction.direction}
+                with pred_cols[0]:
+                    direction_color = "#38ef7d" if prediction.direction == "BUY" else "#f5576c" if prediction.direction == "SELL" else "#ffc107"
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">AI Signal</div>
+                        <div class="metric-value" style="color: {direction_color}; font-size: 2.5rem;">
+                            {prediction.direction}
+                        </div>
+                        <div style="color: #6c757d; font-size: 0.9rem;">
+                            Confidence: {prediction.confidence * 100:.1f}%
+                        </div>
                     </div>
-                    <div style="color: #6c757d; font-size: 0.9rem;">
-                        Confidence: {prediction.confidence * 100:.1f}%
+                    """, unsafe_allow_html=True)
+
+                with pred_cols[1]:
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Stop Loss</div>
+                        <div class="metric-value" style="color: #f5576c; font-size: 1.8rem;">
+                            ${prediction.stop_loss:,.2f}
+                        </div>
+                        <div style="color: #6c757d; font-size: 0.9rem;">
+                            Position: {prediction.position_size_pct * 100:.1f}%
+                        </div>
                     </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
-            with pred_cols[1]:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Stop Loss</div>
-                    <div class="metric-value" style="color: #f5576c; font-size: 1.8rem;">
-                        ${prediction.stop_loss:,.2f}
+                with pred_cols[2]:
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Take Profit</div>
+                        <div class="metric-value" style="color: #38ef7d; font-size: 1.8rem;">
+                            ${prediction.take_profit:,.2f}
+                        </div>
+                        <div style="color: #6c757d; font-size: 0.9rem;">
+                            R:R {prediction.risk_reward_ratio:.2f}:1
+                        </div>
                     </div>
-                    <div style="color: #6c757d; font-size: 0.9rem;">
-                        Risk: {prediction.monte_carlo_risk * 100:.1f}%
+                    """, unsafe_allow_html=True)
+
+                with pred_cols[3]:
+                    regime_color = "#38ef7d" if prediction.regime == "BULL" else "#f5576c" if prediction.regime == "BEAR" else "#ffc107"
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Market Regime</div>
+                        <div class="metric-value" style="color: {regime_color}; font-size: 1.8rem;">
+                            {prediction.regime}
+                        </div>
+                        <div style="color: #6c757d; font-size: 0.9rem;">
+                            Confidence: {prediction.regime_confidence * 100:.1f}%
+                        </div>
                     </div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
-            with pred_cols[2]:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Take Profit</div>
-                    <div class="metric-value" style="color: #38ef7d; font-size: 1.8rem;">
-                        ${prediction.take_profit:,.2f}
-                    </div>
-                    <div style="color: #6c757d; font-size: 0.9rem;">
-                        R:R {prediction.risk_reward_ratio:.2f}:1
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                # Warnings display
+                if prediction.warnings:
+                    st.warning("⚠️ " + " | ".join(prediction.warnings))
 
-            with pred_cols[3]:
-                hurst_color = "#38ef7d" if math_analysis.hurst_exponent > 0.5 else "#f5576c"
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">Market Regime</div>
-                    <div class="metric-value" style="color: {hurst_color}; font-size: 1.8rem;">
-                        {math_analysis.hurst_regime}
-                    </div>
-                    <div style="color: #6c757d; font-size: 0.9rem;">
-                        Hurst: {math_analysis.hurst_exponent:.3f}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                # Model Analysis details
+                with st.expander("🔬 Ensemble Model Breakdown", expanded=False):
+                    math_cols = st.columns(3)
 
-            # Mathematical details (basic view)
-            with st.expander("🔬 Mathematical Breakdown", expanded=False):
-                math_cols = st.columns(3)
+                    with math_cols[0]:
+                        st.markdown("**Technical Indicators**")
+                        st.write(f"RSI (14): {prediction.rsi:.2f}")
+                        rsi_signal = "Overbought" if prediction.rsi > 70 else "Oversold" if prediction.rsi < 30 else "Neutral"
+                        st.write(f"RSI Signal: {rsi_signal}")
+                        st.write(f"MACD Histogram: {prediction.macd_hist:.4f}")
+                        st.write(f"ATR (14): ${prediction.atr:.2f}")
 
-                with math_cols[0]:
-                    st.markdown("**Fourier Analysis**")
-                    st.write(f"Cycle Signal: {prediction.fourier_signal:.3f}")
+                    with math_cols[1]:
+                        st.markdown("**Risk Metrics**")
+                        st.write(f"Expected Value: ${prediction.expected_value:.2f}")
+                        st.write(f"Drift Score: {prediction.drift_score:.4f}")
+                        drift_status = "Normal" if prediction.drift_score < 0.3 else "Elevated" if prediction.drift_score < 0.6 else "High"
+                        st.write(f"Drift Status: {drift_status}")
 
-                    st.markdown("**Kalman Filter**")
-                    st.write(f"Trend Direction: {prediction.kalman_trend:.3f}")
+                    with math_cols[2]:
+                        st.markdown("**Base Model Predictions**")
+                        for model_name, pred_val in prediction.base_model_predictions.items():
+                            st.write(f"{model_name}: {pred_val:.4f}")
 
-                    st.markdown("**Wavelet Analysis**")
-                    st.write(f"Signal: {math_analysis.wavelet_signal:.3f}")
+                # ==========================================================================
+                # FULL ALGORITHM DETAILS (when checkbox enabled)
+                # ==========================================================================
+                if st.session_state.show_algorithm_details:
+                    st.markdown("---")
+                    st.markdown("### 🔬 Complete Ensemble Analysis")
 
-                with math_cols[1]:
-                    st.markdown("**Hurst Exponent**")
-                    st.write(f"Value: {math_analysis.hurst_exponent:.3f}")
-                    st.write(f"Regime: {math_analysis.hurst_regime}")
+                    # Base model predictions visualization
+                    st.markdown("#### 🧠 Base Model Contributions")
+                    if prediction.base_model_predictions:
+                        model_df = pd.DataFrame([
+                            {"Model": k, "Prediction": v, "Signal": "BUY" if v > 0.5 else "SELL" if v < 0.5 else "NEUTRAL"}
+                            for k, v in prediction.base_model_predictions.items()
+                        ])
+                        st.dataframe(model_df, use_container_width=True, hide_index=True)
 
-                    st.markdown("**Markov Chain**")
-                    st.write(f"Transition Prob: {prediction.markov_probability * 100:.1f}%")
-
-                with math_cols[2]:
-                    st.markdown("**Risk Metrics**")
-                    st.write(f"Monte Carlo Risk: {prediction.monte_carlo_risk * 100:.1f}%")
-                    st.write(f"Jump Probability: {math_analysis.jump_probability * 100:.1f}%")
-                    st.write(f"Crash Indicator: {math_analysis.crash_indicator * 100:.1f}%")
-
-            # ==========================================================================
-            # FULL ALGORITHM DETAILS (when checkbox enabled)
-            # ==========================================================================
-            if st.session_state.show_algorithm_details:
-                st.markdown("---")
-                st.markdown("### 🔬 Complete Algorithm Analysis")
-
-                # Algorithm weights visualization
-                st.markdown("#### ⚖️ Current Algorithm Weights")
-                weights = st.session_state.algorithm_weights
-                weights_df = pd.DataFrame([
-                    {"Algorithm": k.title(), "Weight": v, "Percentage": f"{v*100:.1f}%"}
-                    for k, v in weights.items()
-                ])
-                st.dataframe(weights_df, use_container_width=True, hide_index=True)
-
-                # Detailed algorithm panels
-                alg_tabs = st.tabs([
-                    "🌊 Fourier", "📡 Kalman", "🎲 Entropy", "🔗 Markov", "🧠 LSTM",
-                    "📈 Wavelet", "📊 Hurst", "🔄 Ornstein-Uhlenbeck", "⚡ Jump Detection", "🔢 Eigenvalue"
-                ])
-
-                with alg_tabs[0]:  # Fourier
-                    st.markdown("#### Fourier Analysis (Cycle Detection)")
-                    st.markdown("""
-                    **Purpose:** Detects hidden cycles and periodicities in price data.
-
-                    **How it works:**
-                    - Decomposes price into frequency components
-                    - Identifies dominant cycles (daily, weekly patterns)
-                    - Predicts next cycle phase
-                    """)
-
-                    # Main signal metric
-                    st.metric("Fourier Signal", f"{prediction.fourier_signal:.4f}")
-                    signal_strength = "Strong" if abs(prediction.fourier_signal) > 0.5 else "Moderate" if abs(prediction.fourier_signal) > 0.2 else "Weak"
-                    st.info(f"Signal Strength: {signal_strength}")
-
-                    # Detailed Fourier analysis (if available)
-                    fourier_details = getattr(prediction, 'fourier_details', None)
-                    if fourier_details and not fourier_details.get('error'):
-                        st.markdown("---")
-                        st.markdown("##### 📊 Detailed Cycle Analysis")
-
-                        # Cycle metrics in columns
-                        fc1, fc2, fc3 = st.columns(3)
-                        with fc1:
-                            period = fourier_details.get('dominant_period', 0)
-                            if period > 0:
-                                st.metric("Dominant Cycle", f"{period:.1f} candles")
-                                # Interpret the period
-                                if period < 12:
-                                    cycle_type = "Short-term (intraday)"
-                                elif period < 48:
-                                    cycle_type = "Medium-term (daily)"
-                                elif period < 168:
-                                    cycle_type = "Weekly pattern"
-                                else:
-                                    cycle_type = "Long-term cycle"
-                                st.caption(cycle_type)
-                            else:
-                                st.metric("Dominant Cycle", "N/A")
-
-                        with fc2:
-                            phase = fourier_details.get('phase', 0)
-                            phase_deg = np.degrees(phase) if phase else 0
-                            st.metric("Current Phase", f"{phase_deg:.1f}°")
-                            # Phase interpretation
-                            if -45 <= phase_deg <= 45:
-                                phase_meaning = "Peak zone (reversal likely)"
-                            elif 45 < phase_deg <= 135:
-                                phase_meaning = "Uptrend phase"
-                            elif -135 <= phase_deg < -45:
-                                phase_meaning = "Downtrend phase"
-                            else:
-                                phase_meaning = "Trough zone (reversal likely)"
-                            st.caption(phase_meaning)
-
-                        with fc3:
-                            interpretation = fourier_details.get('interpretation', 'NEUTRAL')
-                            if interpretation == 'BULLISH':
-                                st.success(f"📈 {interpretation}")
-                            elif interpretation == 'BEARISH':
-                                st.error(f"📉 {interpretation}")
-                            else:
-                                st.info(f"➡️ {interpretation}")
-                            st.caption("Cycle direction")
-
-                        # Frequency spectrum visualization
-                        freqs = fourier_details.get('dominant_frequencies', [])
-                        mags = fourier_details.get('magnitudes', [])
-                        if freqs and mags:
-                            st.markdown("##### 📈 Frequency Spectrum (Top 3)")
-                            # Create bar chart for frequency magnitudes
-                            freq_df = pd.DataFrame({
-                                'Frequency': [f'{f:.4f}' for f in freqs],
-                                'Magnitude': mags,
-                                'Period': [f'{1/f:.1f} candles' if f > 0.0001 else 'N/A' for f in freqs]
-                            })
-                            st.dataframe(freq_df, use_container_width=True)
-
-                            # Visual bar chart
-                            fig_freq = go.Figure(data=[
-                                go.Bar(
-                                    x=[f'Cycle {i+1}\n({1/f:.0f} candles)' if f > 0.0001 else f'Cycle {i+1}' for i, f in enumerate(freqs)],
-                                    y=mags,
-                                    marker_color=['#667eea', '#764ba2', '#f093fb']
-                                )
-                            ])
-                            fig_freq.update_layout(
-                                title="Dominant Cycle Strengths",
-                                xaxis_title="Cycle",
-                                yaxis_title="Magnitude",
-                                height=250,
-                                margin=dict(l=0, r=0, t=40, b=0)
+                        # Visual bar chart for model predictions
+                        fig_models = go.Figure(data=[
+                            go.Bar(
+                                x=list(prediction.base_model_predictions.keys()),
+                                y=list(prediction.base_model_predictions.values()),
+                                marker_color=['#38ef7d' if v > 0.5 else '#f5576c' if v < 0.5 else '#ffc107'
+                                             for v in prediction.base_model_predictions.values()]
                             )
-                            st.plotly_chart(fig_freq, use_container_width=True)
+                        ])
+                        fig_models.add_hline(y=0.5, line_dash="dash", line_color="gray")
+                        fig_models.update_layout(
+                            title="Base Model Predictions",
+                            xaxis_title="Model",
+                            yaxis_title="Bullish Probability",
+                            height=300,
+                            margin=dict(l=0, r=0, t=40, b=0)
+                        )
+                        st.plotly_chart(fig_models, use_container_width=True)
 
-                        # Cycle prediction
-                        st.markdown("##### 🔮 Cycle Prediction")
-                        period = fourier_details.get('dominant_period', 0)
-                        if period > 0:
-                            # Calculate where we are in the cycle
-                            phase_norm = (phase_deg + 180) / 360  # Normalize to 0-1
-                            candles_into_cycle = int(period * phase_norm)
-                            candles_remaining = int(period - candles_into_cycle)
+                    # Detailed analysis panels
+                    alg_tabs = st.tabs([
+                        "📊 Regime Detection", "🎯 Risk Analysis", "📈 Technical Indicators",
+                        "🔄 Continuous Learning", "⚙️ Model Status"
+                    ])
 
-                            pred_c1, pred_c2 = st.columns(2)
-                            with pred_c1:
-                                st.metric("Position in Cycle", f"{candles_into_cycle}/{int(period)} candles")
-                            with pred_c2:
-                                st.metric("Until Next Reversal", f"~{candles_remaining} candles")
+                    with alg_tabs[0]:  # Regime Detection
+                        st.markdown("#### GMM-HMM Market Regime Detection")
+                        st.markdown("""
+                        **Purpose:** Identifies current market regime using Hidden Markov Model.
 
-                            # Progress bar for cycle
-                            st.progress(min(1.0, phase_norm), text=f"Cycle Progress: {phase_norm*100:.0f}%")
-                    else:
-                        st.warning("⚠️ Insufficient data for detailed Fourier analysis (need 64+ candles)")
+                        **Regimes:**
+                        - **BULL**: Trending up, low volatility - follow momentum
+                        - **BEAR**: Trending down, high volatility - defensive positioning
+                        - **SIDEWAYS**: Mean-reverting, medium volatility - range trading
 
-                with alg_tabs[1]:  # Kalman
-                    st.markdown("#### Kalman Filter (Trend Estimation)")
-                    st.markdown("""
-                    **Purpose:** Optimal estimation of true price trend with noise filtering.
+                        **Research:** Outperformed buy-and-hold 2006-2023 (QuantStart, LSEG)
+                        """)
 
-                    **How it works:**
-                    - Predicts price using state-space model
-                    - Updates prediction based on new observations
-                    - Adapts to volatility changes
-                    """)
-                    st.metric("Kalman Trend", f"{prediction.kalman_trend:.4f}")
-                    trend_dir = "Bullish" if prediction.kalman_trend > 0 else "Bearish"
-                    st.info(f"Trend Direction: {trend_dir}")
+                        # Regime metrics
+                        regime_cols = st.columns(3)
+                        with regime_cols[0]:
+                            st.metric("Current Regime", prediction.regime)
+                        with regime_cols[1]:
+                            st.metric("Confidence", f"{prediction.regime_confidence * 100:.1f}%")
+                        with regime_cols[2]:
+                            regime_signal = "Follow trend" if prediction.regime == "BULL" else "Defensive" if prediction.regime == "BEAR" else "Range trade"
+                            st.metric("Strategy", regime_signal)
 
-                with alg_tabs[2]:  # Entropy
-                    st.markdown("#### Shannon Entropy (Regime Detection)")
-                    st.markdown("""
-                    **Purpose:** Measures market disorder and regime changes.
+                    with alg_tabs[1]:  # Risk Analysis
+                        st.markdown("#### Risk Management Analysis")
+                        st.markdown("""
+                        **Components:**
+                        - **Fractional Kelly Criterion**: Optimal position sizing
+                        - **Dynamic Stop Loss**: ATR-based with support/resistance
+                        - **Expected Value**: Probability-weighted returns
+                        """)
 
-                    **How it works:**
-                    - Calculates information entropy of returns
-                    - High entropy = uncertain market
-                    - Low entropy = predictable patterns
-                    """)
-                    entropy_val = getattr(prediction, 'entropy_signal', 0.5)
-                    st.metric("Market Entropy", f"{entropy_val:.4f}")
-                    regime = "High Uncertainty" if entropy_val > 0.7 else "Moderate" if entropy_val > 0.4 else "Low Uncertainty"
-                    st.info(f"Market Regime: {regime}")
+                        risk_cols = st.columns(3)
+                        with risk_cols[0]:
+                            st.metric("Position Size", f"{prediction.position_size_pct * 100:.2f}%")
+                            st.caption("Kelly-optimized")
+                        with risk_cols[1]:
+                            st.metric("Risk/Reward", f"{prediction.risk_reward_ratio:.2f}:1")
+                            rr_quality = "Excellent" if prediction.risk_reward_ratio >= 2.5 else "Good" if prediction.risk_reward_ratio >= 1.5 else "Fair"
+                            st.caption(rr_quality)
+                        with risk_cols[2]:
+                            st.metric("Expected Value", f"${prediction.expected_value:.2f}")
+                            ev_signal = "Positive EV" if prediction.expected_value > 0 else "Negative EV"
+                            st.caption(ev_signal)
 
-                with alg_tabs[3]:  # Markov
-                    st.markdown("#### Markov Chain (State Transitions)")
-                    st.markdown("""
-                    **Purpose:** Models market as state machine with transition probabilities.
+                    with alg_tabs[2]:  # Technical Indicators
+                        st.markdown("#### Technical Indicators")
 
-                    **States:** Strong Bear, Bear, Neutral, Bull, Strong Bull
+                        tech_cols = st.columns(4)
+                        with tech_cols[0]:
+                            rsi_color = "#f5576c" if prediction.rsi > 70 else "#38ef7d" if prediction.rsi < 30 else "#ffc107"
+                            st.metric("RSI (14)", f"{prediction.rsi:.1f}")
+                            rsi_signal = "Overbought" if prediction.rsi > 70 else "Oversold" if prediction.rsi < 30 else "Neutral"
+                            st.caption(rsi_signal)
 
-                    **How it works:**
-                    - Learns historical state transitions
-                    - Predicts next likely state
-                    - Provides probability of direction change
-                    """)
+                        with tech_cols[1]:
+                            macd_color = "#38ef7d" if prediction.macd_hist > 0 else "#f5576c"
+                            st.metric("MACD Hist", f"{prediction.macd_hist:.4f}")
+                            macd_signal = "Bullish" if prediction.macd_hist > 0 else "Bearish"
+                            st.caption(macd_signal)
 
-                    # Main probability metric
-                    st.metric("Bullish Probability", f"{prediction.markov_probability * 100:.1f}%")
+                        with tech_cols[2]:
+                            st.metric("ATR (14)", f"${prediction.atr:.2f}")
+                            st.caption("Volatility measure")
 
-                    # Detailed Markov analysis (if available)
-                    markov_details = getattr(prediction, 'markov_details', None)
-                    if markov_details:
-                        st.markdown("---")
-                        st.markdown("##### 📊 Transition Matrix Visualization")
+                        with tech_cols[3]:
+                            bb_pct = prediction.bb_position * 100
+                            st.metric("BB Position", f"{bb_pct:.1f}%")
+                            bb_signal = "Upper band" if bb_pct > 80 else "Lower band" if bb_pct < 20 else "Middle"
+                            st.caption(bb_signal)
 
-                        # Current state indicator
-                        state_names = markov_details.get('state_names', ['Strong Bear', 'Bear', 'Neutral', 'Bull', 'Strong Bull'])
-                        current_state = markov_details.get('current_state', 2)
-                        current_state_name = state_names[current_state] if 0 <= current_state < len(state_names) else 'Unknown'
+                    with alg_tabs[3]:  # Continuous Learning
+                        st.markdown("#### Continuous Learning Status")
+                        st.markdown("""
+                        **Components:**
+                        - **EWC (Elastic Weight Consolidation)**: Prevents catastrophic forgetting
+                        - **Concept Drift Detection**: Monitors for market regime changes
+                        - **Experience Replay**: Stores important samples for retraining
+                        """)
 
-                        mk_c1, mk_c2, mk_c3 = st.columns(3)
-                        with mk_c1:
-                            st.metric("Current State", current_state_name)
-                        with mk_c2:
-                            bullish_prob = markov_details.get('bullish_probability', 0.5)
-                            st.metric("Bullish Probability", f"{bullish_prob*100:.1f}%")
-                        with mk_c3:
-                            bearish_prob = markov_details.get('bearish_probability', 0.5)
-                            st.metric("Bearish Probability", f"{bearish_prob*100:.1f}%")
+                        drift_cols = st.columns(2)
+                        with drift_cols[0]:
+                            drift_color = "#38ef7d" if prediction.drift_score < 0.3 else "#ffc107" if prediction.drift_score < 0.6 else "#f5576c"
+                            st.metric("Drift Score", f"{prediction.drift_score:.4f}")
+                            drift_status = "Normal" if prediction.drift_score < 0.3 else "Elevated" if prediction.drift_score < 0.6 else "High - Retrain!"
+                            st.caption(drift_status)
 
-                        # State color mapping
-                        state_colors = {
-                            'Strong Bear': '#ff4136',
-                            'Bear': '#ff851b',
-                            'Neutral': '#aaaaaa',
-                            'Bull': '#2ecc40',
-                            'Strong Bull': '#01ff70'
-                        }
+                        with drift_cols[1]:
+                            st.metric("Model Confidence", f"{prediction.model_confidence * 100:.1f}%")
+                            conf_status = "High" if prediction.model_confidence > 0.7 else "Medium" if prediction.model_confidence > 0.5 else "Low"
+                            st.caption(conf_status)
 
-                        # Visual state indicator
-                        st.markdown("##### 🎯 Market State")
-                        state_html = f"""
-                        <div style="display: flex; justify-content: center; gap: 10px; margin: 20px 0;">
-                        """
-                        for i, state in enumerate(state_names):
-                            is_current = i == current_state
-                            color = state_colors.get(state, '#aaa')
-                            border = "3px solid #000" if is_current else "1px solid #ccc"
-                            opacity = "1" if is_current else "0.4"
-                            state_html += f"""
-                            <div style="padding: 15px 20px; background: {color}; border-radius: 10px;
-                                        border: {border}; opacity: {opacity}; text-align: center;
-                                        font-weight: {'bold' if is_current else 'normal'}; color: white;
-                                        text-shadow: 1px 1px 2px rgba(0,0,0,0.5);">
-                                {state}
-                                {"← CURRENT" if is_current else ""}
-                            </div>
-                            """
-                        state_html += "</div>"
-                        st.markdown(state_html, unsafe_allow_html=True)
+                        # Drift visualization
+                        if prediction.drift_score > 0.5:
+                            st.warning("⚠️ Elevated concept drift detected. Consider retraining: `python scripts/train_model.py`")
 
-                        # Transition matrix heatmap
-                        transition_matrix = markov_details.get('transition_matrix', None)
-                        if transition_matrix and len(transition_matrix) > 0:
-                            st.markdown("##### 📈 Transition Probability Matrix")
-                            st.caption("Shows probability of moving FROM row state TO column state")
+                    with alg_tabs[4]:  # Model Status
+                        st.markdown("#### Model Status")
 
-                            # Convert to numpy array
-                            tm = np.array(transition_matrix)
+                        # Get predictor status
+                        status = st.session_state.predictor.get_status()
 
-                            # Create heatmap
-                            fig_tm = go.Figure(data=go.Heatmap(
-                                z=tm,
-                                x=state_names,
-                                y=state_names,
-                                colorscale='RdYlGn',
-                                text=[[f'{v*100:.1f}%' for v in row] for row in tm],
-                                texttemplate='%{text}',
-                                textfont={"size": 12},
-                                hovertemplate='From %{y} → To %{x}: %{z:.1%}<extra></extra>'
-                            ))
+                        status_cols = st.columns(3)
+                        with status_cols[0]:
+                            st.metric("Device", status['device'])
+                        with status_cols[1]:
+                            st.metric("Base Models", status['n_base_models'])
+                        with status_cols[2]:
+                            st.metric("Sequence Length", status['sequence_length'])
 
-                            fig_tm.update_layout(
-                                title="State Transition Probabilities",
-                                xaxis_title="To State",
-                                yaxis_title="From State",
-                                height=350,
-                                margin=dict(l=0, r=0, t=40, b=0)
-                            )
-
-                            st.plotly_chart(fig_tm, use_container_width=True)
-
-                            # Next state prediction
-                            st.markdown("##### 🔮 Next State Prediction")
-                            if 0 <= current_state < len(tm):
-                                current_row = tm[current_state]
-                                # Get probabilities for each next state
-                                pred_data = []
-                                for i, prob in enumerate(current_row):
-                                    pred_data.append({
-                                        'Next State': state_names[i],
-                                        'Probability': f'{prob*100:.1f}%',
-                                        'Likelihood': '🟢 High' if prob > 0.3 else '🟡 Medium' if prob > 0.15 else '🔴 Low'
-                                    })
-                                st.dataframe(pd.DataFrame(pred_data), use_container_width=True)
-
-                                # Most likely next state
-                                most_likely_idx = np.argmax(current_row)
-                                st.success(f"📌 Most likely next state: **{state_names[most_likely_idx]}** ({current_row[most_likely_idx]*100:.1f}%)")
-                    else:
-                        st.info("Detailed Markov analysis not available")
-
-                with alg_tabs[4]:  # LSTM
-                    st.markdown("#### LSTM Neural Network (Deep Learning)")
-                    st.markdown("""
-                    **Purpose:** Learns complex non-linear patterns in price history.
-
-                    **Architecture:**
-                    - Long Short-Term Memory cells
-                    - Remembers important patterns
-                    - Forgets irrelevant noise
-                    """)
-                    model_path = ROOT / "data" / "lstm_model.pt"
-                    if model_path.exists():
-                        st.success("✅ Model trained and active")
-                    else:
-                        st.warning("⚠️ Model not trained")
-
-                with alg_tabs[5]:  # Wavelet
-                    st.markdown("#### Wavelet Analysis (Multi-Scale Patterns)")
-                    st.markdown("""
-                    **Purpose:** Analyzes patterns at multiple time scales simultaneously.
-
-                    **Better than Fourier because:**
-                    - Handles non-stationary signals
-                    - Provides time-localized frequency info
-                    - Detects transient events
-                    """)
-                    st.metric("Wavelet Signal", f"{math_analysis.wavelet_signal:.4f}")
-
-                with alg_tabs[6]:  # Hurst
-                    st.markdown("#### Hurst Exponent (Memory Analysis)")
-                    st.markdown("""
-                    **Purpose:** Determines if market is trending or mean-reverting.
-
-                    **Interpretation:**
-                    - H > 0.5: **Trending** (follow the trend)
-                    - H < 0.5: **Mean-Reverting** (fade the move)
-                    - H = 0.5: **Random Walk** (unpredictable)
-                    """)
-                    h_col1, h_col2 = st.columns(2)
-                    with h_col1:
-                        st.metric("Hurst Exponent", f"{math_analysis.hurst_exponent:.4f}")
-                    with h_col2:
-                        regime_color = "#38ef7d" if math_analysis.hurst_exponent > 0.5 else "#f5576c"
-                        st.markdown(f"<div style='padding:1rem;background:{regime_color}20;border-radius:10px;text-align:center'><b>{math_analysis.hurst_regime}</b></div>", unsafe_allow_html=True)
-
-                with alg_tabs[7]:  # OU
-                    st.markdown("#### Ornstein-Uhlenbeck Process (Mean Reversion)")
-                    st.markdown("""
-                    **Purpose:** Mathematical model for mean-reverting assets.
-
-                    **Provides:**
-                    - Equilibrium price target
-                    - Half-life (time to mean reversion)
-                    - Entry/exit signals for range trading
-                    """)
-                    ou_col1, ou_col2 = st.columns(2)
-                    with ou_col1:
-                        st.metric("Equilibrium Price", f"${math_analysis.ou_equilibrium:,.2f}")
-                    with ou_col2:
-                        st.metric("Half-Life", f"{math_analysis.ou_half_life:.1f} candles")
-
-                with alg_tabs[8]:  # Jump
-                    st.markdown("#### Jump Detection (Crash/Rally Prediction)")
-                    st.markdown("""
-                    **Purpose:** Detects abnormal price movements and crash probability.
-
-                    **Uses:**
-                    - Poisson jump process modeling
-                    - Tail risk estimation
-                    - Early warning signals
-                    """)
-                    j_col1, j_col2 = st.columns(2)
-                    with j_col1:
-                        jump_color = "#f5576c" if math_analysis.jump_probability > 0.3 else "#38ef7d"
-                        st.markdown(f"<div style='text-align:center'><span style='font-size:0.8rem;color:#6c757d'>Jump Probability</span><br><span style='font-size:1.5rem;font-weight:700;color:{jump_color}'>{math_analysis.jump_probability * 100:.1f}%</span></div>", unsafe_allow_html=True)
-                    with j_col2:
-                        crash_color = "#f5576c" if math_analysis.crash_indicator > 0.5 else "#38ef7d"
-                        st.markdown(f"<div style='text-align:center'><span style='font-size:0.8rem;color:#6c757d'>Crash Risk</span><br><span style='font-size:1.5rem;font-weight:700;color:{crash_color}'>{math_analysis.crash_indicator * 100:.1f}%</span></div>", unsafe_allow_html=True)
-
-                with alg_tabs[9]:  # Eigenvalue
-                    st.markdown("#### Eigenvalue Analysis (Signal vs Noise)")
-                    st.markdown("""
-                    **Purpose:** Separates true market signal from random noise.
-
-                    **Based on Random Matrix Theory:**
-                    - Analyzes correlation matrix eigenvalues
-                    - Detects regime changes
-                    - Identifies market inefficiencies
-                    """)
-                    st.metric("Signal/Noise Ratio", f"{math_analysis.eigenvalue_ratio:.4f}")
-                    quality = "High Quality Signal" if math_analysis.eigenvalue_ratio > 1.5 else "Moderate" if math_analysis.eigenvalue_ratio > 1.0 else "Low Quality (Noisy)"
-                    st.info(f"Signal Quality: {quality}")
+                        st.markdown("**Active Base Models:**")
+                        for model_name in status['base_models']:
+                            st.write(f"- {model_name}")
 
         except Exception as e:
             st.warning(f"⚠️ AI prediction unavailable: {str(e)}")
@@ -1273,15 +1061,17 @@ def main():
         st.info("ℹ️ Need at least 100 candles for AI predictions. Current: " + str(len(df)))
 
     # ==============================================================================
-    # ALL 27 TECHNICAL INDICATORS DISPLAY (when checkbox enabled)
+    # TECHNICAL INDICATORS DISPLAY (when checkbox enabled)
     # ==============================================================================
     if st.session_state.show_all_indicators and df is not None and len(df) >= 50:
         st.markdown("---")
-        st.markdown("### 📊 All 27 Technical Indicators")
+        st.markdown("### 📊 Technical Indicators")
 
         try:
-            # Calculate all features
-            features_df = FeatureCalculator.calculate_all(df)
+            # Use our FeatureEngineer to calculate indicators
+            from src.ml.features import FeatureEngineer
+            feat_eng = FeatureEngineer(include_svmd=False, include_regime=False)
+            features_df = feat_eng.calculate_technical_features(df)
             latest = features_df.iloc[-1]
 
             # Group indicators by category
@@ -1308,11 +1098,11 @@ def main():
                     "MACD Signal": (latest.get('macd_signal', 0), ""),
                     "MACD Histogram": (latest.get('macd_hist', 0), ""),
                     "ROC (10)": (latest.get('roc_10', 0), "%"),
-                    "ROC (20)": (latest.get('roc_20', 0), "%"),
                     "Williams %R": (latest.get('williams_r', -50), ""),
                 },
                 "📦 Volume": {
                     "Volume Ratio": (latest.get('volume_ratio', 1), "x"),
+                    "OBV": (latest.get('obv', 0), ""),
                 },
                 "📐 Trend": {
                     "ADX": (latest.get('adx', 25), ""),
@@ -1320,11 +1110,6 @@ def main():
                     "-DI": (latest.get('minus_di', 25), ""),
                     "Trend 7d": (latest.get('trend_7', 0) * 100, "%"),
                     "Trend 14d": (latest.get('trend_14', 0) * 100, "%"),
-                },
-                "🕯️ Candle Patterns": {
-                    "Body Ratio": (latest.get('candle_body_ratio', 0.5) * 100, "%"),
-                    "Higher High": ("Yes" if latest.get('higher_high', 0) == 1 else "No", ""),
-                    "Lower Low": ("Yes" if latest.get('lower_low', 0) == 1 else "No", ""),
                 },
             }
 
@@ -1350,42 +1135,6 @@ def main():
         except Exception as e:
             st.warning(f"⚠️ Could not calculate indicators: {str(e)}")
             logger.error(f"Indicators error: {e}")
-
-    # ==============================================================================
-    # LSTM Deep Learning Predictions
-    # ==============================================================================
-    if AI_AVAILABLE and df is not None and len(df) >= 100:
-        st.markdown("---")
-        st.markdown("### 🧠 LSTM Deep Learning Predictions")
-
-        try:
-            # Calculate features
-            features_df = FeatureCalculator.calculate_all(df)
-
-            # Check if we have trained model
-            model_path = ROOT / "data" / "lstm_model.pt"
-            if model_path.exists():
-                st.success("✅ Using trained LSTM model")
-
-                # Show feature importance (top 10)
-                with st.expander("📊 Feature Analysis", expanded=False):
-                    st.write("**Top Technical Indicators:**")
-                    feature_cols = [col for col in features_df.columns if col not in ['datetime', 'open', 'high', 'low', 'close', 'volume']]
-                    if len(feature_cols) > 0:
-                        recent_features = features_df[feature_cols].tail(1)
-                        feat_cols = st.columns(3)
-
-                        for idx, feat in enumerate(feature_cols[:12]):  # Show first 12 features
-                            col_idx = idx % 3
-                            with feat_cols[col_idx]:
-                                value = recent_features[feat].values[0]
-                                st.metric(feat, f"{value:.4f}")
-            else:
-                st.info("ℹ️ LSTM model not trained yet. Run `python train_model.py` to train the deep learning model.")
-
-        except Exception as e:
-            st.warning(f"⚠️ LSTM prediction unavailable: {str(e)}")
-            logger.error(f"LSTM error: {e}")
 
     # ==============================================================================
     # MULTI-CURRENCY PERFORMANCE TRACKING

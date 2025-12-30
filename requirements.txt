@@ -26,9 +26,14 @@ scipy>=1.11.0,<2.0.0            # Scientific computing (Kalman, FFT, etc.)
 PyWavelets>=1.4.0,<2.0.0        # Wavelet transform analysis
 
 # =============================================================================
-# MACHINE LEARNING
+# MACHINE LEARNING - Unbreakable Ensemble System
 # =============================================================================
-torch>=2.0.0,<3.0.0             # PyTorch for LSTM model
+torch>=2.0.0,<3.0.0             # PyTorch for TCN-LSTM-Attention model
+xgboost>=2.0.0,<3.0.0           # XGBoost gradient boosting
+lightgbm>=4.0.0,<5.0.0          # LightGBM gradient boosting
+catboost>=1.2.0,<2.0.0          # CatBoost gradient boosting
+ngboost>=0.4.0,<1.0.0           # NGBoost probabilistic predictions
+joblib>=1.3.0,<2.0.0            # Model serialization
 
 # =============================================================================
 # NOTIFICATIONS
