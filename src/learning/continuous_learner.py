@@ -138,6 +138,10 @@ class ContinuousLearningSystem:
             'mode_transitions': 0
         }
 
+        # Store latest predictions per symbol for opposite signal detection
+        self._latest_predictions: Dict[str, AggregatedSignal] = {}
+        self._predictions_lock = threading.Lock()
+
         # Get enabled intervals
         self.enabled_intervals = self._get_enabled_intervals()
 
@@ -259,7 +263,11 @@ class ContinuousLearningSystem:
                     else:
                         self._stats['live_trades'] += 1
 
-            # 8. CHECK FOR COMPLETED TRADES
+            # 8. STORE LATEST PREDICTION (for opposite signal detection)
+            with self._predictions_lock:
+                self._latest_predictions[symbol] = aggregated
+
+            # 9. CHECK FOR COMPLETED TRADES
             self._check_completed_trades(symbol, interval, candle)
 
             # Record prediction
@@ -580,8 +588,20 @@ class ContinuousLearningSystem:
 
         # 3. MAX HOLDING PERIOD CHECK (prevent stale positions)
         try:
+            from datetime import timezone
+
+            # Parse signal time (should always be UTC-aware)
             signal_time = datetime.fromisoformat(signal['datetime'])
-            current_time = datetime.utcfromtimestamp(candle.timestamp)
+            if signal_time.tzinfo is None:
+                # WARN: This shouldn't happen if data is clean
+                logger.warning(
+                    f"Signal {signal.get('id', 'unknown')} has naive datetime, "
+                    f"assuming UTC. This may indicate a data storage bug."
+                )
+                signal_time = signal_time.replace(tzinfo=timezone.utc)
+
+            # Current time from candle timestamp (always UTC)
+            current_time = datetime.fromtimestamp(candle.timestamp, tz=timezone.utc)
             duration = current_time - signal_time
 
             if duration > timedelta(hours=max_holding_hours):
@@ -596,9 +616,36 @@ class ContinuousLearningSystem:
             logger.warning(f"Failed to parse signal datetime: {e}")
             return (True, "invalid_datetime")
 
-        # 4. OPPOSITE SIGNAL CHECK (future enhancement)
-        # TODO: Implement by checking if current prediction has opposite direction
-        # with high confidence. Requires access to latest prediction.
+        # 4. OPPOSITE SIGNAL CHECK
+        # Close trade if current prediction has opposite direction with high confidence
+        opposite_signal_threshold = exit_config.get('opposite_signal_threshold', 0.70)
+        symbol = signal.get('symbol', '')
+
+        # Thread-safe: Copy attributes inside lock to prevent race conditions
+        with self._predictions_lock:
+            latest = self._latest_predictions.get(symbol)
+            if latest is not None:
+                latest_direction = getattr(latest, 'direction', None)
+                latest_confidence = getattr(latest, 'confidence', 0.0)
+            else:
+                latest_direction = None
+                latest_confidence = 0.0
+
+        # Check for opposite signal (outside lock, using copied values)
+        if latest_direction is not None:
+            # Determine if opposite signal
+            is_opposite = (
+                (direction == 'BUY' and latest_direction == 'SELL') or
+                (direction == 'SELL' and latest_direction == 'BUY')
+            )
+
+            if is_opposite and latest_confidence >= opposite_signal_threshold:
+                logger.info(
+                    f"Opposite signal detected for {symbol} {direction}: "
+                    f"new signal is {latest_direction} @ {latest_confidence:.2%} "
+                    f"(threshold: {opposite_signal_threshold:.2%})"
+                )
+                return (True, "opposite_signal")
 
         # Keep position open
         return (False, "holding")

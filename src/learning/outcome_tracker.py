@@ -26,7 +26,7 @@ import json
 import threading
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.core.database import Database
 
@@ -48,6 +48,7 @@ class OutcomeTracker:
     def __init__(
         self,
         database: Database,
+        continual_learner: any = None,
         config: dict = None
     ):
         """
@@ -55,9 +56,11 @@ class OutcomeTracker:
 
         Args:
             database: Database instance
+            continual_learner: ContinualLearner instance for drift detection
             config: Configuration dict from config.yaml
         """
         self.db = database
+        self.continual_learner = continual_learner
         self.config = config or {}
 
         # Retraining triggers (from config)
@@ -72,18 +75,25 @@ class OutcomeTracker:
         self._buffer_max_size = retrain_config.get('replay_buffer_size', 10000)
         self._replay_lock = threading.Lock()  # Thread safety for replay buffer
 
+        # Drift detection state (sliding window of recent predictions)
+        self._drift_window_size = retrain_config.get('drift_window_size', 50)
+        self._drift_history: Dict[Tuple[str, str], List[dict]] = {}
+        self._drift_lock = threading.Lock()
+
         # Statistics
         self._stats = {
             'outcomes_recorded': 0,
             'losses_detected': 0,
             'wins_detected': 0,
-            'retraining_triggered': 0
+            'retraining_triggered': 0,
+            'drift_detected': 0
         }
 
         logger.info(
             f"OutcomeTracker initialized: "
             f"retrain_on_loss={self.retrain_on_loss}, "
-            f"consecutive_threshold={self.consecutive_loss_threshold}"
+            f"consecutive_threshold={self.consecutive_loss_threshold}, "
+            f"drift_detection={'enabled' if continual_learner else 'disabled'}"
         )
 
     def record_outcome(
@@ -335,12 +345,111 @@ class OutcomeTracker:
         except Exception as e:
             logger.error(f"Failed to check win rate: {e}")
 
-        # Trigger 4: Concept drift
-        # Note: Drift detection would require continual learner integration
-        # For now, we'll skip this trigger
-        # TODO: Integrate with drift detector once continual learner is connected
+        # Trigger 4: Concept drift detection
+        # Uses sliding window to detect when model accuracy degrades significantly
+        if self.continual_learner is not None:
+            try:
+                drift_detected, drift_score = self._check_concept_drift(
+                    symbol=symbol,
+                    interval=interval,
+                    was_correct=was_correct,
+                    confidence=confidence
+                )
+
+                if drift_detected:
+                    self._stats['retraining_triggered'] += 1
+                    self._stats['drift_detected'] += 1
+                    return (True, f"concept_drift (score={drift_score:.2f} > {self.drift_threshold:.2f})")
+
+            except Exception as e:
+                logger.error(f"Failed to check concept drift: {e}")
 
         return (False, None)
+
+    def _check_concept_drift(
+        self,
+        symbol: str,
+        interval: str,
+        was_correct: bool,
+        confidence: float
+    ) -> Tuple[bool, float]:
+        """
+        Detect concept drift using sliding window accuracy monitoring.
+
+        Drift is detected when high-confidence predictions start failing.
+        This indicates the underlying market regime has changed.
+
+        Args:
+            symbol: Trading pair
+            interval: Timeframe
+            was_correct: Whether the prediction was correct
+            confidence: Prediction confidence
+
+        Returns:
+            (drift_detected: bool, drift_score: float)
+        """
+        key = (symbol, interval)
+
+        with self._drift_lock:
+            if key not in self._drift_history:
+                self._drift_history[key] = []
+
+            # Add current outcome to history
+            self._drift_history[key].append({
+                'was_correct': was_correct,
+                'confidence': confidence,
+                'timestamp': datetime.now(timezone.utc)  # Always use timezone-aware UTC
+            })
+
+            # Maintain sliding window
+            if len(self._drift_history[key]) > self._drift_window_size:
+                self._drift_history[key] = self._drift_history[key][-self._drift_window_size:]
+
+            # Need minimum samples for drift detection
+            if len(self._drift_history[key]) < 10:
+                return (False, 0.0)
+
+            # Calculate weighted accuracy (higher weight for recent samples)
+            history = self._drift_history[key]
+            total_weight = 0.0
+            weighted_correct = 0.0
+
+            for i, outcome in enumerate(history):
+                # Exponential decay weight (recent samples matter more)
+                weight = 1.0 * (0.95 ** (len(history) - i - 1))
+
+                # Extra weight for high-confidence predictions (validate confidence first)
+                outcome_confidence = outcome.get('confidence')
+                if outcome_confidence is not None and outcome_confidence >= 0.7:
+                    weight *= 1.5
+
+                total_weight += weight
+                if outcome['was_correct']:
+                    weighted_correct += weight
+
+            # Calculate drift score (1.0 - accuracy = drift)
+            # Handle edge case: if total_weight is 0, cannot determine drift
+            if total_weight <= 0:
+                logger.warning(
+                    f"[{symbol}@{interval}] Invalid total_weight=0 in drift detection, "
+                    f"cannot determine drift"
+                )
+                return (False, 0.0)
+
+            accuracy = weighted_correct / total_weight
+            drift_score = 1.0 - accuracy
+
+            # Check against threshold
+            drift_detected = drift_score > self.drift_threshold
+
+            if drift_detected:
+                logger.warning(
+                    f"[{symbol}@{interval}] Concept drift detected: "
+                    f"drift_score={drift_score:.2f}, accuracy={accuracy:.2%}, "
+                    f"window_size={len(history)}"
+                )
+
+            return (drift_detected, drift_score)
 
     def _add_to_replay(
         self,

@@ -65,7 +65,9 @@
       "Bash(curl:*)",
       "Bash(# Trigger dashboard page load curl -s http://localhost:8501 sleep 8 # Check the logs cat /tmp/streamlit.log)",
       "Bash(pgrep:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(mkdir:*)",
+      "Bash(git add:*)"
     ]
   }
 }
