@@ -1,36 +1,26 @@
 """
-Data Service - 24/7 Price Collection with WebSocket Support
-============================================================
-Runs continuously in background, collecting price data.
-Supports both REST polling AND WebSocket real-time streaming.
-Does NOT stop when dashboard is closed.
-Only stops when: you run stop command, or data source disconnects.
+Data Service - 24/7 Price Collection via WebSocket
+===================================================
+Uses UnifiedDataProvider for real-time WebSocket streaming.
+Automatically saves candles to database.
 
-WebSocket Support:
-- Binance: wss://stream.binance.com:9443/ws/<symbol>@kline_<interval>
-- Coinbase: wss://ws-feed.exchange.coinbase.com
+Usage:
+    service = DataService()
+    service.start()  # Starts WebSocket streaming
 """
 
 import sqlite3
 import logging
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable, List
+from typing import Optional, Callable
 import threading
-import time
 
-import ccxt
 import pandas as pd
 import yaml
-from functools import lru_cache
 
-# Try to import websocket for real-time streaming
-try:
-    import websocket
-    WEBSOCKET_AVAILABLE = True
-except ImportError:
-    WEBSOCKET_AVAILABLE = False
+# UnifiedDataProvider (REQUIRED - no fallback)
+from src.data.provider import UnifiedDataProvider, Candle
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +41,16 @@ class CachedData:
 
 class DataService:
     """
-    Continuous data collection service.
+    Continuous data collection service using WebSocket.
 
-    - Runs in background thread
-    - Collects data every interval
-    - Stores in SQLite database
-    - Never stops unless explicitly told to
+    Uses UnifiedDataProvider for real-time streaming.
+    Automatically saves closed candles to database.
     """
 
     def __init__(self, config_path: str = "config.yaml"):
         """Initialize data service with configuration."""
+        self._config_path = config_path
+
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
@@ -76,10 +66,11 @@ class DataService:
 
         # State
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._exchange = None
         self._last_update = None
         self._callbacks: list[Callable] = []
+
+        # UnifiedDataProvider (WebSocket - ONLY data source)
+        self._provider: Optional[UnifiedDataProvider] = None
 
         # Performance: Add caching to reduce API and DB calls
         self._candle_cache = {}  # Cache for get_candles results
@@ -135,94 +126,6 @@ class DataService:
         conn.commit()
         conn.close()
         logger.info(f"Database initialized: {self.db_path}")
-
-    def _get_exchange(self):
-        """Get or create exchange connection."""
-        if self._exchange is None:
-            exchange_class = getattr(ccxt, self.exchange_name)
-            self._exchange = exchange_class({
-                'enableRateLimit': True,
-            })
-        return self._exchange
-
-    def _interval_to_ms(self) -> int:
-        """Convert interval string to milliseconds."""
-        unit = self.interval[-1]
-        value = int(self.interval[:-1])
-
-        multipliers = {
-            'm': 60 * 1000,
-            'h': 60 * 60 * 1000,
-            'd': 24 * 60 * 60 * 1000,
-        }
-
-        return value * multipliers.get(unit, 60 * 60 * 1000)
-
-    def fetch_historical_data(self, days: Optional[int] = None) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV data.
-
-        Args:
-            days: Number of days to fetch (default: from config)
-
-        Returns:
-            DataFrame with OHLCV data
-        """
-        days = days or self.history_days
-        exchange = self._get_exchange()
-
-        # Calculate start time
-        since = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
-
-        all_candles = []
-
-        logger.info(f"Fetching {days} days of {self.symbol} data...")
-
-        while True:
-            try:
-                candles = exchange.fetch_ohlcv(
-                    self.symbol,
-                    timeframe=self.interval,
-                    since=since,
-                    limit=1000
-                )
-
-                if not candles:
-                    break
-
-                all_candles.extend(candles)
-
-                # Move to next batch
-                since = candles[-1][0] + 1
-
-                # Check if we've reached current time
-                if since > int(datetime.utcnow().timestamp() * 1000):
-                    break
-
-                # Rate limiting
-                time.sleep(exchange.rateLimit / 1000)
-
-            except Exception as e:
-                logger.error(f"Error fetching data: {e}")
-                break
-
-        if not all_candles:
-            logger.warning("No candles fetched")
-            return pd.DataFrame()
-
-        # Convert to DataFrame
-        df = pd.DataFrame(
-            all_candles,
-            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        )
-
-        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df = df.drop_duplicates(subset=['timestamp'])
-        df = df.sort_values('timestamp')
-
-        logger.info(f"Fetched {len(df)} candles")
-
-        return df
 
     def save_candles(self, df: pd.DataFrame):
         """Save candles to database using FULLY VECTORIZED bulk insert (100x faster)."""
@@ -331,115 +234,82 @@ class DataService:
 
         return df
 
-    def _fetch_latest(self):
-        """Fetch latest candle(s)."""
-        try:
-            exchange = self._get_exchange()
-
-            candles = exchange.fetch_ohlcv(
-                self.symbol,
-                timeframe=self.interval,
-                limit=5
-            )
-
-            if candles:
-                df = pd.DataFrame(
-                    candles,
-                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                )
-                df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-                self.save_candles(df)
-                self._last_update = datetime.utcnow()
-
-                # Notify callbacks (analysis engine)
-                for callback in self._callbacks:
-                    try:
-                        callback(df)
-                    except Exception as e:
-                        logger.error(f"Callback error: {e}")
-
-                return True
-
-        except Exception as e:
-            logger.error(f"Error fetching latest data: {e}")
-            return False
-
-    def _collection_loop(self):
-        """
-        Main collection loop - runs forever until stopped.
-
-        THIS IS THE KEY: It runs in background thread.
-        Dashboard can close, this keeps running.
-        """
-        logger.info("=== DATA COLLECTION STARTED ===")
-        logger.info("Will run until you stop it or data source disconnects")
-
-        update_interval = self.config['analysis']['update_interval']
-        consecutive_errors = 0
-        max_errors = 10
-
-        while self._running:
-            success = self._fetch_latest()
-
-            if success:
-                consecutive_errors = 0
-                logger.debug(f"Data updated at {datetime.utcnow()}")
-            else:
-                consecutive_errors += 1
-                logger.warning(f"Fetch error ({consecutive_errors}/{max_errors})")
-
-                if consecutive_errors >= max_errors:
-                    logger.error("Too many consecutive errors. Stopping.")
-                    self._running = False
-                    break
-
-            # Wait for next update
-            for _ in range(update_interval):
-                if not self._running:
-                    break
-                time.sleep(1)
-
-        logger.info("=== DATA COLLECTION STOPPED ===")
-
     def register_callback(self, callback: Callable):
         """Register callback to be called when new data arrives."""
         self._callbacks.append(callback)
 
     def start(self):
         """
-        Start continuous data collection in background.
+        Start data collection via WebSocket.
 
-        Returns immediately - collection runs in separate thread.
+        Returns immediately - runs in background.
         """
         if self._running:
             logger.warning("Data service already running")
             return
 
-        # First, fetch historical data if database is empty
-        existing = self.get_candles(limit=1)
-        if existing.empty:
-            logger.info("No existing data, fetching historical...")
-            historical = self.fetch_historical_data()
-            self.save_candles(historical)
-
         self._running = True
-        self._thread = threading.Thread(
-            target=self._collection_loop,
-            daemon=False,  # NOT daemon - survives main thread
-            name="DataCollectionThread"
-        )
-        self._thread.start()
 
-        logger.info("Data service started in background")
+        # Start WebSocket data collection
+        logger.info("Starting WebSocket data collection...")
+        self._provider = UnifiedDataProvider.get_instance(self._config_path)
+
+        # Subscribe to symbol
+        self._provider.subscribe(
+            self.symbol,
+            exchange=self.exchange_name,
+            interval=self.interval
+        )
+
+        # Register callback to save candles to database
+        self._provider.on_candle(self._on_candle_received)
+
+        # Start provider
+        self._provider.start()
+        logger.info("WebSocket data service started")
+
+    def _on_candle_received(self, candle: 'Candle', interval: str):
+        """
+        Handle candle from WebSocket provider - save to database.
+
+        Args:
+            candle: Completed candle data
+            interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d, etc.)
+        """
+        try:
+            # Convert to DataFrame for save_candles
+            df = pd.DataFrame([{
+                'timestamp': candle.timestamp,
+                'datetime': datetime.fromtimestamp(candle.timestamp / 1000),
+                'open': candle.open,
+                'high': candle.high,
+                'low': candle.low,
+                'close': candle.close,
+                'volume': candle.volume
+            }])
+
+            self.save_candles(df)
+            self._last_update = datetime.utcnow()
+
+            # Notify callbacks
+            for callback in self._callbacks:
+                try:
+                    callback(df)
+                except Exception as e:
+                    logger.error(f"Callback error: {e}")
+
+        except Exception as e:
+            logger.error(f"Error saving candle: {e}")
 
     def stop(self):
         """Stop data collection."""
         logger.info("Stopping data service...")
         self._running = False
 
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
+        # Stop WebSocket provider
+        if self._provider:
+            self._provider.stop()
+            self._provider = None
 
         logger.info("Data service stopped")
 
@@ -470,202 +340,21 @@ class DataService:
         total_candles = cursor.fetchone()[0]
         conn.close()
 
+        # Provider status
+        provider_status = None
+        if self._provider:
+            provider_status = self._provider.get_status()
+
         return {
             'running': self._running,
+            'mode': 'websocket',
+            'connected': self._provider.is_connected if self._provider else False,
             'symbol': symbol_snapshot,
             'interval': interval_snapshot,
             'last_update': self._last_update.isoformat() if self._last_update else None,
             'latest_price': latest_price,
             'total_candles': total_candles,
-            'websocket_available': WEBSOCKET_AVAILABLE,
-        }
-
-
-# =============================================================================
-# WEBSOCKET REAL-TIME DATA SERVICE
-# =============================================================================
-
-class WebSocketDataService:
-    """
-    Real-time WebSocket data streaming like TradingView.
-
-    Connects to exchange WebSocket and streams live price updates.
-    Much faster than REST polling - updates in milliseconds.
-    """
-
-    def __init__(self, config_path: str = "config.yaml"):
-        """Initialize WebSocket service."""
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-
-        self.symbol = self.config['data']['symbol']
-        self.exchange_name = self.config['data']['exchange']
-        self.interval = self.config['data']['interval']
-
-        self._running = False
-        self._ws = None
-        self._thread: Optional[threading.Thread] = None
-        self._callbacks: List[Callable] = []
-        self._last_price = None
-        self._last_candle = None
-
-        logger.info(f"WebSocketDataService initialized: {self.symbol}")
-
-    def register_callback(self, callback: Callable):
-        """Register callback for real-time updates."""
-        self._callbacks.append(callback)
-
-    def _notify_callbacks(self, data: dict):
-        """Notify all registered callbacks."""
-        for callback in self._callbacks:
-            try:
-                callback(data)
-            except Exception as e:
-                logger.error(f"Callback error: {e}")
-
-    def _get_ws_url(self) -> str:
-        """Get WebSocket URL for exchange."""
-        symbol_ws = self.symbol.replace('-', '').replace('/', '').lower()
-        interval_map = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d'}
-        interval_ws = interval_map.get(self.interval, '1m')
-
-        if self.exchange_name == 'binance':
-            # Binance WebSocket
-            return f"wss://stream.binance.com:9443/ws/{symbol_ws}@kline_{interval_ws}"
-        elif self.exchange_name == 'coinbase':
-            # Coinbase WebSocket (needs subscription message)
-            return "wss://ws-feed.exchange.coinbase.com"
-        else:
-            raise ValueError(f"WebSocket not supported for {self.exchange_name}")
-
-    def _on_message(self, ws, message):
-        """Handle incoming WebSocket message."""
-        try:
-            data = json.loads(message)
-
-            if self.exchange_name == 'binance':
-                # Binance kline format
-                if 'k' in data:
-                    kline = data['k']
-                    candle = {
-                        'time': int(kline['t'] / 1000),
-                        'open': float(kline['o']),
-                        'high': float(kline['h']),
-                        'low': float(kline['l']),
-                        'close': float(kline['c']),
-                        'volume': float(kline['v']),
-                        'is_closed': kline['x'],
-                    }
-                    self._last_price = candle['close']
-                    self._last_candle = candle
-                    self._notify_callbacks({'type': 'candle', 'data': candle})
-
-            elif self.exchange_name == 'coinbase':
-                # Coinbase ticker format
-                if data.get('type') == 'ticker':
-                    ticker = {
-                        'time': int(datetime.utcnow().timestamp()),
-                        'price': float(data.get('price', 0)),
-                        'volume': float(data.get('volume_24h', 0)),
-                        'bid': float(data.get('best_bid', 0)),
-                        'ask': float(data.get('best_ask', 0)),
-                    }
-                    self._last_price = ticker['price']
-                    self._notify_callbacks({'type': 'ticker', 'data': ticker})
-
-        except Exception as e:
-            logger.error(f"WebSocket message error: {e}")
-
-    def _on_error(self, ws, error):
-        """Handle WebSocket error."""
-        logger.error(f"WebSocket error: {error}")
-
-    def _on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket close."""
-        logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-        if self._running:
-            # Reconnect
-            time.sleep(5)
-            self._connect()
-
-    def _on_open(self, ws):
-        """Handle WebSocket open."""
-        logger.info("WebSocket connected")
-
-        # Coinbase requires subscription message
-        if self.exchange_name == 'coinbase':
-            subscribe_msg = {
-                "type": "subscribe",
-                "product_ids": [self.symbol],
-                "channels": ["ticker", "heartbeat"]
-            }
-            ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to {self.symbol}")
-
-    def _connect(self):
-        """Connect to WebSocket."""
-        if not WEBSOCKET_AVAILABLE:
-            logger.error("websocket-client not installed. Run: pip install websocket-client")
-            return
-
-        try:
-            ws_url = self._get_ws_url()
-            self._ws = websocket.WebSocketApp(
-                ws_url,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
-                on_open=self._on_open
-            )
-            self._ws.run_forever()
-        except Exception as e:
-            logger.error(f"WebSocket connection error: {e}")
-
-    def start(self):
-        """Start WebSocket streaming."""
-        if not WEBSOCKET_AVAILABLE:
-            logger.error("WebSocket not available. Install: pip install websocket-client")
-            return False
-
-        if self._running:
-            logger.warning("WebSocket already running")
-            return True
-
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._connect,
-            daemon=True,
-            name="WebSocketThread"
-        )
-        self._thread.start()
-        logger.info("WebSocket streaming started")
-        return True
-
-    def stop(self):
-        """Stop WebSocket streaming."""
-        self._running = False
-        if self._ws:
-            self._ws.close()
-        logger.info("WebSocket streaming stopped")
-
-    @property
-    def last_price(self) -> Optional[float]:
-        """Get last received price."""
-        return self._last_price
-
-    @property
-    def last_candle(self) -> Optional[dict]:
-        """Get last received candle."""
-        return self._last_candle
-
-    def get_status(self) -> dict:
-        """Get WebSocket status."""
-        return {
-            'running': self._running,
-            'symbol': self.symbol,
-            'exchange': self.exchange_name,
-            'last_price': self._last_price,
-            'websocket_available': WEBSOCKET_AVAILABLE,
+            'provider_status': provider_status,
         }
 
 

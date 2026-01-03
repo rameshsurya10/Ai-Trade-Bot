@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
-AI Trade Bot - Start Analysis
-=============================
+AI Trade Bot - Analysis & Trading System
+=========================================
 
 ONE COMMAND TO START EVERYTHING:
     python run_analysis.py
 
 This starts:
-1. Data collection (runs forever)
-2. Analysis engine (runs forever)
-3. Signal service (runs forever)
-4. Notifier (desktop + sound alerts)
+1. Real-time data streaming
+2. AI/ML prediction engine
+3. Signal generation with notifications
+4. Paper trading by default (safe)
+
+Modes:
+    python run_analysis.py                 # Paper trading (default)
+    python run_analysis.py --mode paper    # Explicit paper trading
+    python run_analysis.py --mode live     # Live trading (REAL MONEY!)
 
 RUNS IN BACKGROUND - Dashboard is optional!
-Analysis continues even if:
-- Dashboard is closed
-- Browser tab is changed
-- Screen is off
 
 ONLY STOPS WHEN:
 - You run: python stop_analysis.py
 - You press Ctrl+C
-- Data source disconnects
-
-NO AUTO-TRADING - You trade manually based on signals!
 """
 
 import os
@@ -31,19 +29,16 @@ import sys
 import signal
 import time
 import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.data_service import DataService
-from src.analysis_engine import AnalysisEngine
-from src.signal_service import SignalService
-from src.notifier import Notifier
-
 # PID file for stop command
-PID_FILE = Path(__file__).parent / "data" / ".analysis.pid"
+ROOT = Path(__file__).parent
+PID_FILE = ROOT / "run_analysis.pid"
 
 
 def setup_logging():
@@ -56,7 +51,7 @@ def setup_logging():
     console.setFormatter(logging.Formatter(log_format))
 
     # File handler
-    log_dir = Path(__file__).parent / "data"
+    log_dir = ROOT / "data"
     log_dir.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(log_dir / "trading.log")
     file_handler.setLevel(logging.DEBUG)
@@ -83,9 +78,25 @@ def clear_pid():
         PID_FILE.unlink()
 
 
-def print_banner():
+def print_banner(mode: str):
     """Print startup banner."""
-    banner = """
+    mode_display = mode.upper()
+
+    mode_warning = ""
+    if mode == "live":
+        mode_warning = """
+    ╔══════════════════════════════════════════════════════════════╗
+    ║  ⚠️  WARNING: LIVE TRADING MODE - REAL MONEY AT RISK! ⚠️     ║
+    ╚══════════════════════════════════════════════════════════════╝
+"""
+    elif mode == "paper":
+        mode_warning = """
+    ╔══════════════════════════════════════════════════════════════╗
+    ║  📝 PAPER TRADING MODE - Simulated trades, no real money     ║
+    ╚══════════════════════════════════════════════════════════════╝
+"""
+
+    banner = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
 ║     █████╗ ██╗    ████████╗██████╗  █████╗ ██████╗ ███████╗  ║
@@ -95,110 +106,69 @@ def print_banner():
 ║    ██║  ██║██║       ██║   ██║  ██║██║  ██║██████╔╝███████╗  ║
 ║    ╚═╝  ╚═╝╚═╝       ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝  ║
 ║                                                              ║
-║              MANUAL TRADING SIGNAL SYSTEM                    ║
+║                 AI TRADING SIGNAL SYSTEM                     ║
 ║                                                              ║
 ╠══════════════════════════════════════════════════════════════╣
-║  ✓ NO auto-trading - You control your trades                 ║
-║  ✓ Continuous analysis - Never stops until YOU stop it       ║
-║  ✓ Desktop alerts - Works with browser closed                ║
-║  ✓ Sound notifications - Never miss a signal                 ║
+║  Mode: {mode_display:^51} ║
+╠══════════════════════════════════════════════════════════════╣
+║  Features:                                                   ║
+║    ✓ LSTM + Mathematical ensemble predictions                ║
+║    ✓ Continuous analysis (never stops until YOU stop it)     ║
+║    ✓ Desktop + sound notifications                           ║
+║    ✓ Portfolio tracking with risk management                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║                                                              ║
 ║  To STOP: python stop_analysis.py  OR  Ctrl+C                ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
-"""
+{mode_warning}"""
     print(banner)
 
 
-class TradingBot:
-    """
-    Main trading bot coordinator.
-
-    Connects all services together:
-    DataService -> AnalysisEngine -> SignalService -> Notifier
-    """
-
-    def __init__(self, config_path: str = "config.yaml"):
-        self.config_path = config_path
-        self.logger = logging.getLogger(__name__)
-
-        # Initialize services
-        self.data_service = DataService(config_path)
-        self.analysis_engine = AnalysisEngine(config_path)
-        self.signal_service = SignalService(config_path)
-        self.notifier = Notifier(config_path)
-
-        self._running = False
-
-        # Wire up the pipeline
-        self._connect_services()
-
-    def _connect_services(self):
-        """Connect services in pipeline."""
-        # DataService -> AnalysisEngine
-        self.data_service.register_callback(self._on_new_candles)
-
-        # AnalysisEngine -> SignalService
-        self.analysis_engine.register_callback(self.signal_service.on_prediction)
-
-        # SignalService -> Notifier
-        self.signal_service.register_callback(self.notifier.on_signal)
-
-        self.logger.info("Services connected")
-
-    def _on_new_candles(self, df):
-        """Handle new candles from data service."""
-        # Get full history for analysis
-        full_df = self.data_service.get_candles(limit=500)
-        if len(full_df) >= 100:
-            self.analysis_engine.on_new_data(full_df)
-
-    def start(self):
-        """Start all services."""
-        self.logger.info("Starting trading bot...")
-
-        # 1. Load ML model FIRST (REQUIRED - will exit if not found)
-        self.logger.info("Loading ML model (REQUIRED)...")
-        try:
-            self.analysis_engine.load_model()
-        except (FileNotFoundError, RuntimeError) as e:
-            self.logger.critical("═" * 60)
-            self.logger.critical("CANNOT START WITHOUT ML MODEL!")
-            self.logger.critical("Train the model first: python scripts/train_model.py")
-            self.logger.critical("═" * 60)
-            raise SystemExit(1) from e
-
-        # 2. Start data collection
-        self.logger.info("Starting data collection...")
-        self.data_service.start()
-
-        self._running = True
-        self.logger.info("Trading bot running - waiting for signals...")
-
-    def stop(self):
-        """Stop all services."""
-        self.logger.info("Stopping trading bot...")
-        self._running = False
-        self.data_service.stop()
-        self.logger.info("Trading bot stopped")
-
-    def get_status(self) -> dict:
-        """Get full system status."""
-        return {
-            'running': self._running,
-            'data_service': self.data_service.get_status(),
-            'analysis_engine': self.analysis_engine.get_status(),
-            'signal_service': self.signal_service.get_status(),
-            'notifier': self.notifier.get_status(),
-            'started_at': datetime.utcnow().isoformat()
-        }
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="AI Trade Bot - Analysis & Trading System"
+    )
+    parser.add_argument(
+        '--mode', '-m',
+        choices=['paper', 'live'],
+        default='paper',
+        help='Trading mode (default: paper)'
+    )
+    parser.add_argument(
+        '--symbols', '-s',
+        nargs='+',
+        default=['BTC/USDT'],
+        help='Symbols to analyze (default: BTC/USDT)'
+    )
+    parser.add_argument(
+        '--exchange', '-e',
+        default='binance',
+        help='Exchange to use (default: binance)'
+    )
+    parser.add_argument(
+        '--config', '-c',
+        default='config.yaml',
+        help='Config file path (default: config.yaml)'
+    )
+    return parser.parse_args()
 
 
 def main():
     """Main entry point."""
-    print_banner()
+    args = parse_args()
+
+    print_banner(args.mode)
     logger = setup_logging()
+
+    # Safety check for live mode
+    if args.mode == "live":
+        confirm = input("\n⚠️  You are about to start LIVE trading with REAL MONEY.\n"
+                       "Type 'YES I UNDERSTAND' to continue: ")
+        if confirm != "YES I UNDERSTAND":
+            print("Aborted. Use --mode paper for safe testing.")
+            sys.exit(0)
 
     # Check if already running
     if PID_FILE.exists():
@@ -212,13 +182,40 @@ def main():
         except (ProcessLookupError, ValueError):
             clear_pid()
 
-    # Create bot
-    bot = TradingBot()
+    # Import after logging is set up
+    try:
+        from src.live_trading import LiveTradingRunner, TradingMode, RunnerStatus
+        from src.notifier import Notifier
+
+        # Map mode string to enum
+        mode_map = {
+            'paper': TradingMode.PAPER,
+            'live': TradingMode.LIVE
+        }
+        mode = mode_map[args.mode]
+
+    except ImportError as e:
+        logger.error(f"Failed to import modules: {e}")
+        logger.error("Please ensure all dependencies are installed: pip install -r requirements.txt")
+        sys.exit(1)
+
+    # Create runner
+    logger.info(f"Initializing trading system (mode={mode.value})...")
+
+    try:
+        runner = LiveTradingRunner(
+            config_path=args.config,
+            mode=mode
+        )
+        notifier = Notifier(args.config)
+    except Exception as e:
+        logger.critical(f"Failed to initialize: {e}")
+        sys.exit(1)
 
     # Handle shutdown
     def shutdown(signum, frame):
         print("\n\n🛑 Shutdown signal received...")
-        bot.stop()
+        runner.stop()
         clear_pid()
         sys.exit(0)
 
@@ -229,34 +226,82 @@ def main():
     save_pid()
     logger.info(f"PID saved: {os.getpid()}")
 
-    # Start bot
-    bot.start()
+    # Signal callback with notifications
+    def on_signal(signal_data: dict):
+        symbol = signal_data.get('symbol', 'N/A')
+        direction = signal_data.get('direction', 'N/A')
+        confidence = signal_data.get('confidence', 0) * 100
+        price = signal_data.get('price', 0)
+        stop_loss = signal_data.get('stop_loss', 0)
+        take_profit = signal_data.get('take_profit', 0)
 
-    print("\n" + "="*60)
+        logger.info(
+            f"🔔 SIGNAL: {direction} {symbol} @ ${price:,.2f} "
+            f"(Confidence: {confidence:.1f}%)"
+        )
+
+        # Send notification
+        try:
+            notifier.notify(
+                title=f"📊 {direction} Signal: {symbol}",
+                message=f"Price: ${price:,.2f}\n"
+                       f"Confidence: {confidence:.1f}%\n"
+                       f"SL: ${stop_loss:,.2f} | TP: ${take_profit:,.2f}",
+                priority="high" if confidence >= 70 else "normal"
+            )
+        except Exception as e:
+            logger.debug(f"Notification error: {e}")
+
+    runner.on_signal(on_signal)
+
+    # Add symbols
+    for symbol in args.symbols:
+        try:
+            runner.add_symbol(symbol, exchange=args.exchange)
+            logger.info(f"Added symbol: {symbol}")
+        except Exception as e:
+            logger.error(f"Failed to add {symbol}: {e}")
+
+    # Start runner
+    try:
+        runner.start()
+    except Exception as e:
+        logger.critical(f"Failed to start: {e}")
+        clear_pid()
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
     print("✅ ANALYSIS RUNNING")
-    print("="*60)
-    print(f"📊 Symbol: {bot.data_service.symbol}")
-    print(f"⏱️  Interval: {bot.data_service.interval}")
-    print(f"🤖 ML Model: {'Loaded' if bot.analysis_engine._model else 'Not found (using indicators)'}")
-    print("="*60)
+    print("=" * 60)
+    print(f"📊 Symbols: {', '.join(args.symbols)}")
+    print(f"💱 Exchange: {args.exchange}")
+    print(f"🎮 Mode: {args.mode.upper()}")
+    print("=" * 60)
     print("\n💡 Waiting for trading signals...")
     print("   You'll get desktop notifications when signals appear")
     print("   Press Ctrl+C to stop\n")
 
-    # Keep running
+    # Keep running with status updates
     try:
-        while bot._running:
-            # Print heartbeat every 5 minutes
-            time.sleep(300)
-            status = bot.get_status()
-            candles = status['data_service']['total_candles']
-            price = status['data_service']['latest_price']
-            signals = status['signal_service']['total_signals']
+        heartbeat_interval = 300  # 5 minutes
+        last_heartbeat = time.time()
 
-            logger.info(
-                f"💓 Heartbeat | Price: ${price:,.2f} | "
-                f"Candles: {candles} | Signals: {signals}"
-            )
+        while runner.status == RunnerStatus.RUNNING:
+            time.sleep(10)
+
+            # Heartbeat every 5 minutes
+            if time.time() - last_heartbeat >= heartbeat_interval:
+                status = runner.get_status()
+                portfolio = status.get('portfolio', {})
+                signals = status.get('signals_generated', 0)
+                equity = portfolio.get('total_value', 0)
+
+                logger.info(
+                    f"💓 Heartbeat | Equity: ${equity:,.2f} | "
+                    f"Signals: {signals} | "
+                    f"Positions: {portfolio.get('position_count', 0)}"
+                )
+                last_heartbeat = time.time()
 
     except KeyboardInterrupt:
         shutdown(None, None)

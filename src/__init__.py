@@ -6,43 +6,68 @@ A production-ready trading signal system with ML predictions.
 
 Modules:
 --------
-- core: Configuration, database, types, logging
-- data: WebSocket and polling data feeds
+- core: Configuration, database, types, logging, metrics, validation
+- live_trading: Live/paper trading runner
+- portfolio: Position sizing, risk management
+- universe: Asset filtering and selection
+- brokerages: Exchange integrations
 - analysis_engine: Feature engineering and ML predictions
-- multi_currency_system: Multi-currency trading with auto-learning
-- signal_service: Signal filtering and management
-- notifier: Multi-channel notifications
-- math_engine: Advanced mathematical algorithms
 - advanced_predictor: Fourier, Kalman, Monte Carlo predictions
+- multi_currency_system: Multi-currency trading with auto-learning
 
 Usage:
 ------
     from src import DataService, AnalysisEngine, SignalService
-    from src.core import Config, Database
-    from src.multi_currency_system import MultiCurrencySystem
+    from src.core import Config, Database, MetricsCalculator
+    from src.advanced_predictor import AdvancedPredictor
+    from src.live_trading import LiveTradingRunner
 
 Quick Start:
 ------------
-    # Run analysis
+    # Run analysis (paper trading)
     python run_analysis.py
 
-    # Start dashboard
-    streamlit run dashboard.py
+    # Start unified dashboard
+    streamlit run dashboard_unified.py
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 __author__ = "AI Trade Bot"
 
-# Core services (backward compatible)
+# Core services (non-torch)
 from .data_service import DataService
-from .analysis_engine import AnalysisEngine, FeatureCalculator, LSTMModel
 from .signal_service import SignalService
 from .notifier import Notifier
 
-# Multi-currency system with auto-learning
-from .multi_currency_system import MultiCurrencySystem, CurrencyConfig, PerformanceStats
+# Torch-dependent imports (optional)
+try:
+    from .analysis_engine import AnalysisEngine, FeatureCalculator, LSTMModel
+    TORCH_AVAILABLE = True
+except ImportError:
+    AnalysisEngine = None
+    FeatureCalculator = None
+    LSTMModel = None
+    TORCH_AVAILABLE = False
 
-# Utilities (kept for backward compatibility)
+# Advanced predictor (mathematical algorithms - no torch required)
+from .advanced_predictor import (
+    AdvancedPredictor,
+    FourierAnalyzer,
+    KalmanFilter,
+    EntropyAnalyzer,
+    MarkovChain,
+    MonteCarlo
+)
+
+# Multi-currency system (may require torch)
+try:
+    from .multi_currency_system import MultiCurrencySystem, CurrencyConfig, PerformanceStats
+except ImportError:
+    MultiCurrencySystem = None
+    CurrencyConfig = None
+    PerformanceStats = None
+
+# Utilities
 from .utils import (
     load_config,
     get_config_value,
@@ -65,10 +90,20 @@ __all__ = [
     "LSTMModel",
     "SignalService",
     "Notifier",
+
+    # Advanced Predictor
+    "AdvancedPredictor",
+    "FourierAnalyzer",
+    "KalmanFilter",
+    "EntropyAnalyzer",
+    "MarkovChain",
+    "MonteCarlo",
+
     # Multi-currency
     "MultiCurrencySystem",
     "CurrencyConfig",
     "PerformanceStats",
+
     # Utils
     "load_config",
     "get_config_value",

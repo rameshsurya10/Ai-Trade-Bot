@@ -93,6 +93,62 @@ class LoggingConfig:
 
 
 @dataclass
+class BrokerageConfig:
+    """
+    Brokerage settings (Lean-inspired).
+
+    Supports multiple brokers:
+    - paper: Simulated trading (default)
+    - alpaca: Alpaca Securities (US stocks, options, crypto)
+    - binance: Binance exchange (crypto)
+
+    SECURITY: API credentials should be set via environment variables:
+        ALPACA_API_KEY, ALPACA_SECRET_KEY
+        BINANCE_API_KEY, BINANCE_SECRET_KEY
+    """
+    # Brokerage type: paper, alpaca, binance
+    type: str = "paper"
+
+    # Paper trading settings
+    initial_cash: float = 10000.0
+    commission_percent: float = 0.1
+    slippage_percent: float = 0.05
+
+    # Live trading settings
+    paper_mode: bool = True  # Use paper/testnet for live brokers
+
+    @property
+    def is_paper(self) -> bool:
+        """Check if using paper trading."""
+        return self.type == "paper" or self.paper_mode
+
+    @property
+    def is_live(self) -> bool:
+        """Check if using live trading (with real money)."""
+        return self.type != "paper" and not self.paper_mode
+
+
+@dataclass
+class BacktestConfig:
+    """Backtesting settings."""
+    # Capital
+    initial_cash: float = 100000.0
+
+    # Simulation
+    slippage_percent: float = 0.05
+    commission_percent: float = 0.1
+
+    # Position management
+    max_open_positions: int = 1
+    allow_concurrent: bool = False
+
+    # Exit rules
+    max_hold_candles: int = 24
+    use_trailing_stop: bool = False
+    trailing_stop_percent: float = 1.0
+
+
+@dataclass
 class Config:
     """
     Main configuration class.
@@ -107,6 +163,8 @@ class Config:
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    brokerage: BrokerageConfig = field(default_factory=BrokerageConfig)
+    backtest: BacktestConfig = field(default_factory=BacktestConfig)
 
     _config_path: Optional[Path] = field(default=None, repr=False)
 
@@ -165,6 +223,12 @@ class Config:
 
         if 'logging' in data:
             config.logging = LoggingConfig(**data['logging'])
+
+        if 'brokerage' in data:
+            config.brokerage = BrokerageConfig(**data['brokerage'])
+
+        if 'backtest' in data:
+            config.backtest = BacktestConfig(**data['backtest'])
 
         # Validate
         config.validate()
@@ -250,4 +314,70 @@ class Config:
                 'level': self.logging.level,
                 'file': self.logging.file,
             },
+            'brokerage': {
+                'type': self.brokerage.type,
+                'initial_cash': self.brokerage.initial_cash,
+                'commission_percent': self.brokerage.commission_percent,
+                'slippage_percent': self.brokerage.slippage_percent,
+                'paper_mode': self.brokerage.paper_mode,
+            },
+            'backtest': {
+                'initial_cash': self.backtest.initial_cash,
+                'slippage_percent': self.backtest.slippage_percent,
+                'commission_percent': self.backtest.commission_percent,
+                'max_open_positions': self.backtest.max_open_positions,
+                'max_hold_candles': self.backtest.max_hold_candles,
+            },
         }
+
+    def get_brokerage(self) -> 'BaseBrokerage':
+        """
+        Get configured brokerage instance.
+
+        Returns:
+            BaseBrokerage instance based on config
+        """
+        from src.brokerages.base import BaseBrokerage
+
+        if self.brokerage.type == "paper":
+            from src.paper_trading import PaperBrokerage
+            return PaperBrokerage(
+                initial_cash=self.brokerage.initial_cash,
+                commission_percent=self.brokerage.commission_percent,
+                slippage_percent=self.brokerage.slippage_percent
+            )
+
+        elif self.brokerage.type == "alpaca":
+            from src.brokerages.alpaca import AlpacaBrokerage
+            return AlpacaBrokerage(paper=self.brokerage.paper_mode)
+
+        elif self.brokerage.type == "binance":
+            from src.brokerages.binance import BinanceBrokerage
+            return BinanceBrokerage(testnet=self.brokerage.paper_mode)
+
+        else:
+            raise ValueError(f"Unknown brokerage type: {self.brokerage.type}")
+
+
+def load_config(config_path: str = 'config.yaml') -> dict:
+    """
+    Load configuration from YAML file as dictionary.
+
+    This is a simple loader that returns the raw YAML structure.
+    Use Config.load() for the dataclass-based configuration.
+
+    Args:
+        config_path: Path to config file
+
+    Returns:
+        Dictionary with configuration
+    """
+    path = Path(config_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    with open(path, 'r') as f:
+        config = yaml.safe_load(f) or {}
+
+    return config

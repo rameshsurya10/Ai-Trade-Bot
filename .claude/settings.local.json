@@ -57,7 +57,15 @@
       "Skill(notebook-review:*)",
       "Bash(if [ -d \"venv\" ])",
       "Bash(then echo \"✅ Virtual environment exists at venv/\")",
-      "Bash(else echo \"❌ No venv found\")"
+      "Bash(else echo \"❌ No venv found\")",
+      "Bash(then venv/bin/pip list)",
+      "Bash(else pip list)",
+      "Bash(then echo \"venv exists\")",
+      "Bash(else python3 -m venv venv)",
+      "Bash(curl:*)",
+      "Bash(# Trigger dashboard page load curl -s http://localhost:8501 sleep 8 # Check the logs cat /tmp/streamlit.log)",
+      "Bash(pgrep:*)",
+      "WebSearch"
     ]
   }
 }

@@ -426,6 +426,12 @@ class MultiCurrencySystem:
         self._retrain_threads: Dict[str, threading.Thread] = {}
         self._retrain_scheduled: Dict[str, bool] = {}  # Prevent duplicate retrain scheduling
 
+        # Feature cache to avoid recalculating features on every predict()
+        # Key: f"{symbol}_{last_timestamp}_{len(df)}" -> cached features DataFrame
+        self._feature_cache: Dict[str, pd.DataFrame] = {}
+        self._feature_cache_lock = threading.Lock()
+        self._feature_cache_max_size = 50  # Max cached entries (roughly one per symbol)
+
         logger.info("MultiCurrencySystem initialized")
 
     def add_currency(
@@ -464,6 +470,44 @@ class MultiCurrencySystem:
             if symbol in self.data_services:
                 del self.data_services[symbol]
             logger.info(f"Removed currency: {symbol}")
+
+    def _get_cached_features(self, symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Get features from cache or calculate them.
+
+        Performance: Avoids recalculating features when data hasn't changed.
+        Cache key is based on symbol + last timestamp + data length.
+
+        Args:
+            symbol: Currency pair
+            df: Price data
+
+        Returns:
+            DataFrame with calculated features
+        """
+        # Generate cache key from data signature
+        last_timestamp = str(df.index[-1]) if hasattr(df.index, '__getitem__') else str(len(df))
+        cache_key = f"{symbol}_{last_timestamp}_{len(df)}"
+
+        with self._feature_cache_lock:
+            # Check cache
+            if cache_key in self._feature_cache:
+                return self._feature_cache[cache_key]
+
+            # Calculate features (expensive operation)
+            df_features = FeatureCalculator.calculate_all(df)
+
+            # Evict oldest entries if cache is full (simple LRU approximation)
+            if len(self._feature_cache) >= self._feature_cache_max_size:
+                # Remove first 10 entries (oldest added)
+                keys_to_remove = list(self._feature_cache.keys())[:10]
+                for key in keys_to_remove:
+                    del self._feature_cache[key]
+
+            # Cache the result
+            self._feature_cache[cache_key] = df_features
+
+            return df_features
 
     def get_available_currencies(self) -> List[str]:
         """Get list of supported currency pairs."""
@@ -504,8 +548,8 @@ class MultiCurrencySystem:
 
             if model is not None:
                 try:
-                    # Prepare features
-                    df_features = FeatureCalculator.calculate_all(df)
+                    # Prepare features (cached to avoid recalculation)
+                    df_features = self._get_cached_features(symbol, df)
                     feature_columns = FeatureCalculator.get_feature_columns()
 
                     feature_means, feature_stds = self.model_manager.get_scaler_params(symbol)

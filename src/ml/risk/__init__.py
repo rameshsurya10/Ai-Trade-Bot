@@ -11,6 +11,6 @@ Implements ML-based risk management:
 Research shows proper risk management is MORE important than prediction accuracy.
 """
 
-from .manager import RiskManager, PositionSizer, DynamicStopLoss
+from .manager import RiskManager, PositionSizer, DynamicStopLoss, RiskAssessment
 
-__all__ = ['RiskManager', 'PositionSizer', 'DynamicStopLoss']
+__all__ = ['RiskManager', 'PositionSizer', 'DynamicStopLoss', 'RiskAssessment']

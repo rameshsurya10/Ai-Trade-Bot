@@ -1,55 +1,319 @@
+# AI Trade Bot Configuration
+# ==========================
+
+# Trading Symbols
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+
+# Exchange
+exchange: binance
+
+# Data Collection (WebSocket Real-Time)
 data:
   symbol: BTC/USDT
   exchange: binance
   interval: 1h
   history_days: 365
+  # WebSocket settings
+  websocket:
+    enabled: true                # Use WebSocket (real-time) instead of REST (polling)
+    reconnect_delay: 5           # Seconds before reconnect attempt
+    max_reconnects: 10           # Max reconnect attempts
+    ping_interval: 30            # WebSocket ping interval
+    buffer_size: 500             # Candles to keep in memory
+
+# Analysis Engine
 analysis:
-  update_interval: 60
-  min_confidence: 0.55
-  lookback_period: 100
+  update_interval: 60          # Seconds between analysis cycles
+  min_confidence: 0.55         # Minimum confidence for signal
+  lookback_period: 100         # Candles for analysis
+
+# ML Model Settings
 model:
   path: models/best_model.pt
   models_dir: models
-  sequence_length: 60
-  hidden_size: 128
-  num_layers: 2
-  dropout: 0.2
+  sequence_length: 60          # LSTM sequence length
+  hidden_size: 128             # LSTM hidden dimension
+  num_layers: 2                # LSTM layers
+  dropout: 0.2                 # Dropout rate
+
+  # Feature Configuration
+  features:
+    technical_features: 32     # Technical indicators
+    sentiment_features: 7      # News sentiment features
+    total_features: 39         # Total input features
+    include_sentiment: true    # Enable/disable sentiment integration
+
+# Multi-Timeframe Configuration
+timeframes:
+  enabled: true
+  aggregation_method: weighted_vote  # weighted_vote, majority, alignment_required
+  min_confidence: 0.50               # Minimum confidence for any timeframe
+  alignment_threshold: 1.0           # Alignment ratio (1.0 = all must agree)
+
+  intervals:
+    - interval: 1m
+      enabled: false           # Disabled by default (too noisy)
+      weight: 0.10
+      sequence_length: 120
+      min_training_interval_minutes: 60
+
+    - interval: 5m
+      enabled: true
+      weight: 0.15
+      sequence_length: 72
+      min_training_interval_minutes: 60
+
+    - interval: 15m
+      enabled: true
+      weight: 0.15
+      sequence_length: 96
+      min_training_interval_minutes: 120
+
+    - interval: 1h
+      enabled: true
+      weight: 0.25             # Primary timeframe
+      sequence_length: 60
+      min_training_interval_minutes: 240
+
+    - interval: 4h
+      enabled: true
+      weight: 0.20
+      sequence_length: 42
+      min_training_interval_minutes: 480
+
+    - interval: 1d
+      enabled: true
+      weight: 0.15
+      sequence_length: 30
+      min_training_interval_minutes: 1440
+
+# News & Sentiment Configuration
+news:
+  enabled: true                # Enable news sentiment integration
+
+  sources:
+    newsapi:
+      enabled: true
+      api_key_env: NEWSAPI_KEY      # Environment variable for API key
+      fetch_interval: 1800          # 30 minutes (48 requests/day)
+      max_requests_per_day: 100     # Free tier limit
+      max_articles_per_fetch: 100
+      lookback_hours: 6
+
+    alphavantage:
+      enabled: true
+      api_key_env: ALPHAVANTAGE_KEY # Environment variable for API key
+      fetch_interval: 7200          # 2 hours (12 requests/day)
+      max_requests_per_day: 25      # Free tier limit (conservative)
+      max_articles_per_fetch: 50
+      lookback_hours: 12
+
+  sentiment:
+    analyzer: vader                 # VADER sentiment analyzer
+
+    # Custom crypto lexicon (extends VADER)
+    custom_lexicon:
+      # Bullish terms
+      bullish: 0.8
+      moon: 0.6
+      mooning: 0.7
+      hodl: 0.4
+      buy: 0.5
+      pump: 0.6
+      rally: 0.7
+      surge: 0.6
+      breakout: 0.7
+      uptrend: 0.6
+      gainz: 0.7
+      lambo: 0.5
+      diamond hands: 0.6
+
+      # Bearish terms
+      bearish: -0.8
+      dump: -0.7
+      dumping: -0.7
+      crash: -0.9
+      sell: -0.5
+      panic: -0.7
+      fud: -0.6
+      rekt: -0.8
+      bag holder: -0.6
+      downtrend: -0.6
+      correction: -0.4
+      drop: -0.5
+      plunge: -0.7
+      collapse: -0.9
+      paper hands: -0.6
+
+      # Market terms
+      volatile: -0.3
+      volatility: -0.2
+      uncertainty: -0.4
+      regulation: -0.3
+      ban: -0.7
+      adoption: 0.6
+      institutional: 0.5
+      etf: 0.4
+      halving: 0.5
+      upgrade: 0.6
+
+  features:
+    lookback_hours: [1, 6, 24]      # Time windows for sentiment aggregation
+    time_weighted: true              # Apply exponential time decay
+    decay_rate: 0.1                  # 10% decay per hour
+    min_articles: 1                  # Min articles for valid sentiment
+
+# Multi-Currency (null = single currency mode)
 currencies: null
+
+# Auto-Training
 auto_training:
   enabled: true
   min_trades_before_retrain: 50
   max_days_between_retrain: 30
   min_win_rate_threshold: 0.45
+
+# Continuous Learning (Advanced Retraining)
+continuous_learning:
+  enabled: true
+
+  # Confidence Gating
+  confidence:
+    trading_threshold: 0.80        # 80% confidence required for live trading
+    hysteresis: 0.05               # Exit trading at 75% (prevents oscillation)
+    smoothing_alpha: 0.3           # EMA smoothing on confidence
+    regime_adjustment: true        # Adjust thresholds by market regime
+
+  # Retraining Parameters
+  retraining:
+    on_loss: true                  # Retrain immediately on any loss (user requirement)
+    consecutive_loss_threshold: 3  # Also retrain after 3 consecutive losses
+    win_rate_threshold: 0.45       # Retrain if win rate drops below 45%
+    drift_threshold: 0.7           # Retrain on concept drift
+    min_interval_hours: 1          # Min time between retraining attempts
+    max_epochs: 50                 # Max training epochs
+    target_confidence: 0.80        # Target validation confidence
+    patience: 10                   # Early stopping patience
+    recent_candles: 5000           # Recent candles for retraining
+    replay_mix_ratio: 0.3          # Mix 30% replay buffer samples
+    min_samples: 1000              # Minimum samples required for retraining
+
+  # Experience Replay
+  experience_replay:
+    buffer_size: 10000             # Max samples in replay buffer
+    replay_mix_ratio: 0.3          # 30% of training data from replay
+    prioritize_losses: true        # Weight losses 2x higher
+
+  # EWC (Elastic Weight Consolidation)
+  ewc:
+    lambda: 1000.0                 # EWC importance weight (higher = more conservative)
+    fisher_sample_size: 200        # Samples for Fisher Information estimation
+
+  # Online Learning
+  online_learning:
+    enabled: true                  # Learn from every candle
+    learning_rate: 0.0001          # Very small for stability
+    update_frequency: 1            # Update every N candles
+
+  # Exit Logic (Risk Management)
+  exit_logic:
+    stop_loss_pct: 2.0             # Stop-loss at -2%
+    take_profit_pct: 4.0           # Take-profit at +4% (2:1 R:R)
+    max_holding_hours: 24          # Max holding period (24 hours)
+
+# Algorithm Weights (ensemble)
 algorithm_weights:
   fourier: 0.15
   kalman: 0.25
-  entropy: 0.1
-  markov: 0.2
-  lstm: 0.3
+  entropy: 0.10
+  markov: 0.20
+  lstm: 0.30
+
+# Signal Settings
 signals:
-  risk_per_trade: 0.02
-  risk_reward_ratio: 2.0
-  strong_signal: 0.65
-  medium_signal: 0.55
-  cooldown_minutes: 60
+  risk_per_trade: 0.02         # 2% risk per trade
+  risk_reward_ratio: 2.0       # Risk/Reward ratio
+  strong_signal: 0.65          # Strong signal threshold
+  medium_signal: 0.55          # Medium signal threshold
+  cooldown_minutes: 60         # Cooldown between signals
+
+# Portfolio Management
+portfolio:
+  initial_capital: 10000       # Starting capital
+  max_position_percent: 0.25   # Max 25% per position
+  max_total_positions: 10      # Max concurrent positions
+  reserve_cash_percent: 0.05   # Keep 5% cash reserve
+  base_currency: USD
+
+# Risk Management
+risk:
+  max_drawdown_percent: 20.0   # Max portfolio drawdown
+  max_sector_exposure: 0.40    # Max per sector
+  daily_loss_limit: 0.05       # 5% daily loss limit
+  position_size_method: risk_parity  # equal_weight, risk_parity, kelly
+
+# Position Sizing
+position_sizing:
+  method: risk_parity          # equal_weight, risk_parity, kelly, volatility_target
+  target_volatility: 0.10      # For volatility target method
+  kelly_fraction: 0.5          # Half Kelly (safer)
+  max_position_size: 0.25      # Max 25% of portfolio
+
+# Notifications
 notifications:
-  desktop: true
-  sound: true
-  sound_file: alert.wav
+  desktop:
+    enabled: true
+    sound: true
+    sound_file: alert.wav
   telegram:
     enabled: false
+    bot_token: ""
+    chat_id: ""
   email:
     enabled: false
     smtp_server: smtp.gmail.com
     smtp_port: 587
+    sender: ""
+    password: ""
+    recipient: ""
+
+# Database
 database:
   path: data/trading.db
+  backup_enabled: true
+  backup_interval_hours: 24
+
+# Dashboard
 dashboard:
   host: localhost
   port: 8501
-  theme: dark
+  theme: light
+  auto_refresh: true
+  refresh_interval: 2
+
+# Logging
 logging:
   level: INFO
   file: data/trading.log
   max_size_mb: 10
   backup_count: 3
+
+# Live Trading
+live_trading:
+  mode: paper                  # paper or live
+  default_exchange: binance
+  default_symbols:
+    - BTC/USDT
+    - ETH/USDT
+  heartbeat_interval: 300      # Status heartbeat (seconds)
+
+# Brokerage Settings (API keys from environment variables)
+brokerages:
+  binance:
+    testnet: true              # Use testnet for paper trading
+    # API keys from: BINANCE_API_KEY, BINANCE_SECRET_KEY
+  alpaca:
+    paper: true                # Use paper trading
+    # API keys from: ALPACA_API_KEY, ALPACA_SECRET_KEY

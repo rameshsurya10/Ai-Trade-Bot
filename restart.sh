@@ -24,7 +24,7 @@ echo
 echo "3️⃣  Checking dependencies..."
 venv/bin/python3 -c "
 import streamlit
-from src.live_stream import LiveStream
+from src.data.provider import UnifiedDataProvider
 print('   ✅ Dependencies OK')
 " || { echo "   ❌ Missing dependencies!"; exit 1; }
 echo
@@ -32,19 +32,21 @@ echo
 # Step 4: Test WebSocket
 echo "4️⃣  Testing WebSocket connection..."
 timeout 8 venv/bin/python3 << 'EOF'
-from src.live_stream import LiveStream
+from src.data.provider import UnifiedDataProvider
 import time
 
-stream = LiveStream('binance', 'BTC/USDT', '1m')
+provider = UnifiedDataProvider.get_instance()
+provider.subscribe('BTC/USDT', exchange='binance', interval='1m')
+
 ticks = []
 
-@stream.on_tick
-def handle(t):
-    ticks.append(t.price)
+def handle_tick(tick):
+    ticks.append(tick.price)
 
-stream.start(blocking=False)
+provider.on_tick(handle_tick)
+provider.start()
 time.sleep(5)
-stream.stop()
+provider.stop()
 
 if len(ticks) > 0:
     print(f'   ✅ WebSocket working: {len(ticks)} ticks, last price ${ticks[-1]:,.2f}')

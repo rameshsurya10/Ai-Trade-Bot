@@ -10,6 +10,6 @@ achieving better performance than any single model.
 Research shows XGBoost or Ridge as meta-learner prevents overfitting.
 """
 
-from .stacking import StackingEnsemble, RegimeAwareEnsemble
+from .stacking import StackingEnsemble, RegimeAwareEnsemble, EnsemblePrediction
 
-__all__ = ['StackingEnsemble', 'RegimeAwareEnsemble']
+__all__ = ['StackingEnsemble', 'RegimeAwareEnsemble', 'EnsemblePrediction']

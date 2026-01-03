@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import threading
-from functools import lru_cache
 
 import pandas as pd
 
@@ -79,6 +78,9 @@ class Database:
 
             # Mmap for better read performance (50MB)
             cursor.execute("PRAGMA mmap_size=52428800")
+
+            # Enable foreign key constraints
+            cursor.execute("PRAGMA foreign_keys=ON")
 
             logger.debug("SQLite PRAGMA optimizations enabled (5x faster inserts)")
 
@@ -147,6 +149,8 @@ class Database:
                     take_profit REAL,
                     atr REAL,
                     notified INTEGER DEFAULT 0,
+                    symbol TEXT,
+                    interval TEXT,
                     -- Performance tracking columns
                     actual_outcome TEXT,
                     outcome_price REAL,
@@ -190,6 +194,190 @@ class Database:
                     pnl_absolute REAL,
                     FOREIGN KEY (signal_id) REFERENCES signals(id)
                 )
+            ''')
+
+            # =====================================================================
+            # CONTINUOUS LEARNING TABLES
+            # =====================================================================
+
+            # Learning states table - track LEARNING ↔ TRADING mode transitions
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS learning_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    confidence_score REAL NOT NULL,
+                    entered_at TEXT NOT NULL,
+                    reason TEXT,
+                    metadata TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_learning_states_symbol_interval
+                ON learning_states(symbol, interval, entered_at DESC)
+            ''')
+
+            # Trade outcomes table - enhanced tracking with features snapshot
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trade_outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id INTEGER REFERENCES signals(id),
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT,
+                    predicted_direction TEXT NOT NULL,
+                    predicted_confidence REAL NOT NULL,
+                    predicted_probability REAL NOT NULL,
+                    actual_direction TEXT,
+                    was_correct INTEGER,
+                    pnl_percent REAL,
+                    pnl_absolute REAL,
+                    features_snapshot TEXT,
+                    regime TEXT,
+                    is_paper_trade INTEGER DEFAULT 0,
+                    closed_by TEXT,
+                    FOREIGN KEY (signal_id) REFERENCES signals(id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_trade_outcomes_symbol_interval
+                ON trade_outcomes(symbol, interval, entry_time DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_trade_outcomes_outcome
+                ON trade_outcomes(was_correct, symbol, interval)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_trade_outcomes_signal_id
+                ON trade_outcomes(signal_id)
+            ''')
+
+            # News articles table - store raw news
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS news_articles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp INTEGER,
+                    datetime TEXT,
+                    source TEXT,
+                    title TEXT,
+                    description TEXT,
+                    content TEXT,
+                    url TEXT,
+                    author TEXT,
+                    sentiment_score REAL,
+                    sentiment_label TEXT,
+                    sentiment_compound REAL,
+                    symbols TEXT,
+                    primary_symbol TEXT,
+                    relevance_score REAL,
+                    processed INTEGER DEFAULT 0,
+                    content_hash TEXT UNIQUE
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_news_timestamp
+                ON news_articles(timestamp DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_news_symbol
+                ON news_articles(primary_symbol, timestamp DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_news_source
+                ON news_articles(source)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_news_sentiment
+                ON news_articles(sentiment_score)
+            ''')
+
+            # Sentiment features table - pre-aggregated sentiment aligned to candles
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sentiment_features (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candle_timestamp INTEGER UNIQUE,
+                    symbol TEXT,
+                    interval TEXT,
+                    sentiment_1h REAL,
+                    sentiment_6h REAL,
+                    sentiment_24h REAL,
+                    sentiment_momentum REAL,
+                    sentiment_volatility REAL,
+                    news_volume_1h INTEGER,
+                    news_volume_6h INTEGER,
+                    news_volume_24h INTEGER,
+                    source_diversity REAL,
+                    last_updated TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_sentiment_timestamp
+                ON sentiment_features(candle_timestamp DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_sentiment_symbol
+                ON sentiment_features(symbol, interval, candle_timestamp DESC)
+            ''')
+
+            # Retraining history table - audit log of all retraining events
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS retraining_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    triggered_at TEXT NOT NULL,
+                    trigger_reason TEXT NOT NULL,
+                    trigger_metadata TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    duration_seconds REAL,
+                    status TEXT,
+                    validation_accuracy REAL,
+                    validation_confidence REAL,
+                    improvement_pct REAL,
+                    n_samples INTEGER,
+                    n_epochs INTEGER,
+                    final_loss REAL,
+                    error_message TEXT
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_retraining_history
+                ON retraining_history(symbol, interval, triggered_at DESC)
+            ''')
+
+            # Confidence history table - track confidence scores over time
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS confidence_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    confidence_score REAL NOT NULL,
+                    validation_accuracy REAL,
+                    drift_score REAL,
+                    mode TEXT NOT NULL
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_confidence_history
+                ON confidence_history(symbol, interval, timestamp DESC)
             ''')
 
             logger.debug(f"Database initialized: {self.db_path}")
@@ -601,6 +789,555 @@ class Database:
             _STATS_CACHE[cache_key] = (stats, datetime.utcnow())
 
         return stats
+
+    # =========================================================================
+    # CONTINUOUS LEARNING OPERATIONS
+    # =========================================================================
+
+    def save_learning_state(
+        self,
+        symbol: str,
+        interval: str,
+        mode: str,
+        confidence: float,
+        reason: str = None,
+        metadata: dict = None
+    ) -> int:
+        """Save learning state transition."""
+        import json
+
+        # Validate inputs
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if not isinstance(interval, str) or not interval.strip():
+            raise ValueError("interval must be a non-empty string")
+        if mode not in ('LEARNING', 'TRADING'):
+            raise ValueError(f"mode must be 'LEARNING' or 'TRADING', got {mode}")
+        if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 1):
+            raise ValueError(f"confidence must be between 0 and 1, got {confidence}")
+
+        # Serialize metadata with error handling
+        try:
+            metadata_json = json.dumps(metadata) if metadata else None
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Failed to serialize metadata: {e}")
+            metadata_json = json.dumps({"error": "serialization_failed"})
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO learning_states
+                (symbol, interval, mode, confidence_score, entered_at, reason, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                symbol.strip(),
+                interval.strip(),
+                mode,
+                confidence,
+                datetime.utcnow().isoformat(),
+                reason,
+                metadata_json
+            ))
+            return cursor.lastrowid
+
+    def get_current_learning_state(self, symbol: str, interval: str) -> Optional[Dict]:
+        """Get current learning state for symbol/interval."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT mode, confidence_score, entered_at, reason
+                FROM learning_states
+                WHERE symbol = ? AND interval = ?
+                ORDER BY entered_at DESC
+                LIMIT 1
+            ''', (symbol, interval))
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def get_latest_learning_state(self, symbol: str, interval: str) -> Optional[Dict]:
+        """
+        Get latest learning state for symbol/interval.
+
+        Alias for get_current_learning_state() for compatibility.
+        """
+        return self.get_current_learning_state(symbol, interval)
+
+    def get_learning_state_history(
+        self,
+        symbol: str,
+        interval: str = None,
+        limit: int = 10
+    ) -> List[Dict]:
+        """
+        Get learning state transition history.
+
+        Args:
+            symbol: Trading pair
+            interval: Timeframe (None for all intervals)
+            limit: Maximum number of records to return
+
+        Returns:
+            List of state dicts ordered by entered_at DESC
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            if interval is None:
+                # Get all intervals for this symbol
+                cursor.execute('''
+                    SELECT id, symbol, interval, mode, confidence_score,
+                           entered_at, reason, metadata
+                    FROM learning_states
+                    WHERE symbol = ?
+                    ORDER BY entered_at DESC
+                    LIMIT ?
+                ''', (symbol, limit))
+            else:
+                # Get specific symbol/interval
+                cursor.execute('''
+                    SELECT id, symbol, interval, mode, confidence_score,
+                           entered_at, reason, metadata
+                    FROM learning_states
+                    WHERE symbol = ? AND interval = ?
+                    ORDER BY entered_at DESC
+                    LIMIT ?
+                ''', (symbol, interval, limit))
+
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    def record_trade_outcome(
+        self,
+        signal_id: int,
+        symbol: str,
+        interval: str,
+        entry_price: float,
+        exit_price: float,
+        entry_time: str,
+        exit_time: str,
+        predicted_direction: str,
+        predicted_confidence: float,
+        predicted_probability: float,
+        actual_direction: str,
+        was_correct: bool,
+        pnl_percent: float,
+        pnl_absolute: float,
+        features_snapshot: str = None,
+        regime: str = None,
+        is_paper_trade: bool = False,
+        closed_by: str = None
+    ) -> int:
+        """
+        Record detailed trade outcome.
+
+        Args:
+            signal_id: ID of the signal that generated this trade
+            symbol: Trading pair
+            interval: Timeframe
+            entry_price: Entry price
+            exit_price: Exit price
+            entry_time: Entry timestamp (ISO format)
+            exit_time: Exit timestamp (ISO format)
+            predicted_direction: Predicted direction ('BUY' or 'SELL')
+            predicted_confidence: Model confidence score
+            predicted_probability: Prediction probability
+            actual_direction: Actual direction that occurred
+            was_correct: Whether prediction was correct
+            pnl_percent: PnL percentage
+            pnl_absolute: Absolute PnL
+            features_snapshot: Feature vector snapshot (JSON string)
+            regime: Market regime at trade time
+            is_paper_trade: True if paper trade
+            closed_by: Reason for trade closure
+
+        Returns:
+            Trade outcome record ID
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trade_outcomes
+                (signal_id, symbol, interval, entry_price, exit_price,
+                 entry_time, exit_time, predicted_direction, predicted_confidence,
+                 predicted_probability, actual_direction, was_correct,
+                 pnl_percent, pnl_absolute, features_snapshot, regime,
+                 is_paper_trade, closed_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                signal_id, symbol, interval, entry_price, exit_price,
+                entry_time, exit_time,
+                predicted_direction, predicted_confidence, predicted_probability,
+                actual_direction, int(was_correct), pnl_percent, pnl_absolute,
+                features_snapshot, regime, int(is_paper_trade), closed_by
+            ))
+            return cursor.lastrowid
+
+    def get_recent_outcomes(
+        self,
+        symbol: str,
+        interval: str = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """Get recent trade outcomes."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if interval:
+                cursor.execute('''
+                    SELECT * FROM trade_outcomes
+                    WHERE symbol = ? AND interval = ?
+                    ORDER BY entry_time DESC
+                    LIMIT ?
+                ''', (symbol, interval, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM trade_outcomes
+                    WHERE symbol = ?
+                    ORDER BY entry_time DESC
+                    LIMIT ?
+                ''', (symbol, limit))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_win_rate(
+        self,
+        symbol: str,
+        interval: str = None,
+        limit: int = 100
+    ) -> float:
+        """Calculate win rate for symbol/interval (optimized)."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if interval:
+                cursor.execute('''
+                    SELECT AVG(CAST(was_correct AS FLOAT)) as win_rate
+                    FROM (
+                        SELECT was_correct
+                        FROM trade_outcomes
+                        WHERE symbol = ? AND interval = ?
+                        ORDER BY entry_time DESC
+                        LIMIT ?
+                    )
+                ''', (symbol, interval, limit))
+            else:
+                cursor.execute('''
+                    SELECT AVG(CAST(was_correct AS FLOAT)) as win_rate
+                    FROM (
+                        SELECT was_correct
+                        FROM trade_outcomes
+                        WHERE symbol = ?
+                        ORDER BY entry_time DESC
+                        LIMIT ?
+                    )
+                ''', (symbol, limit))
+
+            result = cursor.fetchone()
+            return result[0] if result and result[0] is not None else 0.0
+
+    def get_pending_trades(self, symbol: str) -> List[Dict]:
+        """Get pending trades (signals without outcomes)."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT s.*, t.id as outcome_id
+                FROM signals s
+                LEFT JOIN trade_outcomes t ON s.id = t.signal_id
+                WHERE t.id IS NULL
+                AND s.actual_outcome IS NULL
+                AND s.symbol = ?
+                ORDER BY s.timestamp DESC
+                LIMIT 100
+            ''', (symbol,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_news_article(
+        self,
+        timestamp: int,
+        source: str,
+        title: str,
+        description: str = None,
+        content: str = None,
+        url: str = None,
+        sentiment_score: float = None,
+        sentiment_label: str = None,
+        primary_symbol: str = None,
+        content_hash: str = None
+    ) -> Optional[int]:
+        """Save news article (returns None if duplicate)."""
+        # Validate timestamp
+        if not isinstance(timestamp, int) or timestamp <= 0:
+            raise ValueError(f"Invalid timestamp: {timestamp}")
+
+        # Detect if timestamp is in seconds or milliseconds
+        # Timestamps > 10000000000 are likely milliseconds (year 2286+)
+        if timestamp > 10000000000:
+            dt = datetime.fromtimestamp(timestamp / 1000)
+        else:
+            dt = datetime.fromtimestamp(timestamp)
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO news_articles
+                    (timestamp, datetime, source, title, description, content,
+                     url, sentiment_score, sentiment_label, primary_symbol,
+                     content_hash, processed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ''', (
+                    timestamp,
+                    dt.isoformat(),
+                    source,
+                    title,
+                    description,
+                    content,
+                    url,
+                    sentiment_score,
+                    sentiment_label,
+                    primary_symbol,
+                    content_hash
+                ))
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                # Duplicate content_hash
+                return None
+
+    def get_news_articles(
+        self,
+        symbol: str = None,
+        since_timestamp: int = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """Get news articles optionally filtered by symbol and time."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            if symbol and since_timestamp:
+                cursor.execute('''
+                    SELECT * FROM news_articles
+                    WHERE primary_symbol = ? AND timestamp >= ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (symbol, since_timestamp, limit))
+            elif symbol:
+                cursor.execute('''
+                    SELECT * FROM news_articles
+                    WHERE primary_symbol = ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (symbol, limit))
+            elif since_timestamp:
+                cursor.execute('''
+                    SELECT * FROM news_articles
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (since_timestamp, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM news_articles
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (limit,))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_sentiment_features(
+        self,
+        candle_timestamp: int,
+        symbol: str,
+        interval: str,
+        sentiment_1h: float = 0.0,
+        sentiment_6h: float = 0.0,
+        sentiment_24h: float = 0.0,
+        sentiment_momentum: float = 0.0,
+        sentiment_volatility: float = 0.0,
+        news_volume_1h: int = 0,
+        news_volume_6h: int = 0,
+        news_volume_24h: int = 0,
+        source_diversity: float = 0.0
+    ) -> int:
+        """Save pre-aggregated sentiment features for a candle."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO sentiment_features
+                (candle_timestamp, symbol, interval, sentiment_1h, sentiment_6h,
+                 sentiment_24h, sentiment_momentum, sentiment_volatility,
+                 news_volume_1h, news_volume_6h, news_volume_24h,
+                 source_diversity, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                candle_timestamp, symbol, interval,
+                sentiment_1h, sentiment_6h, sentiment_24h,
+                sentiment_momentum, sentiment_volatility,
+                news_volume_1h, news_volume_6h, news_volume_24h,
+                source_diversity,
+                datetime.utcnow().isoformat()
+            ))
+            return cursor.lastrowid
+
+    def get_sentiment_features(self, candle_timestamp: int) -> Optional[Dict]:
+        """Get sentiment features for specific candle timestamp."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT sentiment_1h, sentiment_6h, sentiment_24h,
+                       sentiment_momentum, sentiment_volatility,
+                       news_volume_1h, source_diversity
+                FROM sentiment_features
+                WHERE candle_timestamp = ?
+            ''', (candle_timestamp,))
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def start_retraining_event(
+        self,
+        symbol: str,
+        interval: str,
+        trigger_reason: str,
+        trigger_metadata: dict = None
+    ) -> int:
+        """Record start of retraining event."""
+        import json
+
+        # Serialize metadata with error handling
+        try:
+            metadata_json = json.dumps(trigger_metadata) if trigger_metadata else None
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Failed to serialize trigger_metadata: {e}")
+            metadata_json = json.dumps({"error": "serialization_failed"})
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO retraining_history
+                (symbol, interval, triggered_at, trigger_reason,
+                 trigger_metadata, started_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'in_progress')
+            ''', (
+                symbol,
+                interval,
+                datetime.utcnow().isoformat(),
+                trigger_reason,
+                metadata_json,
+                datetime.utcnow().isoformat()
+            ))
+            return cursor.lastrowid
+
+    def complete_retraining_event(
+        self,
+        retrain_id: int,
+        status: str,
+        validation_accuracy: float = None,
+        validation_confidence: float = None,
+        epochs_trained: int = None,
+        duration_seconds: float = None,
+        error_message: str = None
+    ):
+        """Complete retraining event with results."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE retraining_history
+                SET completed_at = ?,
+                    status = ?,
+                    validation_accuracy = ?,
+                    validation_confidence = ?,
+                    n_epochs = ?,
+                    duration_seconds = ?,
+                    error_message = ?
+                WHERE id = ?
+            ''', (
+                datetime.utcnow().isoformat(),
+                status,
+                validation_accuracy,
+                validation_confidence,
+                epochs_trained,
+                duration_seconds,
+                error_message,
+                retrain_id
+            ))
+
+    def get_retraining_history(
+        self,
+        symbol: str,
+        interval: str = None,
+        limit: int = 50
+    ) -> List[Dict]:
+        """Get retraining history for symbol/interval."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if interval:
+                cursor.execute('''
+                    SELECT * FROM retraining_history
+                    WHERE symbol = ? AND interval = ?
+                    ORDER BY triggered_at DESC
+                    LIMIT ?
+                ''', (symbol, interval, limit))
+            else:
+                cursor.execute('''
+                    SELECT * FROM retraining_history
+                    WHERE symbol = ?
+                    ORDER BY triggered_at DESC
+                    LIMIT ?
+                ''', (symbol, limit))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_confidence_score(
+        self,
+        symbol: str,
+        interval: str,
+        confidence: float,
+        mode: str,
+        validation_accuracy: float = None,
+        drift_score: float = None
+    ):
+        """Save confidence score to history."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO confidence_history
+                (symbol, interval, timestamp, confidence_score,
+                 validation_accuracy, drift_score, mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                symbol,
+                interval,
+                datetime.utcnow().isoformat(),
+                confidence,
+                validation_accuracy,
+                drift_score,
+                mode
+            ))
+
+    def get_confidence_trend(
+        self,
+        symbol: str,
+        interval: str,
+        days: int = 7
+    ) -> pd.DataFrame:
+        """Get confidence history for charting."""
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
+        with self.connection() as conn:
+            df = pd.read_sql_query('''
+                SELECT timestamp, confidence_score, mode, drift_score
+                FROM confidence_history
+                WHERE symbol = ? AND interval = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', conn, params=(symbol, interval, cutoff.isoformat()))
+
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        return df
 
     # =========================================================================
     # UTILITY METHODS
