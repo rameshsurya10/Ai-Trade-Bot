@@ -97,35 +97,55 @@ class SentimentAggregator:
             # Get candle datetime
             candle_time = datetime.utcfromtimestamp(candle_timestamp)
 
-            # Calculate sentiment for each lookback period
+            # OPTIMIZED: Single query for longest lookback period (was N+5 queries)
+            max_lookback = max(self.lookback_hours)
+            since_timestamp = int((candle_time - timedelta(hours=max_lookback)).timestamp())
+
+            # Fetch ALL articles once for the longest period
+            all_articles = self.db.get_news_articles(
+                symbol=base_symbol,
+                since_timestamp=since_timestamp,
+                limit=1000,
+                processed_only=False  # Get all, filter in memory
+            )
+
+            # Pre-compute article timestamps for efficient filtering
+            articles_with_ts = []
+            for article in all_articles:
+                try:
+                    article_time = datetime.fromisoformat(article['datetime'])
+                    article['_parsed_time'] = article_time
+                    articles_with_ts.append(article)
+                except (KeyError, ValueError):
+                    continue
+
+            # Calculate sentiment for each lookback period (in-memory filtering)
             sentiment_scores = {}
             article_counts = {}
 
             for hours in self.lookback_hours:
-                since_timestamp = int((candle_time - timedelta(hours=hours)).timestamp())
+                cutoff_time = candle_time - timedelta(hours=hours)
 
-                # Get articles for this period
-                articles = self.db.get_news_articles(
-                    symbol=base_symbol,
-                    since_timestamp=since_timestamp,
-                    limit=1000,
-                    processed_only=True  # Only articles with sentiment
-                )
+                # Filter articles for this period (in-memory, no DB call)
+                period_articles = [
+                    a for a in articles_with_ts
+                    if a['_parsed_time'] >= cutoff_time and a.get('sentiment_score') is not None
+                ]
 
                 # Calculate average sentiment
-                if articles:
-                    sentiments = [a['sentiment_score'] for a in articles if a.get('sentiment_score') is not None]
+                if period_articles:
+                    sentiments = [a['sentiment_score'] for a in period_articles]
 
                     if sentiments:
                         if self.time_weighted:
                             # Apply time decay weighting
-                            weights = self._calculate_time_weights(articles, candle_time)
+                            weights = self._calculate_time_weights(period_articles, candle_time)
                             avg_sentiment = np.average(sentiments, weights=weights)
                         else:
                             avg_sentiment = np.mean(sentiments)
 
                         sentiment_scores[f'{hours}h'] = float(avg_sentiment)
-                        article_counts[f'{hours}h'] = len(articles)
+                        article_counts[f'{hours}h'] = len(period_articles)
                     else:
                         sentiment_scores[f'{hours}h'] = 0.0
                         article_counts[f'{hours}h'] = 0
@@ -141,9 +161,9 @@ class SentimentAggregator:
             # Momentum: difference between short-term and medium-term sentiment
             sentiment_momentum = sentiment_1h - sentiment_6h
 
-            # Calculate volatility (standard deviation of recent sentiment)
-            volatility = self._calculate_volatility(
-                base_symbol=base_symbol,
+            # Calculate volatility using already-fetched articles (in-memory)
+            volatility = self._calculate_volatility_from_articles(
+                articles=articles_with_ts,
                 candle_time=candle_time,
                 hours=self.lookback_hours[0]  # Use shortest lookback for volatility
             )
@@ -151,9 +171,9 @@ class SentimentAggregator:
             # News volume (1 hour)
             news_volume_1h = article_counts.get('1h', 0)
 
-            # Source diversity (Shannon entropy)
-            source_diversity = self._calculate_source_diversity(
-                base_symbol=base_symbol,
+            # Source diversity using already-fetched articles (in-memory)
+            source_diversity = self._calculate_source_diversity_from_articles(
+                articles=articles_with_ts,
                 candle_time=candle_time,
                 hours=self.lookback_hours[1]  # Use 6h for diversity
             )
@@ -225,23 +245,114 @@ class SentimentAggregator:
 
         return weights
 
-    def _calculate_volatility(
+    def _calculate_volatility_from_articles(
         self,
-        base_symbol: str,
+        articles: List[dict],
         candle_time: datetime,
         hours: int
     ) -> float:
         """
-        Calculate sentiment volatility (standard deviation).
+        Calculate sentiment volatility from pre-fetched articles (in-memory).
 
         Args:
-            base_symbol: Base symbol (e.g., 'BTC')
+            articles: Pre-fetched articles with _parsed_time
             candle_time: Candle datetime
             hours: Hours to look back
 
         Returns:
             Volatility score (0.0 to ~1.0)
         """
+        try:
+            cutoff_time = candle_time - timedelta(hours=hours)
+
+            # Filter articles in memory
+            period_articles = [
+                a for a in articles
+                if a.get('_parsed_time') and a['_parsed_time'] >= cutoff_time
+            ]
+
+            if not period_articles:
+                return 0.0
+
+            sentiments = [
+                a['sentiment_score'] for a in period_articles
+                if a.get('sentiment_score') is not None
+            ]
+
+            if len(sentiments) < 2:
+                return 0.0
+
+            return float(np.std(sentiments))
+
+        except Exception as e:
+            logger.warning(f"Failed to calculate volatility: {e}")
+            return 0.0
+
+    def _calculate_source_diversity_from_articles(
+        self,
+        articles: List[dict],
+        candle_time: datetime,
+        hours: int
+    ) -> float:
+        """
+        Calculate source diversity from pre-fetched articles (in-memory).
+
+        Higher entropy = more diverse sources = more reliable sentiment.
+
+        Args:
+            articles: Pre-fetched articles with _parsed_time
+            candle_time: Candle datetime
+            hours: Hours to look back
+
+        Returns:
+            Diversity score (0.0 to ~1.0)
+        """
+        try:
+            cutoff_time = candle_time - timedelta(hours=hours)
+
+            # Filter articles in memory
+            period_articles = [
+                a for a in articles
+                if a.get('_parsed_time') and a['_parsed_time'] >= cutoff_time
+            ]
+
+            if not period_articles:
+                return 0.0
+
+            # Count sources
+            sources = [a['source'] for a in period_articles if a.get('source')]
+
+            if not sources:
+                return 0.0
+
+            # Calculate Shannon entropy
+            source_counts = Counter(sources)
+            total = len(sources)
+            entropy = 0.0
+
+            for count in source_counts.values():
+                p = count / total
+                if p > 0:
+                    entropy -= p * math.log2(p)
+
+            # Normalize to 0-1 (max entropy for 3 sources is log2(3) ≈ 1.58)
+            max_entropy = math.log2(min(len(source_counts), 3))  # Cap at 3 sources
+            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+
+            return float(normalized_entropy)
+
+        except Exception as e:
+            logger.warning(f"Failed to calculate source diversity: {e}")
+            return 0.0
+
+    # Legacy methods kept for backwards compatibility (but unused)
+    def _calculate_volatility(
+        self,
+        base_symbol: str,
+        candle_time: datetime,
+        hours: int
+    ) -> float:
+        """Legacy method - use _calculate_volatility_from_articles instead."""
         try:
             since_timestamp = int((candle_time - timedelta(hours=hours)).timestamp())
 
@@ -272,19 +383,7 @@ class SentimentAggregator:
         candle_time: datetime,
         hours: int
     ) -> float:
-        """
-        Calculate source diversity using Shannon entropy.
-
-        Higher entropy = more diverse sources = more reliable sentiment.
-
-        Args:
-            base_symbol: Base symbol (e.g., 'BTC')
-            candle_time: Candle datetime
-            hours: Hours to look back
-
-        Returns:
-            Diversity score (0.0 to ~1.0)
-        """
+        """Legacy method - use _calculate_source_diversity_from_articles instead."""
         try:
             since_timestamp = int((candle_time - timedelta(hours=hours)).timestamp())
 
@@ -335,7 +434,8 @@ class SentimentAggregator:
             True if successful
         """
         try:
-            self.db.save_sentiment_features(features.to_dict())
+            # Unpack dict to match method signature
+            self.db.save_sentiment_features(**features.to_dict())
             return True
         except Exception as e:
             logger.error(f"Failed to store sentiment features: {e}")

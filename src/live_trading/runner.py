@@ -24,9 +24,15 @@ from enum import Enum
 from typing import Dict, List, Optional, Callable
 from queue import Queue, Empty
 
+from dotenv import load_dotenv
+
+# Load environment variables early
+load_dotenv()
+
 import pandas as pd
 
 from src.core.config import Config
+from src.core.database import Database
 from src.brokerages.base import BaseBrokerage
 from src.brokerages.orders import Order, OrderType, OrderSide, OrderStatus
 from src.brokerages.events import OrderEvent, OrderEventType
@@ -35,6 +41,7 @@ from src.portfolio.risk import RiskManager, RiskAction, MaximumDrawdownRisk, Max
 from src.data.provider import UnifiedDataProvider, Tick, Candle
 from src.multi_currency_system import MultiCurrencySystem
 from src.data_service import DataService
+from src.news.collector import NewsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +184,8 @@ class LiveTradingRunner:
         self._portfolio: Optional[PortfolioManager] = None
         self._risk_manager: Optional[RiskManager] = None
         self._prediction_system: Optional[MultiCurrencySystem] = None
+        self._news_collector: Optional[NewsCollector] = None
+        self._database: Optional[Database] = None
 
         # Symbols and data provider
         self._symbols: Dict[str, TradingSymbol] = {}
@@ -317,6 +326,12 @@ class LiveTradingRunner:
 
         self._running = False
 
+        # Stop news collector
+        if self._news_collector:
+            self._news_collector.stop()
+            self._news_collector = None
+            logger.info("News collector stopped")
+
         # Stop data provider
         if self._provider:
             self._provider.stop()
@@ -368,6 +383,29 @@ class LiveTradingRunner:
     def _initialize_components(self):
         """Initialize all trading components."""
         logger.info("Initializing components...")
+
+        # Database (for news and features)
+        from pathlib import Path
+        db_path = Path(self.config.data.get('database_path', 'data/trading.db'))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._database = Database(str(db_path))
+        logger.info("Database initialized")
+
+        # News Collector (if enabled)
+        news_config = self.config.data.get('news', {})
+        if news_config.get('enabled', False):
+            try:
+                self._news_collector = NewsCollector(
+                    database=self._database,
+                    config=news_config
+                )
+                self._news_collector.start()
+                logger.info("News collector started")
+            except Exception as e:
+                logger.warning(f"Failed to start news collector: {e}. Continuing without news.")
+                self._news_collector = None
+        else:
+            logger.info("News collection disabled in config")
 
         # Portfolio Manager
         initial_cash = self.config.brokerage.initial_cash

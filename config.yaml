@@ -312,8 +312,79 @@ live_trading:
 # Brokerage Settings (API keys from environment variables)
 brokerages:
   binance:
-    testnet: true              # Use testnet for paper trading
+    testnet: false             # Use production for market data (no keys needed)
     # API keys from: BINANCE_API_KEY, BINANCE_SECRET_KEY
   alpaca:
     paper: true                # Use paper trading
     # API keys from: ALPACA_API_KEY, ALPACA_SECRET_KEY
+  oanda:
+    practice: true             # Use OANDA practice account
+    leverage: 50               # US max leverage (50:1)
+    # API keys from: OANDA_API_KEY, OANDA_ACCOUNT_ID
+
+# Forex Trading Configuration
+forex:
+  enabled: true
+  broker: oanda                # Default forex broker
+
+  # Trading pairs (14 pairs: 7 majors + 7 crosses)
+  pairs:
+    majors:
+      - EUR/USD
+      - GBP/USD
+      - USD/JPY
+      - USD/CHF
+      - AUD/USD
+      - USD/CAD
+      - NZD/USD
+    crosses:
+      - EUR/GBP
+      - EUR/JPY
+      - GBP/JPY
+      - EUR/CHF
+      - EUR/AUD
+      - AUD/JPY
+      - CHF/JPY
+
+  # Leverage settings (regulatory limits)
+  leverage:
+    default: 50                # US Standard (50:1)
+    majors: 50                 # Major pairs
+    minors: 20                 # Minor/exotic pairs
+    max_allowed: 50            # Hard limit
+
+  # Risk management
+  risk:
+    max_risk_per_trade: 1.0    # 1% max risk per trade
+    max_position_percent: 10.0 # Max 10% of account in single position
+    max_correlation_exposure: 40.0  # Max 40% in correlated pairs
+
+  # Spread settings
+  spread:
+    max_spread_multiplier: 3.0 # Block trades if spread > 3x average
+    reduce_spread_multiplier: 2.0  # Reduce size if spread > 2x average
+
+  # Margin settings
+  margin:
+    call_level: 50             # Margin call at 50% margin level
+    stop_out_level: 30         # Stop out at 30% margin level
+
+  # Swap/rollover (overnight holding costs)
+  swap:
+    include_in_risk: true      # Factor swap costs into risk calculations
+    warn_triple_swap: true     # Warn before Wednesday triple swap
+
+  # Trading sessions (UTC hours)
+  sessions:
+    sydney:
+      start: 21
+      end: 6
+    tokyo:
+      start: 0
+      end: 9
+    london:
+      start: 8
+      end: 17
+    new_york:
+      start: 13
+      end: 22

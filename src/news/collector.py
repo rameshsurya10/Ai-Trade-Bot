@@ -240,8 +240,19 @@ class NewsCollector:
                     logger.debug(f"Skipping duplicate: {article.title[:50]}...")
                     continue
 
-                # Store in database
-                self.db.save_news_article(article.to_dict())
+                # Store in database (map Article fields to database method signature)
+                self.db.save_news_article(
+                    timestamp=article.timestamp,
+                    source=article.source,
+                    title=article.title,
+                    description=article.description,
+                    content=article.content,
+                    url=article.url,
+                    sentiment_score=article.sentiment_score,
+                    sentiment_label=article.sentiment_label,
+                    primary_symbol=article.primary_symbol,
+                    content_hash=article.content_hash
+                )
                 stored_count += 1
 
             except Exception as e:

@@ -12,6 +12,7 @@ pyyaml>=6.0,<7.0
 # DATA COLLECTION
 # =============================================================================
 ccxt>=4.0.0,<5.0.0              # Exchange API (Binance, Coinbase, etc.)
+oandapyV20>=0.7.0               # OANDA Forex API (REST + Streaming)
 requests>=2.31.0,<3.0.0         # HTTP requests for CoinGecko API fallback
 
 # =============================================================================

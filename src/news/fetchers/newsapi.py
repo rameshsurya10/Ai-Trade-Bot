@@ -109,11 +109,11 @@ class NewsAPIFetcher(BaseFetcher):
             from_time = datetime.utcnow() - timedelta(hours=min(lookback_hours, 720))  # Max 30 days
             to_time = datetime.utcnow()
 
-            # API parameters
+            # API parameters - NewsAPI needs YYYY-MM-DD format (not full ISO with microseconds)
             params = {
                 'q': query,
-                'from': from_time.isoformat(),
-                'to': to_time.isoformat(),
+                'from': from_time.strftime('%Y-%m-%d'),
+                'to': to_time.strftime('%Y-%m-%d'),
                 'language': self.language,
                 'sortBy': self.sort_by,
                 'pageSize': min(max_articles, 100),  # Max 100 per request

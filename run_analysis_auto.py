@@ -41,6 +41,11 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load environment variables FIRST before any other imports
+load_dotenv()
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -48,6 +53,9 @@ from src.data_service import DataService
 from src.multi_currency_system import MultiCurrencySystem
 from src.signal_service import SignalService
 from src.notifier import Notifier
+from src.core.database import Database
+from src.news.collector import NewsCollector
+import yaml
 
 # PID file for stop command
 PID_FILE = Path(__file__).parent / "data" / ".analysis.pid"
@@ -143,6 +151,29 @@ class AutoLearningTradingBot:
         self.config_path = config_path
         self.logger = logging.getLogger(__name__)
 
+        # Load config
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        # Initialize database
+        db_path = Path(config.get('database', {}).get('path', 'data/trading.db'))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database = Database(str(db_path))
+        self.logger.info("Database initialized")
+
+        # Initialize news collector (if enabled)
+        self.news_collector = None
+        news_config = config.get('news', {})
+        if news_config.get('enabled', False):
+            try:
+                self.news_collector = NewsCollector(
+                    database=self.database,
+                    config=news_config
+                )
+                self.logger.info("News collector initialized")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize news collector: {e}")
+
         # Initialize services
         self.data_service = DataService(config_path)
         self.multi_currency = MultiCurrencySystem(config_path)
@@ -207,7 +238,15 @@ class AutoLearningTradingBot:
         """Start all services."""
         self.logger.info("Starting auto-learning trading bot...")
 
-        # 1. Try to load existing model (optional for auto-retrain system)
+        # 1. Start news collector (if enabled)
+        if self.news_collector:
+            try:
+                self.news_collector.start()
+                self.logger.info("News collector started")
+            except Exception as e:
+                self.logger.warning(f"Failed to start news collector: {e}")
+
+        # 2. Try to load existing model (optional for auto-retrain system)
         symbol = self.data_service.symbol
         model = self.multi_currency.model_manager.get_model(symbol)
 
@@ -221,7 +260,7 @@ class AutoLearningTradingBot:
             self.logger.warning("Auto-retrain will create a model after 100 signals.")
             self.logger.warning("═" * 60)
 
-        # 2. Start data collection
+        # 3. Start data collection
         self.logger.info("Starting data collection...")
         self.data_service.start()
 
@@ -232,6 +271,13 @@ class AutoLearningTradingBot:
         """Stop all services."""
         self.logger.info("Stopping auto-learning trading bot...")
         self._running = False
+
+        # Stop news collector
+        if self.news_collector:
+            self.news_collector.stop()
+            self.logger.info("News collector stopped")
+
+        # Stop data service
         self.data_service.stop()
         self.logger.info("Auto-learning trading bot stopped")
 

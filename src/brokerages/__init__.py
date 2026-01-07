@@ -43,6 +43,9 @@ def __getattr__(name):
     elif name == "BinanceBrokerage":
         from .binance import BinanceBrokerage
         return BinanceBrokerage
+    elif name == "OandaBrokerage":
+        from .oanda import OandaBrokerage
+        return OandaBrokerage
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -63,4 +66,5 @@ __all__ = [
     # Implementations (lazy loaded)
     'AlpacaBrokerage',
     'BinanceBrokerage',
+    'OandaBrokerage',
 ]

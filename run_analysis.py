@@ -33,6 +33,11 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load environment variables FIRST before any other imports
+load_dotenv()
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 

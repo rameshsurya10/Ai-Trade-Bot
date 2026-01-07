@@ -67,7 +67,17 @@
       "Bash(pgrep:*)",
       "WebSearch",
       "Bash(mkdir:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(timeout 5 venv/bin/streamlit run:*)",
+      "WebFetch(domain:developer.oanda.com)",
+      "Bash(tree:*)",
+      "Bash(test:*)",
+      "Bash(timeout 35 venv/bin/python3:*)",
+      "Bash(timeout 25 venv/bin/python3:*)",
+      "Bash(venv/bin/streamlit run dashboard.py --server.headless true)",
+      "Bash(lsof:*)",
+      "Bash(kill:*)"
     ]
   }
 }

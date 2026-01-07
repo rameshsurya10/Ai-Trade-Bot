@@ -18,6 +18,7 @@ Usage:
 """
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -30,6 +31,11 @@ import yaml
 import os
 import signal
 import subprocess
+import html
+from dotenv import load_dotenv
+
+# Load environment variables FIRST
+load_dotenv()
 
 # =============================================================================
 # CONFIGURATION
@@ -64,6 +70,8 @@ try:
     from src.core.validation import OrderValidator
     from src.paper_trading import PaperTradingSimulator, OrderSide, OrderType
     from src.advanced_predictor import AdvancedPredictor
+    from src.news.collector import NewsCollector
+    from src.news.aggregator import SentimentAggregator
     AI_AVAILABLE = True
 except ImportError as e:
     AI_AVAILABLE = False
@@ -158,11 +166,9 @@ def init_session_state():
         # Auto-refresh
         'auto_refresh': True,
         'refresh_interval': 5,
-        'last_update': None,
 
         # WebSocket Data Provider (ONLY data source)
         'data_provider': None,
-        'provider_started': False,
 
         # AI/ML
         'predictor': None,
@@ -182,12 +188,12 @@ def init_session_state():
         # Order validator
         'order_validator': None,
 
+        # News & Sentiment
+        'news_collector': None,
+        'sentiment_aggregator': None,
+
         # Tracked currencies
         'tracked_symbols': ['BTC/USDT', 'ETH/USDT'],
-
-        # Cache
-        'market_data': None,
-        'predictions': None,
     }
 
     for key, value in defaults.items():
@@ -204,6 +210,31 @@ init_session_state()
 def get_data_provider():
     """Get singleton UnifiedDataProvider instance."""
     return UnifiedDataProvider.get_instance(str(CONFIG_PATH))
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def load_config() -> dict:
+    """
+    Load configuration file with caching.
+
+    Returns:
+        dict: Configuration dictionary with '_error' key if failed, empty dict if file doesn't exist.
+    """
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            logger.error(f"Invalid YAML in config file: {e}")
+            return {'_error': f"Configuration file is malformed: {e}"}
+        except PermissionError as e:
+            logger.error(f"Permission denied reading config: {e}")
+            return {'_error': f"Permission denied: Cannot read {CONFIG_PATH}. Check file permissions."}
+        except Exception as e:
+            logger.error(f"Error reading config file: {e}")
+            return {'_error': f"Error reading configuration: {e}"}
+    logger.warning(f"Config file not found: {CONFIG_PATH}")
+    return {}
 
 
 def initialize_components():
@@ -228,7 +259,6 @@ def initialize_components():
 
         # Start the provider
         provider.start()
-        st.session_state.provider_started = True
         logger.info(f"WebSocket provider started for {st.session_state.tracked_symbols}")
 
     # Paper trader
@@ -260,19 +290,92 @@ def initialize_components():
         config = load_config()
         st.session_state.order_validator = OrderValidator(config.get('risk', {}))
 
+    # News collector and sentiment aggregator
+    if st.session_state.news_collector is None and AI_AVAILABLE:
+        config = load_config()
+        news_config = config.get('news', {})
+        if news_config.get('enabled', False):
+            # Validate required API keys
+            required_keys = ['NEWSAPI_KEY']
+            missing_keys = [k for k in required_keys if not os.getenv(k)]
+
+            if missing_keys:
+                warning_msg = f"News enabled but missing API keys: {', '.join(missing_keys)}"
+                logger.warning(warning_msg)
+                st.session_state.news_collector = None
+                st.session_state.sentiment_aggregator = None
+                st.warning(f"⚠️ {warning_msg}. Add them to .env file.")
+            else:
+                try:
+                    st.session_state.news_collector = NewsCollector(
+                        database=st.session_state.db,
+                        config=news_config
+                    )
+
+                    st.session_state.sentiment_aggregator = SentimentAggregator(
+                        database=st.session_state.db,
+                        config=news_config.get('features', {})
+                    )
+                    logger.info("Sentiment aggregator initialized")
+
+                    # Start news collector after both components are initialized
+                    st.session_state.news_collector.start()
+                    logger.info("News collector started")
+                except ValueError as e:
+                    error_msg = f"Invalid news configuration: {e}"
+                    logger.error(error_msg)
+                    st.session_state.news_collector = None
+                    st.session_state.sentiment_aggregator = None
+                    st.error(f"❌ {error_msg}")
+                except Exception as e:
+                    error_msg = f"Failed to initialize news components: {e}"
+                    logger.error(error_msg)
+                    st.session_state.news_collector = None
+                    st.session_state.sentiment_aggregator = None
+                    st.error(f"❌ {error_msg}")
+
 initialize_components()
+
+# =============================================================================
+# CLEANUP HANDLERS
+# =============================================================================
+
+def cleanup_resources() -> None:
+    """Cleanup background threads and connections on shutdown."""
+    try:
+        # Check if Streamlit session state is still available
+        if not hasattr(st, 'session_state'):
+            return
+
+        # Stop news collector if running
+        news_collector = st.session_state.get('news_collector')
+        if news_collector:
+            try:
+                if hasattr(news_collector, 'stop'):
+                    news_collector.stop()
+                    logger.info("News collector stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping news collector: {e}")
+
+        # Stop data provider if running
+        data_provider = st.session_state.get('data_provider')
+        if data_provider:
+            try:
+                if hasattr(data_provider, 'stop'):
+                    data_provider.stop()
+                    logger.info("Data provider stopped")
+            except Exception as e:
+                logger.warning(f"Error stopping data provider: {e}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+# Register cleanup handler
+import atexit
+atexit.register(cleanup_resources)
 
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
-
-def load_config() -> dict:
-    """Load configuration file."""
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH) as f:
-            return yaml.safe_load(f)
-    return {}
-
 
 def is_engine_running() -> tuple:
     """Check if analysis engine is running."""
@@ -321,7 +424,7 @@ def fetch_market_data(symbol: str, timeframe: str = '1h', limit: int = 200) -> d
                     'high': price,
                     'low': price,
                     'close': price,
-                    'volume': tick.volume if tick else 0
+                    'volume': tick.quantity if tick else 0
                 }])
             else:
                 return {'success': False, 'error': f'WebSocket connected, waiting for data... ({ticks_received} ticks)'}
@@ -392,19 +495,22 @@ def format_number(value: float, prefix: str = '$') -> str:
 # =============================================================================
 
 def render_metric_card(label: str, value: str, delta: str = "", card_class: str = ""):
-    """Render a metric card."""
-    delta_html = f'<div class="delta">{delta}</div>' if delta else ''
+    """Render a metric card with XSS protection."""
+    # Escape user-controlled content
+    label_escaped = html.escape(label)
+    value_escaped = html.escape(value)
+    delta_html = f'<div class="delta">{html.escape(delta)}</div>' if delta else ''
     st.markdown(f"""
         <div class="metric-card {card_class}">
-            <div class="label">{label}</div>
-            <div class="value">{value}</div>
+            <div class="label">{label_escaped}</div>
+            <div class="value">{value_escaped}</div>
             {delta_html}
         </div>
     """, unsafe_allow_html=True)
 
 
 def render_signal_card(direction: str, confidence: float, price: float, stop_loss: float, take_profit: float):
-    """Render signal card."""
+    """Render basic signal card (legacy function for compatibility)."""
     signal_class = f"signal-{direction.lower()}"
     color = "#28a745" if direction == "BUY" else "#dc3545" if direction == "SELL" else "#6c757d"
 
@@ -429,6 +535,290 @@ def render_signal_card(direction: str, confidence: float, price: float, stop_los
             </div>
         </div>
     """, unsafe_allow_html=True)
+
+
+def render_enhanced_signal_card(prediction, price: float, account_balance: float = 10000):
+    """Render comprehensive signal card with all metrics."""
+    signal_class = f"signal-{prediction.direction.lower()}"
+    color = "#28a745" if prediction.direction == "BUY" else "#dc3545" if prediction.direction == "SELL" else "#6c757d"
+
+    # Calculate dollar amounts for position
+    position_size_dollars = account_balance * prediction.kelly_fraction
+    shares = position_size_dollars / price if price > 0 else 0
+    expected_profit_dollars = shares * abs(prediction.take_profit - price)
+    expected_loss_dollars = shares * abs(price - prediction.stop_loss)
+
+    st.markdown(f"""
+        <div class="signal-card {signal_class}">
+            <!-- Main Signal -->
+            <div style="font-size: 0.9rem; color: #6c757d; margin-bottom: 0.5rem;">🤖 AI SIGNAL</div>
+            <div style="font-size: 3rem; font-weight: 800; color: {color};">{prediction.direction}</div>
+            <div style="font-size: 1.2rem; margin-top: 0.5rem;">
+                Confidence: {prediction.confidence*100:.1f}%
+            </div>
+
+            <!-- Price Levels -->
+            <div style="margin-top: 1.5rem; display: flex; justify-content: space-around; padding: 1rem; background: #f8f9fa; border-radius: 8px;">
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">STOP LOSS</div>
+                    <div style="color: #dc3545; font-weight: 700; font-size: 1.1rem;">${prediction.stop_loss:,.2f}</div>
+                    <div style="font-size: 0.7rem; color: #999;">-{prediction.expected_loss_pct*100:.1f}%</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">ENTRY</div>
+                    <div style="font-weight: 700; font-size: 1.1rem;">${price:,.2f}</div>
+                    <div style="font-size: 0.7rem; color: #999;">Current</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">TAKE PROFIT</div>
+                    <div style="color: #28a745; font-weight: 700; font-size: 1.1rem;">${prediction.take_profit:,.2f}</div>
+                    <div style="font-size: 0.7rem; color: #999;">+{prediction.expected_profit_pct*100:.1f}%</div>
+                </div>
+            </div>
+
+            <!-- Risk Metrics -->
+            <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px; border: 1px solid #e0e0e0;">
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                    <div>
+                        <span style="color: #6c757d; font-size: 0.8rem;">Risk/Reward:</span>
+                        <span style="font-weight: 700; margin-left: 0.3rem;">1:{prediction.risk_reward_ratio:.2f}</span>
+                    </div>
+                    <div>
+                        <span style="color: #6c757d; font-size: 0.8rem;">Position Size:</span>
+                        <span style="font-weight: 700; margin-left: 0.3rem;">{prediction.kelly_fraction*100:.1f}%</span>
+                    </div>
+                    <div>
+                        <span style="color: #6c757d; font-size: 0.8rem;">Expected Profit:</span>
+                        <span style="color: #28a745; font-weight: 700; margin-left: 0.3rem;">${expected_profit_dollars:,.0f}</span>
+                    </div>
+                    <div>
+                        <span style="color: #6c757d; font-size: 0.8rem;">Expected Loss:</span>
+                        <span style="color: #dc3545; font-weight: 700; margin-left: 0.3rem;">${expected_loss_dollars:,.0f}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+
+def render_monte_carlo_section(prediction):
+    """Render Monte Carlo simulation results."""
+    st.markdown("#### 🎲 Monte Carlo Simulation")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        prob_profit = prediction.monte_carlo_prob_profit * 100
+        color = "positive" if prob_profit > 50 else "negative"
+        render_metric_card(
+            "Probability of Profit",
+            f"{prob_profit:.1f}%",
+            card_class=color
+        )
+
+    with col2:
+        prob_tp = prediction.monte_carlo_prob_take_profit * 100
+        render_metric_card(
+            "Hit Take Profit",
+            f"{prob_tp:.1f}%",
+            card_class="positive"
+        )
+
+    with col3:
+        prob_sl = prediction.monte_carlo_prob_stop_loss * 100
+        render_metric_card(
+            "Hit Stop Loss",
+            f"{prob_sl:.1f}%",
+            card_class="negative"
+        )
+
+    # Additional metrics
+    col4, col5, col6 = st.columns(3)
+
+    with col4:
+        render_metric_card(
+            "Value at Risk (5%)",
+            f"{prediction.monte_carlo_var_5pct*100:.2f}%"
+        )
+
+    with col5:
+        render_metric_card(
+            "Daily Volatility",
+            f"{prediction.monte_carlo_volatility_daily*100:.2f}%"
+        )
+
+    with col6:
+        render_metric_card(
+            "Annual Volatility",
+            f"{prediction.monte_carlo_volatility_annual*100:.1f}%"
+        )
+
+
+def render_sentiment_section(prediction):
+    """Render news sentiment analysis."""
+    if prediction.sentiment_score is None:
+        st.info("📰 Sentiment analysis not available (news collector not running)")
+        return
+
+    st.markdown("#### 📰 News Sentiment")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        sentiment = prediction.sentiment_score
+        if sentiment > 0.2:
+            color = "positive"
+            emoji = "📈"
+            label = "Bullish"
+        elif sentiment < -0.2:
+            color = "negative"
+            emoji = "📉"
+            label = "Bearish"
+        else:
+            color = ""
+            emoji = "➖"
+            label = "Neutral"
+
+        render_metric_card(
+            "Overall Sentiment",
+            f"{emoji} {label}",
+            f"{sentiment:+.2f}",
+            card_class=color
+        )
+
+    with col2:
+        if prediction.sentiment_1h is not None:
+            render_metric_card(
+                "1H Sentiment",
+                f"{prediction.sentiment_1h:+.2f}"
+            )
+
+    with col3:
+        if prediction.sentiment_6h is not None:
+            render_metric_card(
+                "6H Sentiment",
+                f"{prediction.sentiment_6h:+.2f}"
+            )
+
+    with col4:
+        if prediction.news_volume_1h is not None:
+            render_metric_card(
+                "News Volume (1H)",
+                str(prediction.news_volume_1h)
+            )
+
+    # Sentiment momentum indicator
+    if prediction.sentiment_momentum is not None:
+        momentum = prediction.sentiment_momentum
+        if abs(momentum) > 0.1:
+            trend = "📈 Improving" if momentum > 0 else "📉 Declining"
+            st.info(f"**Sentiment Trend:** {trend} ({momentum:+.2f}/hour)")
+
+
+def render_algorithm_breakdown(prediction):
+    """Render detailed algorithm analysis."""
+    st.markdown("#### 🧠 Algorithm Analysis")
+
+    # Create tabs for different algorithm categories
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Ensemble",
+        "🌊 Fourier",
+        "📈 Kalman",
+        "🎰 Markov",
+        "💹 Entropy"
+    ])
+
+    with tab1:
+        st.markdown("**Algorithm Contribution Weights**")
+        weights = prediction.ensemble_weights
+
+        # Display as a table
+        weight_df = pd.DataFrame([
+            {"Algorithm": k.upper(), "Weight": f"{v*100:.1f}%", "Raw": v}
+            for k, v in weights.items()
+        ]).sort_values("Raw", ascending=False)
+
+        st.dataframe(weight_df[["Algorithm", "Weight"]], use_container_width=True, hide_index=True)
+
+        # Pie chart
+        fig = go.Figure(data=[go.Pie(
+            labels=[k.upper() for k in weights.keys()],
+            values=list(weights.values()),
+            hole=0.3
+        )])
+        fig.update_layout(title="Ensemble Composition", height=300, showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Signal", prediction.fourier_signal)
+        with col2:
+            st.metric("Cycle Phase", f"{prediction.fourier_cycle_phase:.2f}")
+        with col3:
+            st.metric("Dominant Period", f"{prediction.fourier_dominant_period:.1f}")
+
+        st.info(f"""
+        **Interpretation:**
+        - Phase **{prediction.fourier_cycle_phase:.2f}** means we are {int(prediction.fourier_cycle_phase*100)}% through the current cycle
+        - The dominant cycle period is **{prediction.fourier_dominant_period:.0f}** candles
+        - Signal: **{prediction.fourier_signal}** (cycle-based trend prediction)
+        """)
+
+    with tab3:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Trend", prediction.kalman_trend)
+        with col2:
+            st.metric("Smoothed Price", f"${prediction.kalman_smoothed_price:,.2f}")
+        with col3:
+            st.metric("Velocity", f"{prediction.kalman_velocity:.4f}")
+
+        st.info(f"""
+        **Interpretation:**
+        - Kalman filter detected **{prediction.kalman_trend}** trend
+        - Noise-filtered price estimate: **${prediction.kalman_smoothed_price:,.2f}**
+        - Price velocity (momentum): **{prediction.kalman_velocity:.4f}**
+        - Estimation uncertainty: **{prediction.kalman_error_covariance:.4f}**
+        """)
+
+    with tab4:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Current State", prediction.markov_state)
+        with col2:
+            st.metric("P(Up)", f"{prediction.markov_probability*100:.1f}%")
+        with col3:
+            st.metric("P(Down)", f"{prediction.markov_prob_down*100:.1f}%")
+
+        st.write("**State Transition Probabilities:**")
+        st.write(f"- Probability of UP move: **{prediction.markov_probability*100:.1f}%**")
+        st.write(f"- Probability of DOWN move: **{prediction.markov_prob_down*100:.1f}%**")
+        st.write(f"- Probability of NEUTRAL move: **{prediction.markov_prob_neutral*100:.1f}%**")
+
+    with tab5:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Regime", prediction.entropy_regime)
+        with col2:
+            st.metric("Entropy (Normalized)", f"{prediction.entropy_value:.2f}")
+        with col3:
+            st.metric("Sample Size", prediction.entropy_n_samples)
+
+        regime_descriptions = {
+            "TRENDING": "📈 Low entropy - Clear directional movement",
+            "NORMAL": "➖ Medium entropy - Balanced market conditions",
+            "CHOPPY": "📊 High entropy - Sideways price action",
+            "VOLATILE": "⚡ Very high entropy - Unstable conditions"
+        }
+
+        st.info(f"""
+        **Interpretation:** {regime_descriptions.get(prediction.entropy_regime, 'Unknown regime')}
+
+        - Entropy score: **{prediction.entropy_value:.2f}** (0 = trending, 1 = random)
+        - Raw entropy: **{prediction.entropy_raw_value:.2f}**
+        - Based on **{prediction.entropy_n_samples}** recent observations
+        """)
 
 
 def render_price_chart(df: pd.DataFrame, symbol: str):
@@ -488,7 +878,13 @@ def page_dashboard():
     )
 
     if not data['success']:
-        st.error(f"Failed to fetch market data: {data.get('error', 'Unknown error')}")
+        error_msg = data.get('error', 'Unknown error')
+        # Show info message instead of error (WebSocket is loading data)
+        if 'waiting for data' in error_msg.lower() or 'connecting' in error_msg.lower():
+            st.info(f"🔄 Loading market data... {error_msg}")
+            st.info("💡 The WebSocket is connected and receiving data. The dashboard will update automatically once candles are available.")
+        else:
+            st.warning(f"⚠️ {error_msg}")
         return
 
     df = data['df']
@@ -552,33 +948,70 @@ def page_dashboard():
         st.plotly_chart(fig, use_container_width=True)
 
     with right_col:
-        # AI Prediction
-        st.markdown("### AI Prediction")
+        # AI Prediction Section
+        st.markdown("### 🤖 AI Prediction")
 
         if AI_AVAILABLE and len(df) >= 50:
             try:
                 predictor = st.session_state.advanced_predictor
                 if predictor:
-                    prediction = predictor.predict(df, lstm_probability=0.55)
-                    render_signal_card(
-                        prediction.direction,
-                        prediction.confidence,
-                        price,
-                        prediction.stop_loss,
-                        prediction.take_profit
+                    # Calculate ATR
+                    high_low = df['high'] - df['low']
+                    atr = float(high_low.rolling(14).mean().iloc[-1]) if len(high_low) >= 14 else price * 0.02
+
+                    # Fetch sentiment features
+                    sentiment_features = None
+                    if st.session_state.db and st.session_state.sentiment_aggregator:
+                        try:
+                            latest_timestamp = int(df.iloc[-1]['timestamp'])
+                            sentiment_features = st.session_state.db.get_sentiment_features(latest_timestamp)
+                            if sentiment_features:
+                                logger.info(f"Sentiment features loaded for AI prediction")
+                        except Exception as e:
+                            logger.warning(f"Could not fetch sentiment: {e}")
+                            sentiment_features = None
+
+                    # Make prediction with all available data
+                    prediction = predictor.predict(
+                        df=df,
+                        lstm_probability=0.55,  # TODO: Replace with trained LSTM model
+                        atr=atr,
+                        sentiment_features=sentiment_features
                     )
 
-                    # Algorithm breakdown
-                    with st.expander("Algorithm Details"):
-                        st.write(f"**Fourier:** {prediction.fourier_signal} (Phase: {prediction.fourier_cycle_phase:.2f})")
-                        st.write(f"**Kalman:** {prediction.kalman_trend}")
-                        st.write(f"**Entropy:** {prediction.entropy_regime} ({prediction.entropy_value:.2f})")
-                        st.write(f"**Markov:** {prediction.markov_state} (P(up): {prediction.markov_probability:.2f})")
-                        st.write(f"**Monte Carlo Risk:** {prediction.monte_carlo_risk:.2f}")
+                    # Get account balance for position sizing
+                    paper_trader = st.session_state.paper_trader
+                    account_balance = paper_trader.total_value if paper_trader else 10000
+
+                    # Main enhanced signal card
+                    render_enhanced_signal_card(prediction, price, account_balance)
+
+                    st.markdown("---")
+
+                    # Monte Carlo probabilities section
+                    render_monte_carlo_section(prediction)
+
+                    st.markdown("---")
+
+                    # Sentiment section (if available)
+                    if prediction.sentiment_score is not None:
+                        render_sentiment_section(prediction)
+                        st.markdown("---")
+
+                    # Detailed algorithm breakdown (expandable)
+                    with st.expander("🔍 Detailed Algorithm Analysis", expanded=False):
+                        render_algorithm_breakdown(prediction)
+
             except Exception as e:
-                st.warning(f"Prediction unavailable: {e}")
+                logger.error(f"Prediction error: {e}")
+                st.error(f"❌ Prediction unavailable: {e}")
+
+                # Show debug info
+                if st.checkbox("Show debug info"):
+                    import traceback
+                    st.code(traceback.format_exc())
         else:
-            st.info("AI predictions require 50+ candles")
+            st.info(f"⏳ AI predictions require 50+ candles of data. Currently: {len(df)}")
 
 
 # =============================================================================
@@ -653,6 +1086,215 @@ def page_portfolio():
         st.dataframe(pd.DataFrame(trade_data), use_container_width=True, hide_index=True)
     else:
         st.info("No trades yet")
+
+
+# =============================================================================
+# PAGE: FOREX MARKETS
+# =============================================================================
+
+def page_forex_markets():
+    """Forex markets monitoring page."""
+    st.markdown("### Forex Markets")
+
+    # Try to import forex module
+    try:
+        from src.portfolio.forex import (
+            FOREX_PAIRS, MAJOR_PAIRS, CROSS_PAIRS,
+            get_current_session
+        )
+        forex_available = True
+    except ImportError as e:
+        st.error(f"Forex module not available: {e}")
+        forex_available = False
+        return
+
+    # Load config
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            config = yaml.safe_load(f)
+        forex_config = config.get('forex', {})
+        forex_enabled = forex_config.get('enabled', False)
+    except Exception:
+        forex_config = {}
+        forex_enabled = False
+
+    # Status row
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        status = "Active" if forex_enabled else "Disabled"
+        status_color = "positive" if forex_enabled else "warning"
+        render_metric_card("Forex Status", status, card_class=status_color)
+
+    with col2:
+        session = get_current_session() if forex_available else "unknown"
+        session_display = session.replace("_", " ").title()
+        render_metric_card("Market Session", session_display)
+
+    with col3:
+        total_pairs = len(FOREX_PAIRS) if forex_available else 0
+        render_metric_card("Available Pairs", str(total_pairs))
+
+    with col4:
+        leverage = forex_config.get('leverage', {}).get('default', 50)
+        render_metric_card("Max Leverage", f"{leverage}:1")
+
+    st.markdown("---")
+
+    # Forex pairs display
+    st.markdown("### Currency Pairs")
+
+    # Tabs for Majors and Crosses
+    tab_majors, tab_crosses, tab_all = st.tabs(["Majors (7)", "Crosses (7)", "All Pairs (14)"])
+
+    with tab_majors:
+        st.markdown("#### Major Currency Pairs")
+        _render_forex_pairs_grid(MAJOR_PAIRS if forex_available else {})
+
+    with tab_crosses:
+        st.markdown("#### Cross Currency Pairs")
+        _render_forex_pairs_grid(CROSS_PAIRS if forex_available else {})
+
+    with tab_all:
+        st.markdown("#### All Currency Pairs")
+        _render_forex_pairs_grid(FOREX_PAIRS if forex_available else {})
+
+    st.markdown("---")
+
+    # Position sizing calculator
+    st.markdown("### Position Size Calculator")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        calc_symbol = st.selectbox(
+            "Currency Pair",
+            list(FOREX_PAIRS.keys()) if forex_available else ["EUR/USD"],
+            key="forex_calc_symbol"
+        )
+        account_balance = st.number_input("Account Balance ($)", value=10000.0, min_value=100.0, step=100.0)
+        risk_percent = st.number_input("Risk Per Trade (%)", value=1.0, min_value=0.1, max_value=5.0, step=0.1)
+
+    with col2:
+        stop_pips = st.number_input("Stop Loss (pips)", value=50.0, min_value=1.0, step=1.0)
+        current_price = st.number_input("Current Price", value=1.1000, min_value=0.0001, step=0.0001, format="%.4f")
+
+    if st.button("Calculate Position Size"):
+        try:
+            from src.portfolio.forex import ForexPositionSizer
+            sizer = ForexPositionSizer(max_risk_percent=risk_percent)
+            result = sizer.calculate_position_size(
+                symbol=calc_symbol,
+                account_equity=account_balance,
+                stop_pips=stop_pips,
+                current_price=current_price
+            )
+
+            st.success(f"""
+            **Position Size:** {result.lots:.2f} lots ({result.units:,.0f} units)
+
+            **Risk Amount:** ${result.risk_amount:.2f}
+
+            **Margin Required:** ${result.margin_required:,.2f}
+
+            **Pip Value:** ${result.pip_value:.2f}/pip
+            """)
+
+            if result.was_reduced:
+                st.warning(f"Position reduced: {result.reduction_reason}")
+
+        except Exception as e:
+            st.error(f"Calculation error: {e}")
+
+    st.markdown("---")
+
+    # OANDA connection status
+    st.markdown("### OANDA Connection")
+
+    oanda_key = os.getenv("OANDA_API_KEY", "")
+    oanda_account = os.getenv("OANDA_ACCOUNT_ID", "")
+
+    if oanda_key and oanda_account:
+        st.success("OANDA credentials configured")
+
+        if st.button("Test OANDA Connection"):
+            try:
+                from src.brokerages.oanda import OandaBrokerage
+                broker = OandaBrokerage(practice=True)
+                if broker.connect():
+                    summary = broker.get_account_summary()
+                    st.success(f"""
+                    **Connected to OANDA**
+
+                    Account ID: {summary.get('id', 'N/A')}
+
+                    Balance: ${summary.get('balance', 0):,.2f}
+
+                    NAV: ${summary.get('nav', 0):,.2f}
+
+                    Margin Available: ${summary.get('margin_available', 0):,.2f}
+                    """)
+                    broker.disconnect()
+                else:
+                    st.error("Failed to connect to OANDA")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
+    else:
+        st.warning("OANDA credentials not configured. Set OANDA_API_KEY and OANDA_ACCOUNT_ID in .env")
+
+    # Trading session info
+    st.markdown("---")
+    st.markdown("### Trading Sessions (UTC)")
+
+    session_data = {
+        'Session': ['Sydney', 'Tokyo', 'London', 'New York'],
+        'Open (UTC)': ['21:00', '00:00', '08:00', '13:00'],
+        'Close (UTC)': ['06:00', '09:00', '17:00', '22:00'],
+        'Best Pairs': ['AUD/USD, NZD/USD', 'USD/JPY, EUR/JPY', 'EUR/USD, GBP/USD', 'EUR/USD, USD/CAD'],
+        'Liquidity': ['Low', 'Medium', 'High', 'High']
+    }
+    st.dataframe(pd.DataFrame(session_data), use_container_width=True, hide_index=True)
+
+
+def _render_forex_pairs_grid(pairs: dict):
+    """Render forex pairs in a grid layout."""
+    if not pairs:
+        st.info("No pairs available")
+        return
+
+    # Convert to list for grid
+    pairs_list = list(pairs.items())
+
+    # 4 columns grid
+    cols = st.columns(4)
+
+    for i, (symbol, config) in enumerate(pairs_list):
+        with cols[i % 4]:
+            pip_size = config.pip_size if hasattr(config, 'pip_size') else 0.0001
+            typical_spread = config.typical_spread if hasattr(config, 'typical_spread') else 1.0
+            category = config.category if hasattr(config, 'category') else "major"
+
+            # Card styling based on category
+            border_color = "#667eea" if category == "major" else "#764ba2"
+
+            st.markdown(f"""
+            <div style="
+                background: white;
+                border-radius: 12px;
+                padding: 1rem;
+                margin-bottom: 1rem;
+                border-left: 4px solid {border_color};
+                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            ">
+                <div style="font-size: 1.1rem; font-weight: 700; color: #1a1a2e;">{symbol}</div>
+                <div style="font-size: 0.75rem; color: #6c757d; margin-top: 0.3rem;">
+                    Pip: {pip_size} | Spread: ~{typical_spread:.1f}
+                </div>
+                <div style="font-size: 0.7rem; color: #999; margin-top: 0.2rem;">
+                    {category.upper()}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -769,7 +1411,11 @@ def page_backtesting():
             data = fetch_market_data(st.session_state.symbol, '1h', limit=lookback_days * 24)
 
             if not data['success']:
-                st.error("Failed to fetch historical data")
+                error_msg = data.get('error', 'Unknown error')
+                if 'waiting for data' in error_msg.lower() or 'connecting' in error_msg.lower():
+                    st.info(f"🔄 Loading historical data... {error_msg}")
+                else:
+                    st.warning(f"⚠️ {error_msg}")
                 return
 
             df = data['df']
@@ -1007,6 +1653,204 @@ def page_performance():
 
 
 # =============================================================================
+# PAGE: NEWS & SENTIMENT
+# =============================================================================
+
+def page_news_sentiment():
+    """News & Sentiment analysis page."""
+    st.markdown("### News & Sentiment Analysis")
+
+    db = st.session_state.db
+    news_collector = st.session_state.news_collector
+
+    if not AI_AVAILABLE or db is None:
+        st.warning("News features not available")
+        return
+
+    # News collector status
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if news_collector and hasattr(news_collector, '_running') and news_collector._running:
+            status = "🟢 Active"
+            status_class = "positive"
+        else:
+            status = "🔴 Inactive"
+            status_class = "negative"
+        render_metric_card("News Collector", status, "", status_class)
+
+    with col2:
+        # Count articles in database
+        try:
+            articles = db.get_news_articles(limit=1000)
+            article_count = len(articles)
+            render_metric_card("Total Articles", str(article_count))
+        except Exception as e:
+            logger.error(f"Failed to fetch articles: {e}")
+            render_metric_card("Total Articles", "0")
+            article_count = 0
+
+    with col3:
+        # Get recent articles (last 24h)
+        try:
+            since = int((datetime.utcnow() - timedelta(hours=24)).timestamp())
+            recent = db.get_news_articles(since_timestamp=since, limit=1000)
+            render_metric_card("24h Articles", str(len(recent)))
+        except Exception as e:
+            logger.error(f"Failed to fetch recent articles: {e}")
+            render_metric_card("24h Articles", "0")
+
+    st.markdown("---")
+
+    if article_count == 0:
+        st.info("""
+        **No news articles found in database.**
+
+        News collection requires:
+        1. API keys set in `.env` file (`NEWSAPI_KEY`, `ALPHAVANTAGE_KEY`)
+        2. News collection enabled in `config.yaml`
+        3. Analysis engine running (`python run_analysis.py`)
+
+        Once configured, news will be collected automatically every 30 minutes.
+        """)
+        return
+
+    # Recent articles
+    st.markdown("### Recent Articles")
+
+    try:
+        # Get recent articles
+        articles = db.get_news_articles(
+            symbol=st.session_state.symbol.split('/')[0],
+            limit=20
+        )
+
+        if not articles:
+            st.info(f"No articles found for {st.session_state.symbol}")
+        else:
+            for article in articles[:10]:  # Show top 10
+                # Determine sentiment color
+                sentiment = article.get('sentiment_score', 0)
+                if sentiment > 0.2:
+                    sentiment_color = "#28a745"  # Green (bullish)
+                    sentiment_label = "📈 Bullish"
+                elif sentiment < -0.2:
+                    sentiment_color = "#dc3545"  # Red (bearish)
+                    sentiment_label = "📉 Bearish"
+                else:
+                    sentiment_color = "#6c757d"  # Gray (neutral)
+                    sentiment_label = "➖ Neutral"
+
+                # Format timestamp
+                try:
+                    dt = datetime.fromisoformat(article['datetime'])
+                    time_str = dt.strftime('%Y-%m-%d %H:%M')
+                except:
+                    time_str = "Unknown"
+
+                # Render article card
+                st.markdown(f"""
+                <div style="background: white; border-radius: 8px; padding: 1rem; margin-bottom: 0.5rem; border-left: 4px solid {sentiment_color};">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <span style="color: {sentiment_color}; font-weight: 600;">{sentiment_label}</span>
+                        <span style="color: #6c757d; font-size: 0.85rem;">{article['source']} • {time_str}</span>
+                    </div>
+                    <div style="font-weight: 600; margin-bottom: 0.3rem;">{article['title']}</div>
+                    <div style="color: #6c757d; font-size: 0.9rem;">{article.get('description', '')[:200]}...</div>
+                    {f'<div style="margin-top: 0.5rem;"><a href="{article["url"]}" target="_blank" style="color: #667eea; text-decoration: none;">Read more →</a></div>' if article.get('url') else ''}
+                </div>
+                """, unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"Error loading articles: {e}")
+
+    st.markdown("---")
+
+    # Sentiment trend chart
+    st.markdown("### Sentiment Trend")
+
+    try:
+        # Get sentiment features for recent candles
+        data = fetch_market_data(st.session_state.symbol, limit=48)  # Last 48 hours
+        if data['success'] and not data['df'].empty:
+            df = data['df']
+
+            sentiment_data = []
+            for _, row in df.iterrows():
+                timestamp = int(row.get('timestamp', 0))
+                if timestamp:
+                    features = db.get_sentiment_features(timestamp)
+                    if features:
+                        sentiment_data.append({
+                            'datetime': row['datetime'],
+                            'sentiment_1h': features.get('sentiment_1h', 0),
+                            'sentiment_6h': features.get('sentiment_6h', 0),
+                            'news_volume': features.get('news_volume_1h', 0)
+                        })
+
+            if sentiment_data:
+                df_sentiment = pd.DataFrame(sentiment_data)
+
+                # Create chart
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.1,
+                    row_heights=[0.7, 0.3]
+                )
+
+                # Sentiment line
+                fig.add_trace(
+                    go.Scatter(
+                        x=df_sentiment['datetime'],
+                        y=df_sentiment['sentiment_1h'],
+                        mode='lines',
+                        name='1H Sentiment',
+                        line=dict(color='#667eea', width=2)
+                    ),
+                    row=1, col=1
+                )
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=df_sentiment['datetime'],
+                        y=df_sentiment['sentiment_6h'],
+                        mode='lines',
+                        name='6H Sentiment',
+                        line=dict(color='#764ba2', width=2, dash='dash')
+                    ),
+                    row=1, col=1
+                )
+
+                # News volume
+                fig.add_trace(
+                    go.Bar(
+                        x=df_sentiment['datetime'],
+                        y=df_sentiment['news_volume'],
+                        name='News Volume',
+                        marker_color='#667eea',
+                        opacity=0.5
+                    ),
+                    row=2, col=1
+                )
+
+                fig.update_layout(
+                    title="Sentiment & News Volume",
+                    height=500,
+                    showlegend=True
+                )
+
+                fig.update_yaxes(title_text="Sentiment", row=1, col=1)
+                fig.update_yaxes(title_text="Articles", row=2, col=1)
+
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No sentiment data available yet. Wait for news collection to populate features.")
+    except Exception as e:
+        st.error(f"Error loading sentiment trend: {e}")
+
+
+# =============================================================================
 # PAGE: SETTINGS
 # =============================================================================
 
@@ -1025,9 +1869,10 @@ def page_settings():
 
         with col1:
             new_symbol = st.text_input("Default Symbol", value=config.get('data', {}).get('symbol', 'BTC/USDT'))
-            new_exchange = st.selectbox("Exchange", ['binance', 'coinbase', 'bybit', 'kraken'],
-                                        index=['binance', 'coinbase', 'bybit', 'kraken'].index(
-                                            config.get('data', {}).get('exchange', 'binance')))
+            exchange_options = ['binance', 'alpaca', 'coinbase', 'bybit', 'kraken']
+            current_exchange = config.get('data', {}).get('exchange', 'binance')
+            new_exchange = st.selectbox("Exchange", exchange_options,
+                                        index=exchange_options.index(current_exchange) if current_exchange in exchange_options else 0)
             all_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
             current_interval = config.get('data', {}).get('interval', '1h')
             new_interval = st.selectbox("Timeframe", all_timeframes,
@@ -1111,11 +1956,13 @@ def main():
         # Page selection
         pages = {
             "📊 Dashboard": "Dashboard",
+            "💱 Forex Markets": "Forex Markets",
             "💼 Portfolio": "Portfolio",
             "📝 Paper Trade": "Paper Trading",
             "📈 Backtest": "Backtesting",
             "🛡️ Risk": "Risk Management",
             "📉 Performance": "Performance",
+            "📰 News & Sentiment": "News & Sentiment",
             "⚙️ Settings": "Settings"
         }
 
@@ -1130,15 +1977,22 @@ def main():
         # Quick settings
         st.markdown("### Quick Settings")
 
-        exchanges = ['binance', 'coinbase', 'bybit', 'kraken']
+        exchanges = ['binance', 'alpaca', 'coinbase', 'bybit', 'kraken']
         new_exchange = st.selectbox("Exchange", exchanges,
-                                    index=exchanges.index(st.session_state.exchange))
+                                    index=exchanges.index(st.session_state.exchange) if st.session_state.exchange in exchanges else 0)
         if new_exchange != st.session_state.exchange:
             st.session_state.exchange = new_exchange
             # Provider will use new exchange on next subscription
             st.rerun()
 
-        symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT']
+        # Symbol list changes based on exchange
+        if st.session_state.exchange == 'alpaca':
+            # US Stocks and popular assets
+            symbols = ['AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'SPY', 'QQQ', 'BTC/USD', 'ETH/USD']
+        else:
+            # Crypto pairs for other exchanges
+            symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT']
+
         new_symbol = st.selectbox("Symbol", symbols,
                                   index=symbols.index(st.session_state.symbol) if st.session_state.symbol in symbols else 0)
         if new_symbol != st.session_state.symbol:
@@ -1181,21 +2035,23 @@ def main():
     # Render selected page
     page_functions = {
         "Dashboard": page_dashboard,
+        "Forex Markets": page_forex_markets,
         "Portfolio": page_portfolio,
         "Paper Trading": page_paper_trading,
         "Backtesting": page_backtesting,
         "Risk Management": page_risk_management,
         "Performance": page_performance,
+        "News & Sentiment": page_news_sentiment,
         "Settings": page_settings,
     }
 
+    # Auto-refresh (non-flickering) - runs BEFORE page rendering to prevent flicker
+    if st.session_state.auto_refresh:
+        # Convert seconds to milliseconds, runs in background without blocking
+        st_autorefresh(interval=st.session_state.refresh_interval * 1000, key="data_refresh")
+
     page_func = page_functions.get(st.session_state.page, page_dashboard)
     page_func()
-
-    # Auto-refresh
-    if st.session_state.auto_refresh:
-        time.sleep(st.session_state.refresh_interval)
-        st.rerun()
 
 
 if __name__ == "__main__":

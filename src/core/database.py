@@ -1108,41 +1108,57 @@ class Database:
         self,
         symbol: str = None,
         since_timestamp: int = None,
-        limit: int = 100
+        limit: int = 100,
+        processed_only: bool = False
     ) -> List[Dict]:
-        """Get news articles optionally filtered by symbol and time."""
+        """Get news articles optionally filtered by symbol, time, and processed status."""
         with self.connection() as conn:
             cursor = conn.cursor()
 
-            if symbol and since_timestamp:
-                cursor.execute('''
-                    SELECT * FROM news_articles
-                    WHERE primary_symbol = ? AND timestamp >= ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (symbol, since_timestamp, limit))
-            elif symbol:
-                cursor.execute('''
-                    SELECT * FROM news_articles
-                    WHERE primary_symbol = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (symbol, limit))
-            elif since_timestamp:
-                cursor.execute('''
-                    SELECT * FROM news_articles
-                    WHERE timestamp >= ?
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (since_timestamp, limit))
-            else:
-                cursor.execute('''
-                    SELECT * FROM news_articles
-                    ORDER BY timestamp DESC
-                    LIMIT ?
-                ''', (limit,))
+            # Build WHERE clauses dynamically
+            where_clauses = []
+            params = []
 
+            if symbol:
+                where_clauses.append("primary_symbol = ?")
+                params.append(symbol)
+
+            if since_timestamp:
+                where_clauses.append("timestamp >= ?")
+                params.append(since_timestamp)
+
+            if processed_only:
+                where_clauses.append("processed = 1")
+
+            # Construct SQL query
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            query = f'''
+                SELECT * FROM news_articles
+                WHERE {where_sql}
+                ORDER BY timestamp DESC
+                LIMIT ?
+            '''
+
+            cursor.execute(query, (*params, limit))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_news_by_hash(self, content_hash: str) -> Optional[Dict]:
+        """Get news article by content hash (for duplicate detection)."""
+        if not content_hash:
+            return None
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM news_articles
+                WHERE content_hash = ?
+                LIMIT 1
+            ''', (content_hash,))
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
 
     def save_sentiment_features(
         self,

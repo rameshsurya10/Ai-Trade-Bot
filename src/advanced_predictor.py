@@ -33,29 +33,56 @@ EPSILON = 1e-10
 
 @dataclass
 class PredictionResult:
-    """Result from AdvancedPredictor."""
+    """Result from AdvancedPredictor with comprehensive metrics."""
     direction: str  # "BUY", "SELL", "NEUTRAL"
     confidence: float  # 0.0 to 1.0
 
     # Individual algorithm outputs
     fourier_signal: str  # "BULLISH", "BEARISH", "NEUTRAL"
     fourier_cycle_phase: float  # 0.0 to 1.0
+    fourier_dominant_period: float  # Dominant cycle length
 
     kalman_trend: str  # "UP", "DOWN", "SIDEWAYS"
     kalman_smoothed_price: float
+    kalman_velocity: float  # Price momentum
+    kalman_error_covariance: float  # Estimation uncertainty
 
-    entropy_regime: str  # "TRENDING", "CHOPPY", "VOLATILE"
-    entropy_value: float
+    entropy_regime: str  # "TRENDING", "CHOPPY", "VOLATILE", "NORMAL"
+    entropy_value: float  # Normalized entropy 0-1
+    entropy_raw_value: float  # Raw entropy value
+    entropy_n_samples: int  # Number of samples analyzed
 
     markov_probability: float  # P(up | current_state)
-    markov_state: str
+    markov_state: str  # Current market state
+    markov_prob_down: float  # P(down | current_state)
+    markov_prob_neutral: float  # P(neutral | current_state)
 
     monte_carlo_risk: float  # Risk score 0-1
-    monte_carlo_expected_return: float
+    monte_carlo_expected_return: float  # Expected return
+    monte_carlo_prob_profit: float  # Probability of profit
+    monte_carlo_prob_stop_loss: float  # Probability of hitting SL
+    monte_carlo_prob_take_profit: float  # Probability of hitting TP
+    monte_carlo_var_5pct: float  # Value at Risk (5th percentile)
+    monte_carlo_volatility_daily: float  # Daily volatility
+    monte_carlo_volatility_annual: float  # Annualized volatility
+    monte_carlo_drift_annual: float  # Annualized drift
 
     # Price levels
     stop_loss: float
     take_profit: float
+
+    # Risk metrics (calculated)
+    risk_reward_ratio: float  # R:R ratio
+    expected_profit_pct: float  # Expected profit %
+    expected_loss_pct: float  # Expected loss %
+    kelly_fraction: float  # Kelly criterion position size (0-1)
+
+    # Sentiment features (optional)
+    sentiment_score: Optional[float] = None  # Overall sentiment -1 to 1
+    sentiment_1h: Optional[float] = None  # 1-hour sentiment
+    sentiment_6h: Optional[float] = None  # 6-hour sentiment
+    sentiment_momentum: Optional[float] = None  # Sentiment trend
+    news_volume_1h: Optional[int] = None  # Number of articles in last hour
 
     # Meta
     ensemble_weights: Dict[str, float] = field(default_factory=dict)
@@ -675,7 +702,8 @@ class AdvancedPredictor:
         self,
         df: pd.DataFrame,
         lstm_probability: float = 0.5,
-        atr: Optional[float] = None
+        atr: Optional[float] = None,
+        sentiment_features: Optional[Dict] = None
     ) -> PredictionResult:
         """
         Generate prediction using ensemble of algorithms.
@@ -684,6 +712,7 @@ class AdvancedPredictor:
             df: DataFrame with OHLCV data
             lstm_probability: Probability from LSTM model (0-1)
             atr: Average True Range for stop loss calculation
+            sentiment_features: Optional sentiment data from news analysis
 
         Returns:
             PredictionResult with comprehensive analysis
@@ -718,6 +747,27 @@ class AdvancedPredictor:
         monte_carlo_result = self.monte_carlo.simulate(
             current_price, returns, stop_loss_pct, take_profit_pct
         )
+
+        # Process sentiment features (if available)
+        sentiment_score = None
+        sentiment_1h = None
+        sentiment_6h = None
+        sentiment_momentum = None
+        news_volume_1h = None
+        sentiment_prob = 0.5
+
+        if sentiment_features:
+            sentiment_1h = sentiment_features.get('sentiment_1h', 0.0)
+            sentiment_6h = sentiment_features.get('sentiment_6h', 0.0)
+            sentiment_momentum = sentiment_features.get('sentiment_momentum', 0.0)
+            news_volume_1h = sentiment_features.get('news_volume_1h', 0)
+
+            # Calculate weighted sentiment score
+            sentiment_score = (sentiment_1h * 0.6 + sentiment_6h * 0.4) if sentiment_1h is not None and sentiment_6h is not None else 0.0
+
+            # Convert sentiment to probability (sentiment range -1 to 1, prob 0 to 1)
+            sentiment_prob = 0.5 + (sentiment_score * 0.5)
+            sentiment_prob = max(0.2, min(0.8, sentiment_prob))  # Clamp to 0.2-0.8
 
         # Calculate ensemble probability
         prob_scores = []
@@ -757,9 +807,22 @@ class AdvancedPredictor:
         mc_prob = max(0.3, min(0.7, mc_prob))
         prob_scores.append(('monte_carlo', mc_prob))
 
+        # Sentiment contribution (if available)
+        if sentiment_features:
+            prob_scores.append(('sentiment', sentiment_prob))
+            # Adjust weights to include sentiment (5%)
+            weights_with_sentiment = self.weights.copy()
+            weights_with_sentiment['sentiment'] = 0.05
+            # Normalize other weights
+            total_other = sum(self.weights.values())
+            for key in self.weights:
+                weights_with_sentiment[key] = self.weights[key] * 0.95 / total_other
+        else:
+            weights_with_sentiment = self.weights
+
         # Weighted ensemble
         ensemble_prob = sum(
-            self.weights[name] * prob
+            weights_with_sentiment.get(name, 0) * prob
             for name, prob in prob_scores
         )
         ensemble_prob = max(0.0, min(1.0, ensemble_prob))
@@ -790,22 +853,77 @@ class AdvancedPredictor:
             stop_loss = current_price - atr
             take_profit = current_price + atr
 
+        # Calculate risk metrics
+        risk_amount = abs(current_price - stop_loss)
+        reward_amount = abs(take_profit - current_price)
+        risk_reward_ratio = reward_amount / (risk_amount + EPSILON)
+
+        expected_profit_pct = abs((take_profit - current_price) / current_price)
+        expected_loss_pct = abs((current_price - stop_loss) / current_price)
+
+        # Position sizing using Kelly Criterion approximation
+        win_prob = monte_carlo_result['prob_profit']
+        kelly_fraction = (win_prob * (1 + risk_reward_ratio) - 1) / (risk_reward_ratio + EPSILON)
+        kelly_fraction = max(0.0, min(0.25, kelly_fraction))  # Cap at 25% max
+
         return PredictionResult(
+            # Core signal
             direction=direction,
             confidence=float(confidence),
+
+            # Fourier analysis
             fourier_signal=fourier_result['signal'],
             fourier_cycle_phase=fourier_result['cycle_phase'],
+            fourier_dominant_period=fourier_result['dominant_period'],
+
+            # Kalman filter
             kalman_trend=kalman_result['trend'],
             kalman_smoothed_price=kalman_result['smoothed_price'],
+            kalman_velocity=kalman_result['velocity'],
+            kalman_error_covariance=kalman_result['error_covariance'],
+
+            # Entropy & regime
             entropy_regime=entropy_result['regime'],
             entropy_value=entropy_result['normalized_entropy'],
+            entropy_raw_value=entropy_result['entropy'],
+            entropy_n_samples=entropy_result['n_samples'],
+
+            # Markov chain
             markov_probability=markov_result['prob_up'],
             markov_state=markov_result['current_state'],
+            markov_prob_down=markov_result['prob_down'],
+            markov_prob_neutral=markov_result['prob_neutral'],
+
+            # Monte Carlo simulation
             monte_carlo_risk=monte_carlo_result['risk_score'],
             monte_carlo_expected_return=monte_carlo_result['expected_return'],
+            monte_carlo_prob_profit=monte_carlo_result['prob_profit'],
+            monte_carlo_prob_stop_loss=monte_carlo_result['prob_stop_loss'],
+            monte_carlo_prob_take_profit=monte_carlo_result['prob_take_profit'],
+            monte_carlo_var_5pct=monte_carlo_result['var_5_pct'],
+            monte_carlo_volatility_daily=monte_carlo_result['volatility_daily'],
+            monte_carlo_volatility_annual=monte_carlo_result['volatility_annual'],
+            monte_carlo_drift_annual=monte_carlo_result['drift_annual'],
+
+            # Price levels
             stop_loss=float(stop_loss),
             take_profit=float(take_profit),
-            ensemble_weights=self.weights.copy()
+
+            # Risk metrics
+            risk_reward_ratio=float(risk_reward_ratio),
+            expected_profit_pct=float(expected_profit_pct),
+            expected_loss_pct=float(expected_loss_pct),
+            kelly_fraction=float(kelly_fraction),
+
+            # Sentiment (optional)
+            sentiment_score=sentiment_score,
+            sentiment_1h=sentiment_1h,
+            sentiment_6h=sentiment_6h,
+            sentiment_momentum=sentiment_momentum,
+            news_volume_1h=news_volume_1h,
+
+            # Meta
+            ensemble_weights=weights_with_sentiment.copy()
         )
 
 

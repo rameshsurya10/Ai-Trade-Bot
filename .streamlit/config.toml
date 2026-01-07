@@ -1,13 +1,23 @@
+# Streamlit Theme Configuration
+# This configuration eliminates browser console warnings about empty theme colors
+
 [theme]
-base = "light"
 primaryColor = "#667eea"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f0f2f6"
+backgroundColor = "#f8f9fa"
+secondaryBackgroundColor = "#ffffff"
 textColor = "#1a1a2e"
 font = "sans serif"
 
+[theme.sidebar]
+widgetBackgroundColor = "#ffffff"
+widgetBorderColor = "#e0e0e0"
+skeletonBackgroundColor = "#f0f0f0"
+
 [server]
 headless = true
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
