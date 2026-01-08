@@ -17,6 +17,14 @@ Usage:
     streamlit run dashboard.py
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+ROOT = Path(__file__).parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
@@ -24,7 +32,6 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
-from pathlib import Path
 import time
 import logging
 import yaml
@@ -41,7 +48,6 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 
-ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.yaml"
 PID_FILE = ROOT / "run_analysis.pid"
 
