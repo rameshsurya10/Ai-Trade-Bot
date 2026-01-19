@@ -97,6 +97,41 @@ class Database:
             conn.rollback()
             raise e
 
+    def execute(self, query: str, params: tuple = None):
+        """
+        Execute single query (convenience method for prediction_validator).
+
+        Args:
+            query: SQL query
+            params: Query parameters
+
+        Returns:
+            Cursor object
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            return cursor
+
+    def query(self, query: str, params: tuple = None):
+        """
+        Execute query and return rows.
+
+        Args:
+            query: SQL query
+            params: Query parameters
+
+        Returns:
+            List of rows
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params if params else ())
+            return cursor.fetchall()
+
     def _init_schema(self):
         """Create database tables if they don't exist."""
         with self.connection() as conn:
@@ -106,7 +141,7 @@ class Database:
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS candles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp INTEGER UNIQUE,
+                    timestamp INTEGER,
                     datetime TEXT,
                     open REAL,
                     high REAL,
@@ -114,7 +149,8 @@ class Database:
                     close REAL,
                     volume REAL,
                     symbol TEXT,
-                    interval TEXT
+                    interval TEXT,
+                    UNIQUE(symbol, interval, timestamp)
                 )
             ''')
 

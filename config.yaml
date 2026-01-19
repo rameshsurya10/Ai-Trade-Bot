@@ -1,121 +1,81 @@
-# AI Trade Bot Configuration
-# ==========================
-
-# Trading Symbols
+market_mode: crypto
 symbols:
-  - BTC/USDT
-  - ETH/USDT
-
-# Exchange
+- BTC/USDT
+- ETH/USDT
 exchange: binance
-
-# Data Collection (WebSocket Real-Time)
 data:
   symbol: BTC/USDT
   exchange: binance
-  interval: 1h
+  interval: 15m
   history_days: 365
-  # WebSocket settings
   websocket:
-    enabled: true                # Use WebSocket (real-time) instead of REST (polling)
-    reconnect_delay: 5           # Seconds before reconnect attempt
-    max_reconnects: 10           # Max reconnect attempts
-    ping_interval: 30            # WebSocket ping interval
-    buffer_size: 500             # Candles to keep in memory
-
-# Analysis Engine
+    enabled: true
+    reconnect_delay: 5
+    max_reconnects: 10
+    ping_interval: 30
+    buffer_size: 40000
 analysis:
-  update_interval: 60          # Seconds between analysis cycles
-  min_confidence: 0.55         # Minimum confidence for signal
-  lookback_period: 100         # Candles for analysis
-
-# ML Model Settings
+  update_interval: 60
+  min_confidence: 0.55
+  lookback_period: 100
 model:
   path: models/best_model.pt
   models_dir: models
-  sequence_length: 60          # LSTM sequence length
-  hidden_size: 128             # LSTM hidden dimension
-  num_layers: 2                # LSTM layers
-  dropout: 0.2                 # Dropout rate
-
-  # Feature Configuration
+  sequence_length: 60
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
   features:
-    technical_features: 32     # Technical indicators
-    sentiment_features: 7      # News sentiment features
-    total_features: 39         # Total input features
-    include_sentiment: true    # Enable/disable sentiment integration
-
-# Multi-Timeframe Configuration
+    technical_features: 32
+    sentiment_features: 7
+    total_features: 39
+    include_sentiment: true
 timeframes:
   enabled: true
-  aggregation_method: weighted_vote  # weighted_vote, majority, alignment_required
-  min_confidence: 0.50               # Minimum confidence for any timeframe
-  alignment_threshold: 1.0           # Alignment ratio (1.0 = all must agree)
-
+  aggregation_method: weighted_vote
+  min_confidence: 0.5
+  alignment_threshold: 1.0
   intervals:
-    - interval: 1m
-      enabled: false           # Disabled by default (too noisy)
-      weight: 0.10
-      sequence_length: 120
-      min_training_interval_minutes: 60
-
-    - interval: 5m
-      enabled: true
-      weight: 0.15
-      sequence_length: 72
-      min_training_interval_minutes: 60
-
-    - interval: 15m
-      enabled: true
-      weight: 0.15
-      sequence_length: 96
-      min_training_interval_minutes: 120
-
-    - interval: 1h
-      enabled: true
-      weight: 0.25             # Primary timeframe
-      sequence_length: 60
-      min_training_interval_minutes: 240
-
-    - interval: 4h
-      enabled: true
-      weight: 0.20
-      sequence_length: 42
-      min_training_interval_minutes: 480
-
-    - interval: 1d
-      enabled: true
-      weight: 0.15
-      sequence_length: 30
-      min_training_interval_minutes: 1440
-
-# News & Sentiment Configuration
+  - interval: 15m
+    enabled: true
+    weight: 0.2
+    sequence_length: 96
+    min_training_interval_minutes: 120
+  - interval: 1h
+    enabled: true
+    weight: 0.35
+    sequence_length: 60
+    min_training_interval_minutes: 240
+  - interval: 4h
+    enabled: true
+    weight: 0.25
+    sequence_length: 42
+    min_training_interval_minutes: 480
+  - interval: 1d
+    enabled: true
+    weight: 0.2
+    sequence_length: 30
+    min_training_interval_minutes: 1440
 news:
-  enabled: true                # Enable news sentiment integration
-
+  enabled: true
   sources:
     newsapi:
       enabled: true
-      api_key_env: NEWSAPI_KEY      # Environment variable for API key
-      fetch_interval: 1800          # 30 minutes (48 requests/day)
-      max_requests_per_day: 100     # Free tier limit
+      api_key_env: NEWSAPI_KEY
+      fetch_interval: 1800
+      max_requests_per_day: 100
       max_articles_per_fetch: 100
       lookback_hours: 6
-
     alphavantage:
       enabled: true
-      api_key_env: ALPHAVANTAGE_KEY # Environment variable for API key
-      fetch_interval: 7200          # 2 hours (12 requests/day)
-      max_requests_per_day: 25      # Free tier limit (conservative)
+      api_key_env: ALPHAVANTAGE_KEY
+      fetch_interval: 7200
+      max_requests_per_day: 25
       max_articles_per_fetch: 50
       lookback_hours: 12
-
   sentiment:
-    analyzer: vader                 # VADER sentiment analyzer
-
-    # Custom crypto lexicon (extends VADER)
+    analyzer: vader
     custom_lexicon:
-      # Bullish terms
       bullish: 0.8
       moon: 0.6
       mooning: 0.7
@@ -129,8 +89,6 @@ news:
       gainz: 0.7
       lambo: 0.5
       diamond hands: 0.6
-
-      # Bearish terms
       bearish: -0.8
       dump: -0.7
       dumping: -0.7
@@ -146,8 +104,6 @@ news:
       plunge: -0.7
       collapse: -0.9
       paper hands: -0.6
-
-      # Market terms
       volatile: -0.3
       volatility: -0.2
       uncertainty: -0.4
@@ -158,110 +114,91 @@ news:
       etf: 0.4
       halving: 0.5
       upgrade: 0.6
-
   features:
-    lookback_hours: [1, 6, 24]      # Time windows for sentiment aggregation
-    time_weighted: true              # Apply exponential time decay
-    decay_rate: 0.1                  # 10% decay per hour
-    min_articles: 1                  # Min articles for valid sentiment
-
-# Multi-Currency (null = single currency mode)
+    lookback_hours:
+    - 1
+    - 6
+    - 24
+    time_weighted: true
+    decay_rate: 0.1
+    min_articles: 1
 currencies: null
-
-# Auto-Training
 auto_training:
   enabled: true
+  min_accuracy_required: 0.58
+  target_accuracy: 0.65
+  max_epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+  min_candles: 1000
+  training_candles: 5000
   min_trades_before_retrain: 50
   max_days_between_retrain: 30
   min_win_rate_threshold: 0.45
-
-# Continuous Learning (Advanced Retraining)
 continuous_learning:
   enabled: true
-
-  # Confidence Gating
   confidence:
-    trading_threshold: 0.80        # 80% confidence required for live trading
-    hysteresis: 0.05               # Exit trading at 75% (prevents oscillation)
-    smoothing_alpha: 0.3           # EMA smoothing on confidence
-    regime_adjustment: true        # Adjust thresholds by market regime
-
-  # Retraining Parameters
+    trading_threshold: 0.8
+    hysteresis: 0.05
+    smoothing_alpha: 0.3
+    regime_adjustment: true
   retraining:
-    on_loss: true                  # Retrain immediately on any loss (user requirement)
-    consecutive_loss_threshold: 3  # Also retrain after 3 consecutive losses
-    win_rate_threshold: 0.45       # Retrain if win rate drops below 45%
-    drift_threshold: 0.7           # Retrain on concept drift
-    min_interval_hours: 1          # Min time between retraining attempts
-    max_epochs: 50                 # Max training epochs
-    target_confidence: 0.80        # Target validation confidence
-    patience: 10                   # Early stopping patience
-    recent_candles: 5000           # Recent candles for retraining
-    replay_mix_ratio: 0.3          # Mix 30% replay buffer samples
-    min_samples: 1000              # Minimum samples required for retraining
-
-  # Experience Replay
+    on_loss: true
+    consecutive_loss_threshold: 3
+    win_rate_threshold: 0.45
+    drift_threshold: 0.7
+    min_interval_hours: 1
+    max_epochs: 50
+    target_confidence: 0.8
+    patience: 10
+    recent_candles: 5000
+    replay_mix_ratio: 0.3
+    min_samples: 1000
   experience_replay:
-    buffer_size: 10000             # Max samples in replay buffer
-    replay_mix_ratio: 0.3          # 30% of training data from replay
-    prioritize_losses: true        # Weight losses 2x higher
-
-  # EWC (Elastic Weight Consolidation)
+    buffer_size: 10000
+    replay_mix_ratio: 0.3
+    prioritize_losses: true
   ewc:
-    lambda: 1000.0                 # EWC importance weight (higher = more conservative)
-    fisher_sample_size: 200        # Samples for Fisher Information estimation
-
-  # Online Learning
+    lambda: 1000.0
+    fisher_sample_size: 200
   online_learning:
-    enabled: true                  # Learn from every candle
-    learning_rate: 0.0001          # Very small for stability
-    update_frequency: 1            # Update every N candles
-
-  # Exit Logic (Risk Management)
+    enabled: true
+    learning_rate: 0.0001
+    update_frequency: 1
   exit_logic:
-    stop_loss_pct: 2.0             # Stop-loss at -2%
-    take_profit_pct: 4.0           # Take-profit at +4% (2:1 R:R)
-    max_holding_hours: 24          # Max holding period (24 hours)
-
-# Algorithm Weights (ensemble)
+    stop_loss_pct: 2.0
+    take_profit_pct: 4.0
+    max_holding_hours: 24
 algorithm_weights:
   fourier: 0.15
   kalman: 0.25
-  entropy: 0.10
-  markov: 0.20
-  lstm: 0.30
-
-# Signal Settings
+  entropy: 0.1
+  markov: 0.2
+  lstm: 0.3
 signals:
-  risk_per_trade: 0.02         # 2% risk per trade
-  risk_reward_ratio: 2.0       # Risk/Reward ratio
-  strong_signal: 0.65          # Strong signal threshold
-  medium_signal: 0.55          # Medium signal threshold
-  cooldown_minutes: 60         # Cooldown between signals
-
-# Portfolio Management
+  risk_per_trade: 0.02
+  risk_reward_ratio: 2.0
+  strong_signal: 0.65
+  medium_signal: 0.55
+  cooldown_minutes: 60
 portfolio:
-  initial_capital: 10000       # Starting capital
-  max_position_percent: 0.25   # Max 25% per position
-  max_total_positions: 10      # Max concurrent positions
-  reserve_cash_percent: 0.05   # Keep 5% cash reserve
+  initial_capital: 10000
+  max_position_percent: 0.25
+  max_total_positions: 10
+  reserve_cash_percent: 0.05
   base_currency: USD
-
-# Risk Management
+  position_sizing: equal_weight
 risk:
-  max_drawdown_percent: 20.0   # Max portfolio drawdown
-  max_sector_exposure: 0.40    # Max per sector
-  daily_loss_limit: 0.05       # 5% daily loss limit
-  position_size_method: risk_parity  # equal_weight, risk_parity, kelly
-
-# Position Sizing
+  max_drawdown_percent: 20
+  max_sector_exposure: 0.4
+  daily_loss_limit: 0.05
+  position_size_method: risk_parity
+  max_position_percent: 0.25
 position_sizing:
-  method: risk_parity          # equal_weight, risk_parity, kelly, volatility_target
-  target_volatility: 0.10      # For volatility target method
-  kelly_fraction: 0.5          # Half Kelly (safer)
-  max_position_size: 0.25      # Max 25% of portfolio
-
-# Notifications
+  method: risk_parity
+  target_volatility: 0.1
+  kelly_fraction: 0.5
+  max_position_size: 0.25
 notifications:
   desktop:
     enabled: true
@@ -269,112 +206,83 @@ notifications:
     sound_file: alert.wav
   telegram:
     enabled: false
-    bot_token: ""
-    chat_id: ""
+    bot_token: ''
+    chat_id: ''
   email:
     enabled: false
     smtp_server: smtp.gmail.com
     smtp_port: 587
-    sender: ""
-    password: ""
-    recipient: ""
-
-# Database
+    sender: ''
+    password: ''
+    recipient: ''
 database:
   path: data/trading.db
   backup_enabled: true
   backup_interval_hours: 24
-
-# Dashboard
 dashboard:
   host: localhost
   port: 8501
   theme: light
   auto_refresh: true
   refresh_interval: 2
-
-# Logging
 logging:
   level: INFO
   file: data/trading.log
   max_size_mb: 10
   backup_count: 3
-
-# Live Trading
 live_trading:
-  mode: paper                  # paper or live
+  mode: paper
   default_exchange: binance
   default_symbols:
-    - BTC/USDT
-    - ETH/USDT
-  heartbeat_interval: 300      # Status heartbeat (seconds)
-
-# Brokerage Settings (API keys from environment variables)
+  - BTC/USDT
+  - ETH/USDT
+  heartbeat_interval: 300
 brokerages:
   binance:
-    testnet: false             # Use production for market data (no keys needed)
-    # API keys from: BINANCE_API_KEY, BINANCE_SECRET_KEY
+    testnet: false
   alpaca:
-    paper: true                # Use paper trading
-    # API keys from: ALPACA_API_KEY, ALPACA_SECRET_KEY
-  oanda:
-    practice: true             # Use OANDA practice account
-    leverage: 50               # US max leverage (50:1)
-    # API keys from: OANDA_API_KEY, OANDA_ACCOUNT_ID
-
-# Forex Trading Configuration
+    paper: true
+  capital:
+    demo: true
+    leverage: 30
 forex:
   enabled: true
-  broker: oanda                # Default forex broker
-
-  # Trading pairs (14 pairs: 7 majors + 7 crosses)
+  broker: capital
   pairs:
     majors:
-      - EUR/USD
-      - GBP/USD
-      - USD/JPY
-      - USD/CHF
-      - AUD/USD
-      - USD/CAD
-      - NZD/USD
+    - EUR/USD
+    - GBP/USD
+    - USD/JPY
+    - USD/CHF
+    - AUD/USD
+    - USD/CAD
+    - NZD/USD
     crosses:
-      - EUR/GBP
-      - EUR/JPY
-      - GBP/JPY
-      - EUR/CHF
-      - EUR/AUD
-      - AUD/JPY
-      - CHF/JPY
-
-  # Leverage settings (regulatory limits)
+    - EUR/GBP
+    - EUR/JPY
+    - GBP/JPY
+    - EUR/CHF
+    - EUR/AUD
+    - AUD/JPY
+    - CHF/JPY
   leverage:
-    default: 50                # US Standard (50:1)
-    majors: 50                 # Major pairs
-    minors: 20                 # Minor/exotic pairs
-    max_allowed: 50            # Hard limit
-
-  # Risk management
+    default: 50
+    majors: 50
+    minors: 20
+    max_allowed: 50
   risk:
-    max_risk_per_trade: 1.0    # 1% max risk per trade
-    max_position_percent: 10.0 # Max 10% of account in single position
-    max_correlation_exposure: 40.0  # Max 40% in correlated pairs
-
-  # Spread settings
+    max_risk_per_trade: 1.0
+    max_position_percent: 10.0
+    max_correlation_exposure: 40.0
   spread:
-    max_spread_multiplier: 3.0 # Block trades if spread > 3x average
-    reduce_spread_multiplier: 2.0  # Reduce size if spread > 2x average
-
-  # Margin settings
+    max_spread_multiplier: 3.0
+    reduce_spread_multiplier: 2.0
   margin:
-    call_level: 50             # Margin call at 50% margin level
-    stop_out_level: 30         # Stop out at 30% margin level
-
-  # Swap/rollover (overnight holding costs)
+    call_level: 50
+    stop_out_level: 30
   swap:
-    include_in_risk: true      # Factor swap costs into risk calculations
-    warn_triple_swap: true     # Warn before Wednesday triple swap
-
-  # Trading sessions (UTC hours)
+    include_in_risk: true
+    warn_triple_swap: true
   sessions:
     sydney:
       start: 21
@@ -388,3 +296,21 @@ forex:
     new_york:
       start: 13
       end: 22
+strategy_analysis:
+  classification:
+    scalping_hours: 1
+    momentum_confidence: 0.85
+    momentum_min_hours: 1
+    momentum_max_hours: 4
+    swing_min_hours: 4
+    swing_max_hours: 24
+    position_min_hours: 24
+  min_trades_per_strategy: 3
+  min_total_trades: 10
+  metrics:
+    sharpe_trading_days: 252
+    cache_ttl_seconds: 60
+  dashboard:
+    default_lookback_days: 7
+    min_lookback_days: 1
+    max_lookback_days: 30

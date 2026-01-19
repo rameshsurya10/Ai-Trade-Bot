@@ -5,7 +5,7 @@ Unified brokerage abstraction for live and paper trading.
 
 Supports:
 - Multiple order types (Market, Limit, Stop, Trailing)
-- Multiple brokers (Alpaca, Binance, Paper)
+- Multiple brokers (Alpaca, Binance, Capital.com)
 - Event-driven order management
 - Position and portfolio tracking
 
@@ -43,9 +43,9 @@ def __getattr__(name):
     elif name == "BinanceBrokerage":
         from .binance import BinanceBrokerage
         return BinanceBrokerage
-    elif name == "OandaBrokerage":
-        from .oanda import OandaBrokerage
-        return OandaBrokerage
+    elif name == "CapitalBrokerage":
+        from .capital import CapitalBrokerage
+        return CapitalBrokerage
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -66,5 +66,5 @@ __all__ = [
     # Implementations (lazy loaded)
     'AlpacaBrokerage',
     'BinanceBrokerage',
-    'OandaBrokerage',
+    'CapitalBrokerage',
 ]

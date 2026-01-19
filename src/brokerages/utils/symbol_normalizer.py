@@ -6,30 +6,30 @@ Normalize currency pair symbols between different formats.
 
 Formats:
 - Standard: "EUR/USD" (internal format)
-- OANDA: "EUR_USD"
-- MT4/MT5: "EURUSD"
-- Binance: "EURUSDT"
+- Capital.com: "EURUSD" (no separator)
+- MT4/MT5: "EURUSD" (no separator)
+- Underscore: "EUR_USD" (underscore separator)
 
 Usage:
-    from src.brokerages.utils import SymbolNormalizer, to_oanda_format
+    from src.brokerages.utils import SymbolNormalizer, to_capital_format
 
     normalizer = SymbolNormalizer()
 
     # Convert to standard format
-    standard = normalizer.to_standard("EUR_USD")
+    standard = normalizer.to_standard("EURUSD")
     # Returns: "EUR/USD"
 
-    # Convert to OANDA format
-    oanda = normalizer.to_oanda("EUR/USD")
-    # Returns: "EUR_USD"
+    # Convert to Capital.com format
+    capital = normalizer.to_capital("EUR/USD")
+    # Returns: "EURUSD"
 
     # Helper functions
-    oanda_symbol = to_oanda_format("EUR/USD")
-    standard_symbol = from_oanda_format("EUR_USD")
+    capital_symbol = to_capital_format("EUR/USD")
+    standard_symbol = from_capital_format("EURUSD")
 """
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,9 @@ class SymbolNormalizer:
 
     Supports conversion between:
     - Standard format: EUR/USD (slash separator)
-    - OANDA format: EUR_USD (underscore separator)
+    - Capital.com format: EURUSD (no separator)
+    - Underscore format: EUR_USD (underscore separator)
     - MT4/MT5 format: EURUSD (no separator)
-    - Compact format: EURUSD (no separator)
 
     Example:
         normalizer = SymbolNormalizer()
@@ -79,12 +79,11 @@ class SymbolNormalizer:
 
     def __init__(self):
         """Initialize symbol normalizer."""
-        # Cache for fast lookups
         self._cache: Dict[str, str] = {}
         self._reverse_cache: Dict[str, Dict[str, str]] = {
-            "oanda": {},
+            "capital": {},
             "mt4": {},
-            "compact": {},
+            "underscore": {},
         }
 
     def to_standard(self, symbol: str) -> str:
@@ -104,7 +103,6 @@ class SymbolNormalizer:
         if not symbol:
             return symbol
 
-        # Check cache
         cache_key = symbol.upper()
         if cache_key in self._cache:
             return self._cache[cache_key]
@@ -113,18 +111,34 @@ class SymbolNormalizer:
         self._cache[cache_key] = result
         return result
 
-    def to_oanda(self, symbol: str) -> str:
+    def to_capital(self, symbol: str) -> str:
         """
-        Convert to OANDA format (EUR_USD).
+        Convert to Capital.com format (EURUSD).
 
         Args:
             symbol: Symbol in any format
 
         Returns:
-            Symbol in OANDA format
+            Symbol in Capital.com format
 
         Example:
-            to_oanda("EUR/USD") -> "EUR_USD"
+            to_capital("EUR/USD") -> "EURUSD"
+        """
+        standard = self.to_standard(symbol)
+        return standard.replace("/", "")
+
+    def to_underscore(self, symbol: str) -> str:
+        """
+        Convert to underscore format (EUR_USD).
+
+        Args:
+            symbol: Symbol in any format
+
+        Returns:
+            Symbol in underscore format
+
+        Example:
+            to_underscore("EUR/USD") -> "EUR_USD"
         """
         standard = self.to_standard(symbol)
         return standard.replace("/", "_")
@@ -142,29 +156,43 @@ class SymbolNormalizer:
         Example:
             to_mt4("EUR/USD") -> "EURUSD"
         """
-        standard = self.to_standard(symbol)
-        return standard.replace("/", "")
+        return self.to_capital(symbol)
 
     def to_compact(self, symbol: str) -> str:
         """
         Convert to compact format (EURUSD).
 
-        Same as MT4 format.
+        Same as Capital.com/MT4 format.
         """
-        return self.to_mt4(symbol)
+        return self.to_capital(symbol)
 
-    def from_oanda(self, symbol: str) -> str:
+    def from_capital(self, symbol: str) -> str:
         """
-        Convert from OANDA format to standard.
+        Convert from Capital.com format to standard.
 
         Args:
-            symbol: Symbol in OANDA format
+            symbol: Symbol in Capital.com format
 
         Returns:
             Symbol in standard format
 
         Example:
-            from_oanda("EUR_USD") -> "EUR/USD"
+            from_capital("EURUSD") -> "EUR/USD"
+        """
+        return self.to_standard(symbol)
+
+    def from_underscore(self, symbol: str) -> str:
+        """
+        Convert from underscore format to standard.
+
+        Args:
+            symbol: Symbol in underscore format
+
+        Returns:
+            Symbol in standard format
+
+        Example:
+            from_underscore("EUR_USD") -> "EUR/USD"
         """
         return self.to_standard(symbol)
 
@@ -228,7 +256,7 @@ class SymbolNormalizer:
                 return symbol
             raise ValueError(f"Invalid symbol format: {symbol}")
 
-        # OANDA format (EUR_USD)
+        # Underscore format (EUR_USD)
         if "_" in symbol:
             parts = symbol.split("_")
             if len(parts) == 2 and all(p in CURRENCY_CODES for p in parts):
@@ -272,9 +300,9 @@ def normalize_forex_symbol(symbol: str) -> str:
     return _normalizer.to_standard(symbol)
 
 
-def to_oanda_format(symbol: str) -> str:
+def to_capital_format(symbol: str) -> str:
     """
-    Convert symbol to OANDA format.
+    Convert symbol to Capital.com format.
 
     Convenience function using singleton normalizer.
 
@@ -282,24 +310,54 @@ def to_oanda_format(symbol: str) -> str:
         symbol: Symbol in any format
 
     Returns:
-        Symbol in OANDA format (EUR_USD)
+        Symbol in Capital.com format (EURUSD)
     """
-    return _normalizer.to_oanda(symbol)
+    return _normalizer.to_capital(symbol)
 
 
-def from_oanda_format(symbol: str) -> str:
+def from_capital_format(symbol: str) -> str:
     """
-    Convert from OANDA format to standard.
+    Convert from Capital.com format to standard.
 
     Convenience function using singleton normalizer.
 
     Args:
-        symbol: Symbol in OANDA format
+        symbol: Symbol in Capital.com format
 
     Returns:
         Symbol in standard format (EUR/USD)
     """
-    return _normalizer.from_oanda(symbol)
+    return _normalizer.from_capital(symbol)
+
+
+def to_underscore_format(symbol: str) -> str:
+    """
+    Convert symbol to underscore format.
+
+    Convenience function using singleton normalizer.
+
+    Args:
+        symbol: Symbol in any format
+
+    Returns:
+        Symbol in underscore format (EUR_USD)
+    """
+    return _normalizer.to_underscore(symbol)
+
+
+def from_underscore_format(symbol: str) -> str:
+    """
+    Convert from underscore format to standard.
+
+    Convenience function using singleton normalizer.
+
+    Args:
+        symbol: Symbol in underscore format
+
+    Returns:
+        Symbol in standard format (EUR/USD)
+    """
+    return _normalizer.from_underscore(symbol)
 
 
 def get_symbol_normalizer() -> SymbolNormalizer:

@@ -34,6 +34,24 @@ class PendingOrder:
     take_profit_order: Optional[Order] = None
 
 
+@dataclass
+class Trade:
+    """Completed trade record."""
+    symbol: str
+    side: str
+    quantity: float
+    entry_price: float
+    exit_price: float
+    realized_pnl: float
+    commission: float
+    timestamp: datetime
+
+    @property
+    def price(self) -> float:
+        """Get exit price (alias for dashboard compatibility)."""
+        return self.exit_price
+
+
 class PaperBrokerage(BaseBrokerage):
     """
     Paper trading brokerage (Lean-inspired).
@@ -524,9 +542,26 @@ class PaperBrokerage(BaseBrokerage):
     # ========== Additional Methods ==========
 
     def get_trade_history(self, limit: int = 100) -> List[Dict]:
-        """Get trade history."""
+        """Get trade history as dictionaries."""
         with self._lock:
             return self._trade_history[-limit:]
+
+    def get_trades(self, limit: int = 100) -> List[Trade]:
+        """Get trade history as Trade objects."""
+        with self._lock:
+            trades = []
+            for t in self._trade_history[-limit:]:
+                trades.append(Trade(
+                    symbol=t.get('symbol', ''),
+                    side=t.get('side', ''),
+                    quantity=t.get('quantity', 0),
+                    entry_price=t.get('entry_price', 0),
+                    exit_price=t.get('exit_price', 0),
+                    realized_pnl=t.get('pnl', 0),
+                    commission=t.get('commission', 0),
+                    timestamp=t.get('time', datetime.utcnow())
+                ))
+            return trades
 
     def get_portfolio_stats(self) -> Dict:
         """Get comprehensive portfolio statistics."""

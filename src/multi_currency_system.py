@@ -46,7 +46,7 @@ _CACHE_LOCK = threading.Lock()
 class CurrencyConfig:
     """Configuration for a single currency pair."""
     symbol: str  # e.g., "EUR/USD", "BTC/USD"
-    exchange: str  # e.g., "oanda", "coinbase"
+    exchange: str  # e.g., "capital", "binance", "coinbase"
     interval: str  # e.g., "1h", "4h"
     model_path: str  # Path to trained model
     enabled: bool = True
@@ -229,12 +229,9 @@ class AutoTrainer:
             df_features = FeatureCalculator.calculate_all(df)
             feature_columns = FeatureCalculator.get_feature_columns()
 
-            # Create target
-            df_features['target'] = (df_features['close'].shift(-1) > df_features['close']).astype(int)
-
-            # Get features and targets
+            # Extract and normalize features FIRST (before creating target)
             features = df_features[feature_columns].values
-            targets = df_features['target'].values
+            closes = df_features['close'].values
 
             # Normalize
             feature_means = np.nanmean(features, axis=0)
@@ -242,27 +239,35 @@ class AutoTrainer:
             features = (features - feature_means) / (feature_stds + 1e-8)
             features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
 
-            # Create sequences - VECTORIZED (10x faster, 50% less memory)
+            # Create sequences
             sequence_length = self.config.get('sequence_length', 60)
 
-            # Use numpy sliding window view (zero-copy, memory efficient)
-            from numpy.lib.stride_tricks import sliding_window_view
+            # Create sliding windows manually for correct shape
+            # Need shape: (num_samples, sequence_length, num_features)
+            num_features = features.shape[1]
+            num_sequences = len(features) - sequence_length - 1  # -1 for target
 
-            # Create sliding windows of features
-            X = sliding_window_view(features[:-1], window_shape=sequence_length, axis=0)
-            # Ensure correct shape (n_sequences, sequence_length, n_features)
-            X = X.transpose(0, 2, 1) if X.shape[-1] == features.shape[-1] else X
+            X = np.zeros((num_sequences, sequence_length, num_features))
+            y = np.zeros(num_sequences)
 
-            # Targets correspond to the point after each sequence
-            y = targets[sequence_length:]
+            # CRITICAL FIX: Align sequences with correct targets
+            # For each sequence ending at position i+sequence_length-1,
+            # the target is: will the NEXT candle (i+sequence_length) close higher?
+            for i in range(num_sequences):
+                # Sequence uses candles [i] to [i+sequence_length-1]
+                X[i] = features[i:i + sequence_length]
 
-            logger.debug(f"Vectorized sequence creation: {X.shape[0]} sequences (10x faster than loop)")
+                # Target: will candle [i+sequence_length] close higher than candle [i+sequence_length-1]?
+                current_close = closes[i + sequence_length - 1]
+                next_close = closes[i + sequence_length]
+                y[i] = 1.0 if next_close > current_close else 0.0
 
-            valid = ~np.isnan(y)
+            # Remove any invalid entries
+            valid = ~(np.isnan(y) | np.isnan(X).any(axis=(1, 2)))
             X = X[valid]
             y = y[valid]
 
-            logger.info(f"Created {len(X)} sequences")
+            logger.info(f"Created {len(X)} training sequences")
 
             # Split data
             split_idx = int(len(X) * (1 - validation_split))
@@ -445,7 +450,7 @@ class MultiCurrencySystem:
 
         Args:
             symbol: Currency pair (e.g., "BTC/USD", "EUR/USD")
-            exchange: Exchange name (coinbase, binance, oanda)
+            exchange: Exchange name (coinbase, binance, capital)
             interval: Candle interval
         """
         currency_config = CurrencyConfig(
@@ -601,8 +606,8 @@ class MultiCurrencySystem:
 
                 # Model info
                 'has_trained_model': model is not None,
-                'algorithm_weights': advanced_result.algorithm_weights,
-                'raw_scores': advanced_result.raw_scores
+                'algorithm_weights': getattr(advanced_result, 'algorithm_weights', {}),
+                'raw_scores': getattr(advanced_result, 'raw_scores', {})
             }
 
             return result
@@ -761,19 +766,19 @@ MULTI_CURRENCY_CONFIG = """
 # Add this to your config.yaml or use as separate file
 
 currencies:
-  # Forex pairs (use with OANDA, FXCM, etc.)
+  # Forex pairs (use with Capital.com, etc.)
   - symbol: "EUR/USD"
-    exchange: "oanda"
+    exchange: "capital"
     interval: "1h"
     enabled: true
 
   - symbol: "GBP/USD"
-    exchange: "oanda"
+    exchange: "capital"
     interval: "1h"
     enabled: true
 
   - symbol: "USD/JPY"
-    exchange: "oanda"
+    exchange: "capital"
     interval: "1h"
     enabled: false  # Disabled example
 

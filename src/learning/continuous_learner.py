@@ -83,9 +83,17 @@ class ContinuousLearningSystem:
             config=self.timeframes_config
         )
 
-        self.confidence_gate = ConfidenceGate(
-            config=self.cl_config.get('confidence', {})
+        # Create ConfidenceGateConfig from dict
+        conf_dict = self.cl_config.get('confidence', {})
+        from src.learning.confidence_gate import ConfidenceGateConfig
+        conf_config = ConfidenceGateConfig(
+            trading_threshold=conf_dict.get('trading_threshold', 0.8),
+            hysteresis=conf_dict.get('hysteresis', 0.05),
+            smoothing_alpha=conf_dict.get('smoothing_alpha', 0.3),
+            regime_adjustment=conf_dict.get('regime_adjustment', True)
         )
+
+        self.confidence_gate = ConfidenceGate(config=conf_config)
 
         self.state_manager = LearningStateManager(
             database=database
@@ -93,11 +101,19 @@ class ContinuousLearningSystem:
 
         # Get continual learner from predictor
         continual_learner = getattr(predictor, 'continual_learner', None)
-        if not continual_learner:
+        if not continual_learner and hasattr(predictor, 'model'):
             logger.warning("Predictor has no continual_learner, creating new one")
+            ewc_config = self.cl_config.get("ewc", {})
             continual_learner = ContinualLearner(
-                config=self.cl_config.get('ewc', {})
+                model=predictor.model,
+                ewc_lambda=ewc_config.get("lambda", 1000.0),
+                replay_buffer_size=self.cl_config.get("experience_replay", {}).get("buffer_size", 10000),
+                replay_batch_size=32,
+                drift_window=100
             )
+        elif not continual_learner:
+            logger.info("Predictor is not a neural network model, skipping continual learner")
+            continual_learner = None
 
         self.outcome_tracker = OutcomeTracker(
             database=database,
@@ -108,10 +124,10 @@ class ContinuousLearningSystem:
         # Get model manager from predictor
         model_manager = getattr(predictor, 'model_manager', None)
         if not model_manager:
-            logger.warning("Predictor has no model_manager")
+            logger.warning("Predictor has no model_manager, creating one")
             model_manager = MultiTimeframeModelManager(
-                config=self.config,
-                database=database
+                models_dir=self.config.get('model', {}).get('models_dir', 'models'),
+                config=self.config.get('model', {})
             )
 
         self.retraining_engine = RetrainingEngine(

@@ -43,6 +43,9 @@ from src.multi_currency_system import MultiCurrencySystem
 from src.data_service import DataService
 from src.news.collector import NewsCollector
 
+# CONTINUOUS LEARNING: Strategic Learning Bridge integrates continuous learning
+from src.learning.strategic_learning_bridge import StrategicLearningBridge
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,7 +72,7 @@ class TradingSymbol:
     """Configuration for a traded symbol."""
     symbol: str
     exchange: str
-    interval: str = "1h"
+    interval: str = None  # Will be set dynamically from config
     enabled: bool = True
     last_signal_time: Optional[datetime] = None
     cooldown_minutes: int = 60
@@ -187,6 +190,9 @@ class LiveTradingRunner:
         self._news_collector: Optional[NewsCollector] = None
         self._database: Optional[Database] = None
 
+        # CONTINUOUS LEARNING: Strategic Learning Bridge (initialized on start)
+        self._learning_bridge: Optional[StrategicLearningBridge] = None
+
         # Symbols and data provider
         self._symbols: Dict[str, TradingSymbol] = {}
         self._provider: Optional[UnifiedDataProvider] = None
@@ -195,6 +201,10 @@ class LiveTradingRunner:
         # Efficient candle storage using deque (O(1) append, avoids pd.concat fragmentation)
         self._candle_buffers: Dict[str, deque] = {}
         self._buffer_max_size = 500
+
+        # Model readiness tracking - ONLY trade if model is validated
+        self._models_ready: Dict[str, bool] = {}
+        self._model_accuracies: Dict[str, float] = {}
 
         # Signal and order tracking
         self._pending_signals: Queue = Queue()
@@ -230,7 +240,7 @@ class LiveTradingRunner:
         self,
         symbol: str,
         exchange: str = "binance",
-        interval: str = "1h",
+        interval: str = None,  # Will use config intervals if not specified
         cooldown_minutes: int = 60
     ):
         """
@@ -239,7 +249,7 @@ class LiveTradingRunner:
         Args:
             symbol: Trading pair (e.g., "BTC/USD")
             exchange: Exchange name
-            interval: Candle interval
+            interval: Primary candle interval (optional, uses config if not specified)
             cooldown_minutes: Minutes between signals
         """
         ts = TradingSymbol(
@@ -284,6 +294,9 @@ class LiveTradingRunner:
 
             # Initialize components
             self._initialize_components()
+
+            # Ensure models are ready (auto-train if needed)
+            self._ensure_models_ready()
 
             # Connect to brokerage
             if not self._brokerage.connect():
@@ -350,6 +363,12 @@ class LiveTradingRunner:
         if self._prediction_system:
             self._prediction_system.cleanup()
 
+        # CONTINUOUS LEARNING: Cleanup learning bridge
+        if self._learning_bridge:
+            logger.info("Stopping Strategic Learning Bridge...")
+            self._learning_bridge.stop()
+            logger.info("Strategic Learning Bridge stopped")
+
         self._set_status(RunnerStatus.STOPPED)
         logger.info("Live trading stopped")
 
@@ -386,13 +405,13 @@ class LiveTradingRunner:
 
         # Database (for news and features)
         from pathlib import Path
-        db_path = Path(self.config.data.get('database_path', 'data/trading.db'))
+        db_path = Path(getattr(self.config.database, 'path', 'data/trading.db'))
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._database = Database(str(db_path))
         logger.info("Database initialized")
 
         # News Collector (if enabled)
-        news_config = self.config.data.get('news', {})
+        news_config = self.config.raw.get('news', {}) if hasattr(self.config.data, 'data') else {}
         if news_config.get('enabled', False):
             try:
                 self._news_collector = NewsCollector(
@@ -434,7 +453,362 @@ class LiveTradingRunner:
                 interval=ts.interval
             )
 
+        # CONTINUOUS LEARNING: Initialize Strategic Learning Bridge
+        # This connects prediction system → continuous learning → automatic retraining
+        logger.info("Initializing Strategic Learning Bridge...")
+
+        # Get paper brokerage (always available for learning mode)
+        paper_brokerage = self._brokerage  # TODO: Separate paper vs live brokerage
+
+        # Get live brokerage (optional - used only in TRADING mode)
+        live_brokerage = None
+        if self.mode == TradingMode.LIVE:
+            live_brokerage = self._brokerage
+
+        # Initialize the bridge
+        self._learning_bridge = StrategicLearningBridge(
+            database=self._database,
+            predictor=self._prediction_system.advanced_predictor,  # Use AdvancedPredictor
+            paper_brokerage=paper_brokerage,
+            live_brokerage=live_brokerage,
+            config=self.config.raw  # Pass full config dict
+        )
+
+        logger.info("Strategic Learning Bridge initialized - Continuous learning ENABLED")
         logger.info("Components initialized")
+
+    def _ensure_models_ready(self):
+        """
+        MANDATORY: Thoroughly train models before ANY predictions.
+
+        This method:
+        1. ALWAYS trains models (no skipping)
+        2. Requires minimum 60% accuracy to be "ready"
+        3. Blocks predictions for symbols that don't pass
+        4. Uses comprehensive training with validation
+
+        NO PREDICTIONS ALLOWED until model passes validation!
+        """
+        from datetime import datetime, timedelta
+        from pathlib import Path
+        import gc
+        import torch
+        import torch.nn as nn
+        import numpy as np
+        from src.analysis_engine import FeatureCalculator, LSTMModel
+
+        logger.info("=" * 70)
+        logger.info("MANDATORY MODEL TRAINING - NO PREDICTIONS UNTIL VALIDATED")
+        logger.info("=" * 70)
+
+        # Guard: ensure database is available
+        if self._database is None:
+            logger.error("Database not initialized - cannot train models")
+            raise RuntimeError("Database required for model training")
+
+        # Get training config - MANDATORY settings
+        auto_train_config = self.config.raw.get('auto_training', {}) if hasattr(self.config.data, 'data') else {}
+        min_candles = auto_train_config.get('min_candles', 1000)
+        training_candles = auto_train_config.get('training_candles', 5000)
+
+        # MANDATORY: Minimum accuracy required to allow predictions
+        min_accuracy_required = auto_train_config.get('min_accuracy_required', 0.58)
+        target_accuracy = auto_train_config.get('target_accuracy', 0.65)
+        max_epochs = auto_train_config.get('max_epochs', 100)  # More epochs for thorough training
+
+        # Model hyperparameters from config
+        hidden_size = self.config.model.hidden_size
+        num_layers = self.config.model.num_layers
+        dropout = self.config.model.dropout
+        batch_size = auto_train_config.get('batch_size', 32)
+        learning_rate = auto_train_config.get('learning_rate', 0.001)
+
+        # Detect device (GPU if available)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Training device: {device}")
+        logger.info(f"Minimum accuracy required: {min_accuracy_required:.1%}")
+        logger.info(f"Target accuracy: {target_accuracy:.1%}")
+
+        models_dir = Path(self.config.model.models_dir)
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize all symbols as NOT ready
+        for symbol in self._symbols.keys():
+            self._models_ready[symbol] = False
+            self._model_accuracies[symbol] = 0.0
+
+        for symbol, ts in self._symbols.items():
+            if not ts.enabled:
+                continue
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[{symbol}] MANDATORY TRAINING STARTING")
+            logger.info(f"{'='*60}")
+
+            # Get model path
+            safe_symbol = symbol.replace("/", "_").replace("-", "_")
+            model_path = models_dir / f"model_{safe_symbol}_{ts.interval}.pt"
+
+            logger.info(f"[{symbol}] Fetching {training_candles} candles for training...")
+
+            try:
+                # Fetch training data from database
+                candles_df = self._database.get_candles(
+                    symbol=symbol,
+                    interval=ts.interval,
+                    limit=training_candles + 100  # Extra for feature warmup
+                )
+
+                if candles_df is None or len(candles_df) < min_candles:
+                    logger.warning(
+                        f"[{symbol}] Insufficient data for training: "
+                        f"{len(candles_df) if candles_df is not None else 0} < {min_candles} candles. "
+                        f"Will train after more data is collected."
+                    )
+                    continue
+
+                logger.info(f"[{symbol}] Fetched {len(candles_df)} candles for training")
+
+                # Calculate features
+                df_features = FeatureCalculator.calculate_all(candles_df)
+                feature_columns = FeatureCalculator.get_feature_columns()
+
+                # Extract and normalize features FIRST (before creating target)
+                features = df_features[feature_columns].values
+                closes = df_features['close'].values
+
+                # Normalize features
+                feature_means = np.nanmean(features, axis=0)
+                feature_stds = np.nanstd(features, axis=0)
+                features = (features - feature_means) / (feature_stds + 1e-8)
+                features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
+
+                # Create sequences using sliding window
+                sequence_length = self.config.model.sequence_length
+
+                # Create sliding windows manually for correct shape
+                # Need shape: (num_samples, sequence_length, num_features)
+                num_features = features.shape[1]
+                num_sequences = len(features) - sequence_length - 1  # -1 for target
+
+                X = np.zeros((num_sequences, sequence_length, num_features))
+                y = np.zeros(num_sequences)
+
+                # CRITICAL FIX: Align sequences with correct targets
+                # For each sequence ending at position i+sequence_length-1,
+                # the target is: will the NEXT candle (i+sequence_length) close higher?
+                for i in range(num_sequences):
+                    # Sequence uses candles [i] to [i+sequence_length-1]
+                    X[i] = features[i:i + sequence_length]
+
+                    # Target: will candle [i+sequence_length] close higher than candle [i+sequence_length-1]?
+                    current_close = closes[i + sequence_length - 1]
+                    next_close = closes[i + sequence_length]
+                    y[i] = 1.0 if next_close > current_close else 0.0
+
+                # Remove any invalid entries
+                valid = ~(np.isnan(y) | np.isnan(X).any(axis=(1, 2)))
+                X = X[valid]
+                y = y[valid]
+
+                if len(X) < min_candles:
+                    logger.warning(f"[{symbol}] After sequence creation, only {len(X)} samples")
+                    continue
+
+                logger.info(f"[{symbol}] Created {len(X)} training sequences")
+
+                # Train/validation split with validation size check
+                min_val_samples = 50
+                split_idx = int(len(X) * 0.8)
+
+                if len(X) - split_idx < min_val_samples:
+                    logger.warning(f"[{symbol}] Validation set too small, adjusting split")
+                    if len(X) < min_val_samples * 2:
+                        logger.warning(f"[{symbol}] Insufficient data for reliable training")
+                        continue
+                    split_idx = len(X) - min_val_samples
+
+                X_train, X_val = X[:split_idx], X[split_idx:]
+                y_train, y_val = y[:split_idx], y[split_idx:]
+
+                # Create data loaders
+                train_dataset = torch.utils.data.TensorDataset(
+                    torch.FloatTensor(X_train),
+                    torch.FloatTensor(y_train)
+                )
+                val_dataset = torch.utils.data.TensorDataset(
+                    torch.FloatTensor(X_val),
+                    torch.FloatTensor(y_val)
+                )
+                train_loader = torch.utils.data.DataLoader(
+                    train_dataset, batch_size=batch_size, shuffle=True
+                )
+                val_loader = torch.utils.data.DataLoader(
+                    val_dataset, batch_size=batch_size
+                )
+
+                # Create model with config parameters
+                model = LSTMModel(
+                    input_size=len(feature_columns),
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    dropout=dropout
+                ).to(device)
+
+                # Training
+                criterion = torch.nn.BCELoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+                best_val_acc = 0
+                best_state = None
+                patience = 10
+                patience_counter = 0
+
+                logger.info(f"[{symbol}] Training for up to {max_epochs} epochs...")
+
+                for epoch in range(max_epochs):
+                    # Train
+                    model.train()
+                    epoch_loss = 0
+                    for X_batch, y_batch in train_loader:
+                        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                        optimizer.zero_grad()
+                        outputs = model(X_batch).squeeze()
+                        loss = criterion(outputs, y_batch)
+                        loss.backward()
+                        optimizer.step()
+                        epoch_loss += loss.item()
+
+                    # Validate
+                    model.eval()
+                    correct = 0
+                    total = 0
+                    with torch.no_grad():
+                        for X_batch, y_batch in val_loader:
+                            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                            outputs = model(X_batch).squeeze()
+                            predictions = (outputs > 0.5).float()
+                            correct += (predictions == y_batch).sum().item()
+                            total += len(y_batch)
+
+                    val_acc = correct / total if total > 0 else 0
+
+                    # Track best model
+                    if val_acc > best_val_acc:
+                        best_val_acc = val_acc
+                        best_state = {k: v.clone().detach() for k, v in model.state_dict().items()}
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
+                    # Log progress
+                    if (epoch + 1) % 10 == 0:
+                        avg_loss = epoch_loss / len(train_loader)
+                        logger.info(
+                            f"[{symbol}] Epoch {epoch+1}/{max_epochs} - "
+                            f"Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%}"
+                        )
+
+                    # Early stopping
+                    if patience_counter >= patience:
+                        logger.info(f"[{symbol}] Early stopping at epoch {epoch+1}")
+                        break
+
+                    # Stop if target reached
+                    if val_acc >= target_accuracy:
+                        logger.info(f"[{symbol}] [OK] Target accuracy reached: {val_acc:.2%}")
+                        break
+
+                # Save model and validate
+                if best_state is not None:
+                    # Move model to CPU for saving (ensures compatibility)
+                    model.cpu()
+                    model.load_state_dict(best_state)
+
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'config': {
+                            'hidden_size': hidden_size,
+                            'num_layers': num_layers,
+                            'dropout': dropout,
+                            'sequence_length': sequence_length
+                        },
+                        'feature_means': feature_means,
+                        'feature_stds': feature_stds,
+                        'symbol': symbol,
+                        'interval': ts.interval,
+                        'trained_at': datetime.utcnow().isoformat(),
+                        'samples_trained': len(X_train),
+                        'validation_accuracy': best_val_acc
+                    }, model_path)
+
+                    # Store accuracy
+                    self._model_accuracies[symbol] = best_val_acc
+
+                    # VALIDATION GATE: Check if model meets minimum accuracy
+                    if best_val_acc >= min_accuracy_required:
+                        self._models_ready[symbol] = True
+                        logger.info(
+                            f"[{symbol}] [VALIDATED] MODEL READY FOR PREDICTIONS\n"
+                            f"    Accuracy: {best_val_acc:.2%} >= {min_accuracy_required:.2%} required\n"
+                            f"    Samples trained: {len(X_train)}\n"
+                            f"    PREDICTIONS ENABLED for {symbol}"
+                        )
+                    else:
+                        self._models_ready[symbol] = False
+                        logger.warning(
+                            f"[{symbol}] [FAILED] MODEL BELOW MINIMUM ACCURACY\n"
+                            f"    Accuracy: {best_val_acc:.2%} < {min_accuracy_required:.2%} required\n"
+                            f"    PREDICTIONS BLOCKED for {symbol}\n"
+                            f"    Need more training data or better features"
+                        )
+                else:
+                    logger.error(f"[{symbol}] Training failed - no valid model state")
+                    self._models_ready[symbol] = False
+
+            except Exception as e:
+                logger.error(f"[{symbol}] Auto-training failed: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                self._models_ready[symbol] = False
+
+            finally:
+                # Memory cleanup between symbols
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Final summary
+        logger.info("\n" + "=" * 70)
+        logger.info("MODEL TRAINING COMPLETE - READINESS SUMMARY")
+        logger.info("=" * 70)
+
+        ready_count = sum(1 for v in self._models_ready.values() if v)
+        total_count = len(self._models_ready)
+
+        for symbol, is_ready in self._models_ready.items():
+            acc = self._model_accuracies.get(symbol, 0)
+            status = "[READY]" if is_ready else "[BLOCKED]"
+            logger.info(f"  {symbol}: {status} (accuracy: {acc:.2%})")
+
+        logger.info(f"\nTotal: {ready_count}/{total_count} models ready for predictions")
+
+        if ready_count == 0:
+            error_msg = (
+                "CRITICAL: NO MODELS READY FOR PREDICTIONS\n"
+                "All models failed to meet minimum accuracy requirement.\n"
+                "Cannot start live trading without validated models.\n"
+                "Please ensure sufficient historical data is available."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        elif ready_count < total_count:
+            logger.warning(
+                f"\n[WARNING] {total_count - ready_count} symbol(s) will NOT make predictions\n"
+                "until their models meet the minimum accuracy requirement."
+            )
+
+        logger.info("=" * 70)
 
     def _start_streams(self):
         """Start unified data provider for all symbols."""
@@ -442,25 +816,51 @@ class LiveTradingRunner:
             # Get singleton UnifiedDataProvider
             self._provider = UnifiedDataProvider.get_instance(self._config_path)
 
-            # Subscribe to all symbols
+            # Get multi-timeframe intervals from config
+            timeframe_config = self.config.raw.get('timeframes', {})
+            enabled_intervals = []
+
+            if timeframe_config.get('enabled', False):
+                # Extract enabled intervals from config
+                for tf_config in timeframe_config.get('intervals', []):
+                    if tf_config.get('enabled', True):
+                        interval = tf_config.get('interval')
+                        if interval:
+                            enabled_intervals.append(interval)
+
+            # Fallback to single interval if multi-timeframe not configured
+            if not enabled_intervals:
+                enabled_intervals = [self.config.data.interval if hasattr(self.config.data, 'interval') else '1h']
+
+            logger.info(f"Subscribing to intervals: {enabled_intervals}")
+
+            # Subscribe to all symbols with all enabled intervals
             for symbol, ts in self._symbols.items():
                 if not ts.enabled:
                     continue
 
-                self._provider.subscribe(
-                    symbol,
-                    exchange=ts.exchange,
-                    interval=ts.interval
-                )
+                # Subscribe to each timeframe for this symbol
+                for interval in enabled_intervals:
+                    self._provider.subscribe(
+                        symbol,
+                        exchange=ts.exchange,
+                        interval=interval
+                    )
+                    logger.info(f"Subscribed to {symbol} @ {interval}")
 
-                # Initialize data buffer with historical data
+                # Initialize data buffer with historical data (using first interval)
+                ts.interval = enabled_intervals[0]  # Set primary interval
                 self._initialize_buffer(symbol, ts)
 
-                logger.info(f"Subscribed to {symbol}")
-
             # Register callbacks
-            self._provider.on_tick(self._handle_tick_callback)
-            self._provider.on_candle(self._handle_candle_callback)
+            # Note: Using on_candle_closed for completed candles only
+            self._provider.on_candle_closed(self._handle_candle_callback)
+
+            # Connect database to provider for candle persistence
+            # This enables WebSocket candles to be saved for learning system
+            if self._database:
+                self._provider.set_database(self._database)
+                logger.info("Database connected to data provider for candle persistence")
 
             # Start provider
             self._provider.start()
@@ -514,16 +914,14 @@ class LiveTradingRunner:
         """Callback wrapper for tick data from UnifiedDataProvider."""
         self._handle_tick(tick.symbol, tick)
 
-    def _handle_candle_callback(self, candle: Candle, interval: str):
+    def _handle_candle_callback(self, candle: Candle):
         """
         Callback wrapper for candle data from UnifiedDataProvider.
 
         Args:
-            candle: Completed candle data
-            interval: Candle interval (1m, 5m, 15m, 1h, 4h, 1d, etc.)
+            candle: Completed candle data (includes symbol and interval)
         """
-        # Only process candles for the configured interval (if specified)
-        # This allows filtering when multiple intervals are subscribed
+        # Process the candle - interval is in candle.interval
         self._handle_candle(candle.symbol, candle)
 
     def _handle_tick(self, symbol: str, tick: Tick):
@@ -555,6 +953,48 @@ class LiveTradingRunner:
         # This is 10x faster than pd.concat on every candle
         self._data_buffers[symbol] = pd.DataFrame(list(self._candle_buffers[symbol]))
 
+        # ===================================================================
+        # CONTINUOUS LEARNING: Trigger on every candle close
+        # ===================================================================
+        # This is where the MAGIC happens:
+        # 1. Get multi-timeframe predictions (15m, 1h, 4h, 1d)
+        # 2. Check confidence gate (≥80% = TRADING, <80% = LEARNING)
+        # 3. Execute trade (paper or live based on mode)
+        # 4. Monitor positions and close when conditions met
+        # 5. Record outcomes and trigger retraining if needed
+        # ===================================================================
+
+        if self._learning_bridge:
+            try:
+                # Get the interval for this candle (extract from candle object or symbol config)
+                ts = self._symbols.get(symbol)
+                if ts:
+                    interval = ts.interval
+
+                    # Trigger continuous learning system
+                    result = self._learning_bridge.on_candle_close(
+                        symbol=symbol,
+                        interval=interval,
+                        candle=candle
+                    )
+
+                    # Log result for debugging
+                    if result.get('error'):
+                        logger.error(
+                            f"[{symbol} @ {interval}] Learning system error: {result['error']}"
+                        )
+                    elif result.get('executed'):
+                        logger.info(
+                            f"[{symbol} @ {interval}] {result['mode']} trade executed "
+                            f"via {result.get('brokerage', 'unknown')} brokerage"
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"[{symbol}] Continuous learning error: {e}",
+                    exc_info=True
+                )
+
     # =========================================================================
     # SIGNAL GENERATION
     # =========================================================================
@@ -574,6 +1014,11 @@ class LiveTradingRunner:
                     if not ts.enabled:
                         continue
 
+                    # MANDATORY: Check if model is validated and ready
+                    if not self._models_ready.get(symbol, False):
+                        # Model not ready - skip predictions for this symbol
+                        continue
+
                     # Check cooldown
                     if ts.last_signal_time:
                         elapsed = datetime.utcnow() - ts.last_signal_time
@@ -585,7 +1030,7 @@ class LiveTradingRunner:
                     if df is None or len(df) < 60:
                         continue
 
-                    # Generate prediction
+                    # Generate prediction (only if model is validated)
                     try:
                         prediction = self._prediction_system.predict(symbol, df)
                         if prediction and prediction['confidence'] >= self.config.analysis.min_confidence:
@@ -817,12 +1262,17 @@ class LiveTradingRunner:
     # =========================================================================
 
     def get_status(self) -> dict:
-        """Get comprehensive status report."""
+        """Get comprehensive status report including continuous learning stats."""
         uptime = None
         if self._start_time:
             uptime = str(datetime.utcnow() - self._start_time)
 
         portfolio_summary = self._portfolio.get_summary() if self._portfolio else {}
+
+        # Get continuous learning stats
+        learning_stats = {}
+        if self._learning_bridge:
+            learning_stats = self._learning_bridge.get_stats()
 
         return {
             'status': self.status.value,
@@ -836,6 +1286,8 @@ class LiveTradingRunner:
             'active_orders': len(self._active_orders),
             'errors': self._errors_count,
             'brokerage_connected': self._brokerage.is_connected if self._brokerage else False,
+            # CONTINUOUS LEARNING: Add learning system statistics
+            'continuous_learning': learning_stats
         }
 
     def get_recent_signals(self, count: int = 10) -> List[dict]:

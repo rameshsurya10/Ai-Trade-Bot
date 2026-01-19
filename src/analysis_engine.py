@@ -142,10 +142,8 @@ class FeatureCalculator:
         'trend_7', 'trend_14',
         # Pattern
         'candle_body_ratio', 'higher_high', 'higher_close',
-        # Sentiment (7 features - requires news integration)
-        'sentiment_1h', 'sentiment_6h', 'sentiment_24h',
-        'sentiment_momentum', 'sentiment_volatility',
-        'news_volume_1h', 'source_diversity'
+        # Note: Sentiment features removed - they're optional and require news integration
+        # If needed, they should be added separately via database.get_sentiment_features()
     ]
 
     @staticmethod

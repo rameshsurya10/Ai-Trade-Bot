@@ -64,13 +64,18 @@ class CurrencyPairConfig:
     category: str = "major"
 
     @property
-    def oanda_symbol(self) -> str:
-        """Convert to OANDA format (EUR_USD)."""
+    def underscore_symbol(self) -> str:
+        """Convert to underscore format (EUR_USD)."""
         return self.symbol.replace("/", "_")
 
     @property
-    def binance_symbol(self) -> str:
-        """Convert to Binance format (EURUSD)."""
+    def capital_symbol(self) -> str:
+        """Convert to Capital.com format (EURUSD)."""
+        return self.symbol.replace("/", "")
+
+    @property
+    def compact_symbol(self) -> str:
+        """Convert to compact format (EURUSD) - same as Capital.com/Binance."""
         return self.symbol.replace("/", "")
 
     def is_jpy_pair(self) -> bool:

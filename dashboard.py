@@ -29,6 +29,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
+import json
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -39,6 +40,8 @@ import os
 import signal
 import subprocess
 import html
+import atexit
+import sqlite3
 from dotenv import load_dotenv
 
 # Load environment variables FIRST
@@ -69,6 +72,7 @@ st.set_page_config(
 # WebSocket Data Provider (REQUIRED - no fallback)
 # Import directly to avoid torch dependency from src/__init__.py
 from src.data.provider import UnifiedDataProvider
+from src.learning.strategy_analyzer import StrategyAnalyzer
 
 try:
     from src.core.database import Database
@@ -78,9 +82,15 @@ try:
     from src.advanced_predictor import AdvancedPredictor
     from src.news.collector import NewsCollector
     from src.news.aggregator import SentimentAggregator
+
+    # CONTINUOUS LEARNING: Strategic Learning Bridge
+    from src.learning.strategic_learning_bridge import StrategicLearningBridge
+
     AI_AVAILABLE = True
+    LEARNING_AVAILABLE = True
 except ImportError as e:
     AI_AVAILABLE = False
+    LEARNING_AVAILABLE = False
     logger.warning(f"AI modules not available: {e}")
 
 # =============================================================================
@@ -89,20 +99,46 @@ except ImportError as e:
 
 st.markdown("""
 <style>
-    /* Clean Light Theme */
-    .stApp { background-color: #f8f9fa; }
-
     /* Hide Streamlit elements */
     #MainMenu, footer, header { visibility: hidden; }
     .stDeployButton { display: none; }
 
-    /* Navigation */
-    .nav-container {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    /* Sidebar - Always Visible */
+    [data-testid="stSidebar"] {
+        min-width: 280px !important;
+        width: 280px !important;
+        transform: none !important;
+    }
+
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        min-width: 280px !important;
+        width: 280px !important;
+        margin-left: 0 !important;
+        transform: none !important;
+    }
+
+    [data-testid="stSidebar"] button[kind="header"] {
+        display: none !important;
+    }
+
+    /* Responsive Chart Container */
+    .stPlotlyChart {
+        width: 100% !important;
+    }
+    .stPlotlyChart > div {
+        width: 100% !important;
+    }
+    .js-plotly-plot {
+        width: 100% !important;
+    }
+    .plot-container {
+        width: 100% !important;
+    }
+
+    /* Main content area */
+    .main .block-container {
         padding: 1rem 2rem;
-        border-radius: 12px;
-        margin-bottom: 1rem;
-        color: white;
+        max-width: 100%;
     }
 
     /* Metric Cards */
@@ -128,7 +164,9 @@ st.markdown("""
     }
     .metric-card .delta { font-size: 0.9rem; }
     .metric-card.positive { border-left-color: #28a745; }
+    .metric-card.positive .delta { color: #28a745; }
     .metric-card.negative { border-left-color: #dc3545; }
+    .metric-card.negative .delta { color: #dc3545; }
     .metric-card.warning { border-left-color: #ffc107; }
 
     /* Signal Card */
@@ -158,20 +196,40 @@ st.markdown("""
 # SESSION STATE INITIALIZATION
 # =============================================================================
 
+def _load_config_sync() -> dict:
+    """Load config synchronously for initialization (no caching)."""
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r') as f:
+                return yaml.safe_load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def init_session_state():
-    """Initialize all session state variables."""
+    """Initialize all session state variables from config.yaml."""
+    # Load saved settings from config.yaml
+    saved_config = _load_config_sync()
+    data_config = saved_config.get('data', {})
+    portfolio_config = saved_config.get('portfolio', {})
+
     defaults = {
         # Navigation
         'page': 'Dashboard',
 
-        # Market settings
-        'exchange': 'binance',
-        'symbol': 'BTC/USDT',
-        'timeframe': '1h',
+        # Market mode (crypto or forex)
+        'market_mode': saved_config.get('market_mode', 'crypto'),
 
-        # Auto-refresh
-        'auto_refresh': True,
-        'refresh_interval': 5,
+        # Market settings - load from config.yaml if available
+        'exchange': data_config.get('exchange', 'binance'),
+        'symbol': data_config.get('symbol', 'BTC/USDT'),
+        'timeframe': data_config.get('interval', '1h'),
+
+        # Smart auto-refresh (off by default to save resources)
+        # Auto-refreshes ONLY when: data loading, predictions pending, or manually enabled
+        'auto_refresh': False,  # User can enable in settings
+        'refresh_interval': 30,
 
         # WebSocket Data Provider (ONLY data source)
         'data_provider': None,
@@ -180,9 +238,22 @@ def init_session_state():
         'predictor': None,
         'advanced_predictor': None,
 
+        # CONTINUOUS LEARNING: Strategic Learning Bridge
+        'learning_bridge': None,
+        'use_continuous_learning': True,  # Enable continuous learning by default
+
+        # Prediction Validation (8/10 streak system)
+        'prediction_validator': None,
+        'validation_worker_started': False,
+
+        # Prediction cache (matches refresh interval)
+        'last_prediction': None,
+        'last_prediction_time': 0,
+        'prediction_cache_seconds': 30,
+
         # Paper trading
         'paper_trader': None,
-        'paper_capital': 10000,
+        'paper_capital': portfolio_config.get('initial_capital', 10000),
 
         # Database
         'db': None,
@@ -198,8 +269,18 @@ def init_session_state():
         'news_collector': None,
         'sentiment_aggregator': None,
 
-        # Tracked currencies
-        'tracked_symbols': ['BTC/USDT', 'ETH/USDT'],
+        # Tracked currencies (based on market mode)
+        'tracked_symbols': ['EUR/USD', 'GBP/USD'] if saved_config.get('market_mode', 'crypto') == 'forex' else ['BTC/USDT', 'ETH/USDT'],
+
+        # Model Training Status (MANDATORY before predictions)
+        'model_ready': False,
+        'model_accuracy': 0.0,
+        'model_trained_at': None,
+        'training_in_progress': False,
+        'training_progress': 0,
+        'training_epoch': 0,
+        'training_max_epochs': 100,
+        'training_status': '',
     }
 
     for key, value in defaults.items():
@@ -243,8 +324,406 @@ def load_config() -> dict:
     return {}
 
 
+def check_model_readiness(symbol: str, timeframe: str) -> dict:
+    """
+    Check if model exists and is validated for predictions.
+
+    Returns:
+        dict with keys: ready (bool), accuracy (float), trained_at (str), reason (str)
+    """
+    import torch
+    from pathlib import Path
+
+    config = load_config()
+    models_dir = Path(config.get('model', {}).get('models_dir', 'models'))
+
+    # Get model path
+    safe_symbol = symbol.replace("/", "_").replace("-", "_")
+    model_path = models_dir / f"model_{safe_symbol}_{timeframe}.pt"
+
+    if not model_path.exists():
+        return {
+            'ready': False,
+            'accuracy': 0.0,
+            'trained_at': None,
+            'reason': 'No model found'
+        }
+
+    try:
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+        accuracy = checkpoint.get('validation_accuracy', 0.0)
+        trained_at = checkpoint.get('trained_at', 'unknown')
+
+        # Get minimum required accuracy from config
+        min_accuracy = config.get('auto_training', {}).get('min_accuracy_required', 0.58)
+
+        if accuracy >= min_accuracy:
+            return {
+                'ready': True,
+                'accuracy': accuracy,
+                'trained_at': trained_at,
+                'reason': f'Model validated ({accuracy:.1%} >= {min_accuracy:.1%})'
+            }
+        else:
+            return {
+                'ready': False,
+                'accuracy': accuracy,
+                'trained_at': trained_at,
+                'reason': f'Below minimum accuracy ({accuracy:.1%} < {min_accuracy:.1%})'
+            }
+    except Exception as e:
+        return {
+            'ready': False,
+            'accuracy': 0.0,
+            'trained_at': None,
+            'reason': f'Could not read model: {e}'
+        }
+
+
+def train_model(symbol: str, timeframe: str, progress_callback=None):
+    """
+    Train model for symbol/timeframe with progress updates.
+
+    Args:
+        symbol: Trading pair
+        timeframe: Candle interval
+        progress_callback: Function to call with (epoch, max_epochs, accuracy, status_msg)
+    """
+    import torch
+    import torch.nn as nn
+    import numpy as np
+    from pathlib import Path
+    from datetime import datetime
+    from src.analysis_engine import FeatureCalculator, LSTMModel
+
+    config = load_config()
+    auto_train_config = config.get('auto_training', {})
+    model_config = config.get('model', {})
+
+    # Training parameters
+    training_candles = auto_train_config.get('training_candles', 5000)
+    min_candles = auto_train_config.get('min_candles', 1000)
+    target_accuracy = auto_train_config.get('target_accuracy', 0.65)
+    min_accuracy_required = auto_train_config.get('min_accuracy_required', 0.58)
+    max_epochs = auto_train_config.get('max_epochs', 100)
+    batch_size = auto_train_config.get('batch_size', 32)
+    learning_rate = auto_train_config.get('learning_rate', 0.001)
+
+    # Model parameters
+    hidden_size = model_config.get('hidden_size', 128)
+    num_layers = model_config.get('num_layers', 2)
+    dropout = model_config.get('dropout', 0.2)
+    sequence_length = model_config.get('sequence_length', 60)
+
+    # Get database
+    db = st.session_state.db
+    if not db:
+        raise RuntimeError("Database not initialized")
+
+    # Fetch training data
+    if progress_callback:
+        progress_callback(0, max_epochs, 0, f"Fetching {training_candles} candles...")
+
+    candles_df = db.get_candles(
+        symbol=symbol,
+        interval=timeframe,
+        limit=training_candles + 100
+    )
+
+    if candles_df is None or len(candles_df) < min_candles:
+        raise ValueError(
+            f"Insufficient data: {len(candles_df) if candles_df is not None else 0} < {min_candles} candles"
+        )
+
+    # Calculate features
+    if progress_callback:
+        progress_callback(0, max_epochs, 0, "Calculating features...")
+
+    df_features = FeatureCalculator.calculate_all(candles_df)
+    feature_columns = FeatureCalculator.get_feature_columns()
+
+    # Extract and normalize features FIRST (before creating target)
+    features = df_features[feature_columns].values
+    closes = df_features['close'].values
+
+    feature_means = np.nanmean(features, axis=0)
+    feature_stds = np.nanstd(features, axis=0)
+    features = (features - feature_means) / (feature_stds + 1e-8)
+    features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
+
+    # Create sequences
+    if progress_callback:
+        progress_callback(0, max_epochs, 0, "Creating sequences...")
+
+    # Create sliding windows manually for correct shape
+    # Need shape: (num_samples, sequence_length, num_features)
+    num_features = features.shape[1]
+    num_sequences = len(features) - sequence_length - 1  # -1 for target
+
+    X = np.zeros((num_sequences, sequence_length, num_features))
+    y = np.zeros(num_sequences)
+
+    # ==================================================================================
+    # STRATEGIC TARGET: Learn PROFITABLE trades with CLEAR TP/SL rules
+    # ==================================================================================
+    #
+    # TRADING STRATEGY (CRYSTAL CLEAR):
+    # - Take Profit (TP): 2.0% gain from entry
+    # - Stop Loss (SL): 1.0% loss from entry
+    # - Risk/Reward Ratio: 2:1 (risk $1 to make $2)
+    # - Maximum Hold Time: 10 candles
+    #   * For 15m timeframe: 10 × 15min = 2.5 hours maximum
+    #   * For 1h timeframe: 10 × 1h = 10 hours maximum
+    #
+    # EXAMPLE FOR BTC @ $95,000:
+    # - Entry: $95,000
+    # - Take Profit: $96,900 (+2.0% = +$1,900 profit)
+    # - Stop Loss: $94,050 (-1.0% = -$950 loss)
+    # - Hold: Maximum 10 candles, then exit
+    #
+    # The model learns: "Which patterns lead to +2% BEFORE -1% within 10 candles?"
+    # ==================================================================================
+
+    highs = df_features['high'].values
+    lows = df_features['low'].values
+
+    # FIXED percentage targets (clear and simple)
+    TP_PERCENT = 0.02  # 2% take profit (realistic for crypto)
+    SL_PERCENT = 0.01  # 1% stop loss (tight but reasonable)
+    MAX_HOLD_CANDLES = 10  # Maximum candles to hold position
+
+    # Track target distribution for logging
+    buy_signals = 0
+    sell_signals = 0
+    neutral_signals = 0
+
+    for i in range(num_sequences):
+        # Sequence uses candles [i] to [i+sequence_length-1]
+        X[i] = features[i:i + sequence_length]
+
+        # Entry: close price of the last candle in sequence
+        entry_price = closes[i + sequence_length - 1]
+
+        # === LONG (BUY) TRADE TARGETS ===
+        tp_long = entry_price * (1.0 + TP_PERCENT)  # +2%
+        sl_long = entry_price * (1.0 - SL_PERCENT)  # -1%
+
+        # === SHORT (SELL) TRADE TARGETS ===
+        tp_short = entry_price * (1.0 - TP_PERCENT)  # -2%
+        sl_short = entry_price * (1.0 + SL_PERCENT)  # +1%
+
+        # Look ahead to see what happens
+        lookahead = min(MAX_HOLD_CANDLES, len(closes) - (i + sequence_length))
+
+        # Track outcomes
+        long_outcome = None  # 'WIN' if TP hit first, 'LOSS' if SL hit first
+        short_outcome = None
+
+        for j in range(lookahead):
+            candle_idx = i + sequence_length + j
+            high = highs[candle_idx]
+            low = lows[candle_idx]
+
+            # Check LONG trade (if not already decided)
+            if long_outcome is None:
+                # Check SL first (conservative: assume SL hit if both touched same candle)
+                if low <= sl_long:
+                    long_outcome = 'LOSS'
+                elif high >= tp_long:
+                    long_outcome = 'WIN'
+
+            # Check SHORT trade (if not already decided)
+            if short_outcome is None:
+                # Check SL first (conservative: assume SL hit if both touched same candle)
+                if high >= sl_short:
+                    short_outcome = 'LOSS'
+                elif low <= tp_short:
+                    short_outcome = 'WIN'
+
+        # === DECISION LOGIC ===
+        # Only signal BUY/SELL if ONE direction wins clearly
+        # Signal NEUTRAL if both lose, both win, or unclear
+
+        if long_outcome == 'WIN' and short_outcome != 'WIN':
+            # LONG wins, SHORT doesn't → BUY SIGNAL
+            y[i] = 1.0
+            buy_signals += 1
+
+        elif short_outcome == 'WIN' and long_outcome != 'WIN':
+            # SHORT wins, LONG doesn't → SELL SIGNAL
+            y[i] = 0.0
+            sell_signals += 1
+
+        else:
+            # NEUTRAL - don't trade when:
+            # - Both lose (choppy market)
+            # - Both win (contradictory - impossible but check anyway)
+            # - Neither wins within time limit (weak signal)
+            y[i] = 0.5
+            neutral_signals += 1
+
+    # Log target distribution
+    total_samples = buy_signals + sell_signals + neutral_signals
+    logger.info(
+        f"Target distribution: "
+        f"BUY={buy_signals} ({buy_signals/total_samples*100:.1f}%), "
+        f"SELL={sell_signals} ({sell_signals/total_samples*100:.1f}%), "
+        f"NEUTRAL={neutral_signals} ({neutral_signals/total_samples*100:.1f}%)"
+    )
+
+    # Remove any invalid entries
+    valid = ~(np.isnan(y) | np.isnan(X).any(axis=(1, 2)))
+    X = X[valid]
+    y = y[valid]
+
+    if len(X) < min_candles:
+        raise ValueError(f"After sequence creation, only {len(X)} samples")
+
+    # Train/val split
+    split_idx = int(len(X) * 0.8)
+    min_val_samples = 50
+    if len(X) - split_idx < min_val_samples:
+        if len(X) < min_val_samples * 2:
+            raise ValueError("Insufficient data for reliable training")
+        split_idx = len(X) - min_val_samples
+
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+
+    # Create data loaders
+    train_dataset = torch.utils.data.TensorDataset(
+        torch.FloatTensor(X_train),
+        torch.FloatTensor(y_train)
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        torch.FloatTensor(X_val),
+        torch.FloatTensor(y_val)
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=batch_size
+    )
+
+    # Create model
+    device = torch.device('cpu')  # Use CPU for dashboard (GPU causes issues in Streamlit)
+    model = LSTMModel(
+        input_size=len(feature_columns),
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout
+    ).to(device)
+
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    best_val_acc = 0
+    best_state = None
+    patience = 10
+    patience_counter = 0
+
+    # Training loop
+    for epoch in range(max_epochs):
+        # Train
+        model.train()
+        epoch_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch).squeeze()
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        # Validate
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch).squeeze()
+                predictions = (outputs > 0.5).float()
+                correct += (predictions == y_batch).sum().item()
+                total += len(y_batch)
+
+        val_acc = correct / total if total > 0 else 0
+
+        # Track best
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.clone().detach().cpu() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Progress update
+        if progress_callback:
+            avg_loss = epoch_loss / len(train_loader)
+            status = f"Epoch {epoch+1}/{max_epochs} - Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%}"
+            progress_callback(epoch + 1, max_epochs, val_acc, status)
+
+        # Early stopping
+        if patience_counter >= patience:
+            break
+
+        # Target reached
+        if val_acc >= target_accuracy:
+            break
+
+    # Save model
+    if best_state is None:
+        raise RuntimeError("Training failed - no valid model state")
+
+    model.cpu()
+    model.load_state_dict(best_state)
+
+    models_dir = Path(config.get('model', {}).get('models_dir', 'models'))
+    models_dir.mkdir(parents=True, exist_ok=True)
+    safe_symbol = symbol.replace("/", "_").replace("-", "_")
+    model_path = models_dir / f"model_{safe_symbol}_{timeframe}.pt"
+
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': {
+            'hidden_size': hidden_size,
+            'num_layers': num_layers,
+            'dropout': dropout,
+            'sequence_length': sequence_length
+        },
+        'feature_means': feature_means,
+        'feature_stds': feature_stds,
+        'symbol': symbol,
+        'interval': timeframe,
+        'trained_at': datetime.utcnow().isoformat(),
+        'samples_trained': len(X_train),
+        'validation_accuracy': best_val_acc
+    }, model_path)
+
+    # Check if validated
+    if best_val_acc < min_accuracy_required:
+        raise RuntimeError(
+            f"Model below minimum accuracy: {best_val_acc:.2%} < {min_accuracy_required:.2%}"
+        )
+
+    return {
+        'accuracy': best_val_acc,
+        'samples': len(X_train),
+        'epochs': epoch + 1
+    }
+
+
 def initialize_components():
     """Initialize all components."""
+    # Check model readiness on initialization
+    if not st.session_state.training_in_progress:
+        model_status = check_model_readiness(st.session_state.symbol, st.session_state.timeframe)
+        st.session_state.model_ready = model_status['ready']
+        st.session_state.model_accuracy = model_status['accuracy']
+        st.session_state.model_trained_at = model_status['trained_at']
+
     # WebSocket Data Provider (ONLY data source)
     if st.session_state.data_provider is None:
         st.session_state.data_provider = get_data_provider()
@@ -273,15 +752,168 @@ def initialize_components():
             initial_cash=st.session_state.paper_capital
         )
 
-    # Advanced predictor
-    if st.session_state.advanced_predictor is None and AI_AVAILABLE:
-        st.session_state.advanced_predictor = AdvancedPredictor()
-
-    # Database
+    # Database (required for prediction validator)
     if st.session_state.db is None and AI_AVAILABLE:
         db_path = ROOT / "data" / "trading.db"
         db_path.parent.mkdir(exist_ok=True)
         st.session_state.db = Database(str(db_path))
+
+    # Prediction Validator (requires database)
+    if st.session_state.prediction_validator is None and AI_AVAILABLE and st.session_state.db:
+        from src.learning.prediction_validator import PredictionValidator
+        st.session_state.prediction_validator = PredictionValidator(
+            database=st.session_state.db,
+            streak_required=8,
+            min_data_years=1
+        )
+
+    # Start prediction validation background worker (runs once per session)
+    if (not st.session_state.validation_worker_started and
+        st.session_state.prediction_validator is not None and
+        st.session_state.data_provider is not None):
+
+        import threading
+
+        # Initialize stop event for thread cleanup
+        if 'validation_worker_stop' not in st.session_state:
+            st.session_state.validation_worker_stop = threading.Event()
+
+        # Capture instances in closure (thread-safe - no session_state access in thread)
+        validator = st.session_state.prediction_validator
+        data_provider = st.session_state.data_provider
+        stop_event = st.session_state.validation_worker_stop
+
+        def prediction_validation_worker():
+            """
+            Background thread that validates predictions when candles close.
+
+            Runs every 60 seconds to check pending predictions and validate
+            them against actual candle closes.
+
+            Thread-safe: Uses captured instances, NOT session_state.
+            """
+            while not stop_event.is_set():
+                try:
+                    # Sleep in 5-second intervals to allow quick stop
+                    for _ in range(12):  # 12 * 5 = 60 seconds
+                        if stop_event.is_set():
+                            logger.info("🛑 Validation worker stopped")
+                            return
+                        time.sleep(5)
+
+                    # Use captured instances (thread-safe)
+                    if validator and data_provider:
+                        # Get all pending predictions from DATABASE (not just memory!)
+                        # This ensures we validate ALL pending predictions, even after restart
+                        pending_predictions = validator.get_pending_predictions_from_db()
+
+                        logger.info(f"🔍 Checking {len(pending_predictions)} pending predictions from database")
+
+                        for pred in pending_predictions:
+                            if stop_event.is_set():
+                                return
+
+                            symbol = pred['symbol']
+                            timeframe = pred['timeframe']
+                            timestamp = pred['timestamp']
+
+                            # Calculate when candle should close
+                            candle_interval = validator._get_candle_interval_ms(timeframe)
+                            expected_close = ((timestamp // candle_interval) + 1) * candle_interval
+                            current_time = int(time.time() * 1000)
+
+                            # Check if candle should have closed
+                            if current_time >= expected_close:
+                                try:
+                                    # Fetch latest candle
+                                    logger.debug(f"  Fetching data for {symbol} @ {timeframe}")
+                                    df = data_provider.get_candles(
+                                        symbol=symbol,
+                                        interval=timeframe,
+                                        limit=1
+                                    )
+
+                                    if df is not None and len(df) > 0:
+                                        latest = df.iloc[-1]
+                                        actual_price = float(latest['close'])
+                                        candle_time = int(latest['timestamp'])
+
+                                        # Validate prediction
+                                        validator.validate_prediction(
+                                            symbol=symbol,
+                                            timeframe=timeframe,
+                                            actual_price=actual_price,
+                                            candle_close_time=candle_time
+                                        )
+                                        logger.info(f"✅ Auto-validated prediction: {symbol} {timeframe} @ ${actual_price:,.2f}")
+                                    else:
+                                        logger.warning(f"⚠️ No data for validation: {symbol} {timeframe}")
+
+                                except Exception as e:
+                                    logger.error(f"❌ Validation error for {symbol} {timeframe}: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+
+                        # Cleanup stale predictions (older than 2x candle interval)
+                        cleaned = validator.cleanup_stale_predictions()
+                        if cleaned > 0:
+                            logger.info(f"🗑️ Cleaned {cleaned} stale predictions")
+
+                except Exception as e:
+                    logger.error(f"❌ Validation worker error: {e}")
+
+        # Start background thread
+        validation_thread = threading.Thread(
+            target=prediction_validation_worker,
+            daemon=True,
+            name="PredictionValidationWorker"
+        )
+        validation_thread.start()
+        st.session_state.validation_thread = validation_thread
+        st.session_state.validation_worker_started = True
+
+        # Register cleanup on exit (prevent memory leak)
+        def cleanup_validation_thread():
+            """Stop validation thread when process exits."""
+            logger.info("🧹 Cleaning up validation worker...")
+            stop_event.set()
+            if validation_thread.is_alive():
+                validation_thread.join(timeout=2)
+                logger.info("✅ Validation worker cleaned up")
+
+        atexit.register(cleanup_validation_thread)
+        logger.info("🚀 Prediction validation background worker started (thread-safe)")
+
+    # Advanced predictor (requires prediction validator for recording predictions)
+    if st.session_state.advanced_predictor is None and AI_AVAILABLE:
+        st.session_state.advanced_predictor = AdvancedPredictor(
+            prediction_validator=st.session_state.prediction_validator
+        )
+
+    # CONTINUOUS LEARNING: Initialize Strategic Learning Bridge
+    if st.session_state.learning_bridge is None and LEARNING_AVAILABLE and st.session_state.use_continuous_learning:
+        try:
+            logger.info("🧠 Initializing Continuous Learning System...")
+
+            # Get paper brokerage (uses paper trading simulator)
+            paper_brokerage = st.session_state.paper_simulator
+
+            # Initialize bridge
+            st.session_state.learning_bridge = StrategicLearningBridge(
+                database=st.session_state.database,
+                predictor=st.session_state.advanced_predictor,
+                paper_brokerage=paper_brokerage,
+                live_brokerage=None,  # Dashboard is paper-only
+                config=config
+            )
+
+            logger.info("✅ Continuous Learning System initialized")
+            st.success("🧠 Continuous Learning ENABLED - Models will learn from every trade!")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize learning bridge: {e}", exc_info=True)
+            st.warning(f"⚠️ Continuous learning disabled: {e}")
+            st.session_state.learning_bridge = None
 
     # Metrics calculator
     if st.session_state.metrics_calculator is None and AI_AVAILABLE:
@@ -375,8 +1007,7 @@ def cleanup_resources() -> None:
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
-# Register cleanup handler
-import atexit
+# Register cleanup handler (atexit imported at top)
 atexit.register(cleanup_resources)
 
 # =============================================================================
@@ -516,7 +1147,7 @@ def render_metric_card(label: str, value: str, delta: str = "", card_class: str 
 
 
 def render_signal_card(direction: str, confidence: float, price: float, stop_loss: float, take_profit: float):
-    """Render basic signal card (legacy function for compatibility)."""
+    """Render basic signal card."""
     signal_class = f"signal-{direction.lower()}"
     color = "#28a745" if direction == "BUY" else "#dc3545" if direction == "SELL" else "#6c757d"
 
@@ -554,110 +1185,474 @@ def render_enhanced_signal_card(prediction, price: float, account_balance: float
     expected_profit_dollars = shares * abs(prediction.take_profit - price)
     expected_loss_dollars = shares * abs(price - prediction.stop_loss)
 
-    st.markdown(f"""
-        <div class="signal-card {signal_class}">
-            <!-- Main Signal -->
-            <div style="font-size: 0.9rem; color: #6c757d; margin-bottom: 0.5rem;">🤖 AI SIGNAL</div>
-            <div style="font-size: 3rem; font-weight: 800; color: {color};">{prediction.direction}</div>
-            <div style="font-size: 1.2rem; margin-top: 0.5rem;">
-                Confidence: {prediction.confidence*100:.1f}%
+    html = f"""
+    <div class="signal-card {signal_class}">
+        <div style="font-size: 0.9rem; color: #6c757d; margin-bottom: 0.5rem;">🤖 AI SIGNAL</div>
+        <div style="font-size: 3rem; font-weight: 800; color: {color};">{prediction.direction}</div>
+        <div style="font-size: 1.2rem; margin-top: 0.5rem;">Confidence: {prediction.confidence*100:.1f}%</div>
+        <div style="margin-top: 1.5rem; display: flex; justify-content: space-around; padding: 1rem; background: #f8f9fa; border-radius: 8px;">
+            <div style="text-align: center;">
+                <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">STOP LOSS</div>
+                <div style="color: #dc3545; font-weight: 700; font-size: 1.1rem;">${prediction.stop_loss:,.2f}</div>
+                <div style="font-size: 0.7rem; color: #999;">-{prediction.expected_loss_pct*100:.1f}%</div>
             </div>
-
-            <!-- Price Levels -->
-            <div style="margin-top: 1.5rem; display: flex; justify-content: space-around; padding: 1rem; background: #f8f9fa; border-radius: 8px;">
-                <div style="text-align: center;">
-                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">STOP LOSS</div>
-                    <div style="color: #dc3545; font-weight: 700; font-size: 1.1rem;">${prediction.stop_loss:,.2f}</div>
-                    <div style="font-size: 0.7rem; color: #999;">-{prediction.expected_loss_pct*100:.1f}%</div>
-                </div>
-                <div style="text-align: center;">
-                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">ENTRY</div>
-                    <div style="font-weight: 700; font-size: 1.1rem;">${price:,.2f}</div>
-                    <div style="font-size: 0.7rem; color: #999;">Current</div>
-                </div>
-                <div style="text-align: center;">
-                    <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">TAKE PROFIT</div>
-                    <div style="color: #28a745; font-weight: 700; font-size: 1.1rem;">${prediction.take_profit:,.2f}</div>
-                    <div style="font-size: 0.7rem; color: #999;">+{prediction.expected_profit_pct*100:.1f}%</div>
-                </div>
+            <div style="text-align: center;">
+                <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">ENTRY</div>
+                <div style="font-weight: 700; font-size: 1.1rem;">${price:,.2f}</div>
+                <div style="font-size: 0.7rem; color: #999;">Current</div>
             </div>
-
-            <!-- Risk Metrics -->
-            <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px; border: 1px solid #e0e0e0;">
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
-                    <div>
-                        <span style="color: #6c757d; font-size: 0.8rem;">Risk/Reward:</span>
-                        <span style="font-weight: 700; margin-left: 0.3rem;">1:{prediction.risk_reward_ratio:.2f}</span>
-                    </div>
-                    <div>
-                        <span style="color: #6c757d; font-size: 0.8rem;">Position Size:</span>
-                        <span style="font-weight: 700; margin-left: 0.3rem;">{prediction.kelly_fraction*100:.1f}%</span>
-                    </div>
-                    <div>
-                        <span style="color: #6c757d; font-size: 0.8rem;">Expected Profit:</span>
-                        <span style="color: #28a745; font-weight: 700; margin-left: 0.3rem;">${expected_profit_dollars:,.0f}</span>
-                    </div>
-                    <div>
-                        <span style="color: #6c757d; font-size: 0.8rem;">Expected Loss:</span>
-                        <span style="color: #dc3545; font-weight: 700; margin-left: 0.3rem;">${expected_loss_dollars:,.0f}</span>
-                    </div>
-                </div>
+            <div style="text-align: center;">
+                <div style="font-size: 0.75rem; color: #6c757d; font-weight: 600;">TAKE PROFIT</div>
+                <div style="color: #28a745; font-weight: 700; font-size: 1.1rem;">${prediction.take_profit:,.2f}</div>
+                <div style="font-size: 0.7rem; color: #999;">+{prediction.expected_profit_pct*100:.1f}%</div>
             </div>
         </div>
-    """, unsafe_allow_html=True)
+        <div style="margin-top: 1rem; padding: 1rem; background: white; border-radius: 8px; border: 1px solid #e0e0e0;">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                <div><span style="color: #6c757d; font-size: 0.8rem;">Risk/Reward:</span> <span style="font-weight: 700;">1:{prediction.risk_reward_ratio:.2f}</span></div>
+                <div><span style="color: #6c757d; font-size: 0.8rem;">Position Size:</span> <span style="font-weight: 700;">{prediction.kelly_fraction*100:.1f}%</span></div>
+                <div><span style="color: #6c757d; font-size: 0.8rem;">Expected Profit:</span> <span style="color: #28a745; font-weight: 700;">${expected_profit_dollars:,.0f}</span></div>
+                <div><span style="color: #6c757d; font-size: 0.8rem;">Expected Loss:</span> <span style="color: #dc3545; font-weight: 700;">${expected_loss_dollars:,.0f}</span></div>
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
-def render_monte_carlo_section(prediction):
-    """Render Monte Carlo simulation results."""
-    st.markdown("#### 🎲 Monte Carlo Simulation")
+def render_monte_carlo_section(prediction, sl_pct: float, tp_pct: float):
+    """Render Monte Carlo simulation results with clear advice."""
+    prob_profit = prediction.monte_carlo_prob_profit * 100
+    prob_tp = prediction.monte_carlo_prob_take_profit * 100
+    prob_sl = prediction.monte_carlo_prob_stop_loss * 100
+    var_5 = prediction.monte_carlo_var_5pct * 100
+    daily_vol = prediction.monte_carlo_volatility_daily * 100
+    annual_vol = prediction.monte_carlo_volatility_annual * 100
 
+    # Pre-calculate all colors to avoid nested braces in f-string
+    if prob_profit >= 60 and prob_tp > prob_sl:
+        risk_level = "LOW RISK"
+        risk_color = "#28a745"
+        advice = "Good setup! Odds favor profit."
+        advice_bg = "#d4edda"
+    elif prob_profit >= 50:
+        risk_level = "MODERATE"
+        risk_color = "#ffc107"
+        advice = "Fair odds. Use smaller position."
+        advice_bg = "#fff3cd"
+    else:
+        risk_level = "HIGH RISK"
+        risk_color = "#dc3545"
+        advice = "Risky trade. Consider waiting."
+        advice_bg = "#f8d7da"
+
+    win_color = "#28a745" if prob_profit >= 50 else "#dc3545"
+
+    # Use Streamlit columns for clean layout (avoids HTML rendering issues)
+    st.markdown(f"""
+<div style="background:white;border-radius:12px;padding:1.5rem;border:1px solid #e0e0e0;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+<b style="font-size:1.1rem;">Risk Analysis (1 Year, 100K Simulations)</b>
+<span style="background:{risk_color};color:white;padding:4px 12px;border-radius:20px;font-weight:700;font-size:0.85rem;">{risk_level}</span>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # Use columns for the metrics
     col1, col2, col3 = st.columns(3)
-
     with col1:
-        prob_profit = prediction.monte_carlo_prob_profit * 100
-        color = "positive" if prob_profit > 50 else "negative"
-        render_metric_card(
-            "Probability of Profit",
-            f"{prob_profit:.1f}%",
-            card_class=color
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:1rem;background:#f8f9fa;border-radius:8px;">
+<div style="font-size:0.75rem;color:#6c757d;">Win Chance</div>
+<div style="font-size:1.5rem;font-weight:700;color:{win_color};">{prob_profit:.1f}%</div>
+</div>
+""", unsafe_allow_html=True)
 
     with col2:
-        prob_tp = prediction.monte_carlo_prob_take_profit * 100
-        render_metric_card(
-            "Hit Take Profit",
-            f"{prob_tp:.1f}%",
-            card_class="positive"
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:1rem;background:#e8f5e9;border-radius:8px;">
+<div style="font-size:0.75rem;color:#6c757d;">Hit TP (+{tp_pct:.1f}%)</div>
+<div style="font-size:1.5rem;font-weight:700;color:#28a745;">{prob_tp:.1f}%</div>
+</div>
+""", unsafe_allow_html=True)
 
     with col3:
-        prob_sl = prediction.monte_carlo_prob_stop_loss * 100
-        render_metric_card(
-            "Hit Stop Loss",
-            f"{prob_sl:.1f}%",
-            card_class="negative"
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:1rem;background:#ffebee;border-radius:8px;">
+<div style="font-size:0.75rem;color:#6c757d;">Hit SL (-{sl_pct:.1f}%)</div>
+<div style="font-size:1.5rem;font-weight:700;color:#dc3545;">{prob_sl:.1f}%</div>
+</div>
+""", unsafe_allow_html=True)
 
-    # Additional metrics
+    # Bottom metrics row
     col4, col5, col6 = st.columns(3)
-
     with col4:
-        render_metric_card(
-            "Value at Risk (5%)",
-            f"{prediction.monte_carlo_var_5pct*100:.2f}%"
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:0.5rem;">
+<div style="font-size:0.7rem;color:#999;">Worst Case (5%)</div>
+<div style="font-weight:600;color:#dc3545;">-{var_5:.1f}%</div>
+</div>
+""", unsafe_allow_html=True)
 
     with col5:
-        render_metric_card(
-            "Daily Volatility",
-            f"{prediction.monte_carlo_volatility_daily*100:.2f}%"
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:0.5rem;">
+<div style="font-size:0.7rem;color:#999;">Daily Swing</div>
+<div style="font-weight:600;">{daily_vol:.2f}%</div>
+</div>
+""", unsafe_allow_html=True)
 
     with col6:
-        render_metric_card(
-            "Annual Volatility",
-            f"{prediction.monte_carlo_volatility_annual*100:.1f}%"
-        )
+        st.markdown(f"""
+<div style="text-align:center;padding:0.5rem;">
+<div style="font-size:0.7rem;color:#999;">Yearly Swing</div>
+<div style="font-weight:600;">{annual_vol:.1f}%</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # Advice box
+    st.markdown(f"""
+<div style="background:{advice_bg};padding:0.75rem 1rem;border-radius:8px;text-align:center;margin-top:0.5rem;">
+<span style="font-weight:600;">{advice}</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+def render_action_advice(prediction, current_price: float):
+    """Render clear action advice based on all signals."""
+    direction = prediction.direction
+    confidence = prediction.confidence * 100
+    prob_profit = prediction.monte_carlo_prob_profit * 100
+    kelly = prediction.kelly_fraction * 100
+    rr = prediction.risk_reward_ratio
+
+    # Build action steps based on signal
+    if direction == "BUY" and confidence >= 60 and prob_profit >= 50:
+        action_color = "#28a745"
+        action_title = "Consider Buying"
+        steps = [
+            f"Entry: Around ${current_price:,.0f}",
+            f"Stop Loss: ${prediction.stop_loss:,.0f}",
+            f"Take Profit: ${prediction.take_profit:,.0f}",
+            f"Position Size: {kelly:.0f}% of account"
+        ]
+        summary = f"Signals align for a long position with {rr:.1f}x reward potential."
+    elif direction == "SELL" and confidence >= 60 and prob_profit >= 50:
+        action_color = "#dc3545"
+        action_title = "Consider Selling"
+        steps = [
+            f"Entry: Around ${current_price:,.0f}",
+            f"Stop Loss: ${prediction.stop_loss:,.0f}",
+            f"Take Profit: ${prediction.take_profit:,.0f}",
+            f"Position Size: {kelly:.0f}% of account"
+        ]
+        summary = f"Signals suggest shorting with {rr:.1f}x reward potential."
+    else:
+        action_color = "#6c757d"
+        action_title = "Wait for Better Setup"
+        if confidence < 60:
+            reason = f"Low confidence ({confidence:.0f}%)"
+        elif prob_profit < 50:
+            reason = f"Poor win odds ({prob_profit:.0f}%)"
+        else:
+            reason = "Mixed signals"
+        steps = [
+            f"Reason: {reason}",
+            "Watch for clearer trend",
+            "Check back in 15-30 min"
+        ]
+        summary = "Current conditions don't favor a trade. Patience pays."
+
+    # Pre-calculate icon to avoid ternary in f-string
+    icon = "✓" if "Consider" in action_title else "⏸"
+    steps_html = "".join([f'<div style="padding:4px 0;border-bottom:1px solid #eee;">• {step}</div>' for step in steps])
+
+    html = f"""
+<div style="background:white;border-radius:12px;padding:1.5rem;border:2px solid {action_color};">
+<div style="display:flex;align-items:center;margin-bottom:1rem;">
+<div style="width:40px;height:40px;background:{action_color};border-radius:50%;display:flex;align-items:center;justify-content:center;margin-right:12px;">
+<span style="color:white;font-size:1.2rem;">{icon}</span>
+</div>
+<div>
+<div style="font-weight:700;font-size:1.1rem;color:{action_color};">{action_title}</div>
+<div style="font-size:0.8rem;color:#666;">{summary}</div>
+</div>
+</div>
+<div style="background:#f8f9fa;border-radius:8px;padding:1rem;">
+{steps_html}
+</div>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_rule_validation(prediction):
+    """Render 8 out of 10 rule validation status."""
+    # Check if prediction has rule validation (for backward compatibility with cached predictions)
+    if not hasattr(prediction, 'rules_passed') or not prediction.rules_details:
+        st.info("Rule validation will appear after next refresh")
+        return
+
+    rules_passed = prediction.rules_passed
+    rules_total = prediction.rules_total
+    rules_details = prediction.rules_details
+
+    # Determine if signal is valid (8+ rules passed)
+    is_valid = rules_passed >= 8
+    status_color = "#28a745" if is_valid else "#dc3545" if rules_passed < 6 else "#ffc107"
+    status_text = "VALID SIGNAL" if is_valid else "WEAK SIGNAL" if rules_passed >= 6 else "NO TRADE"
+
+    # Header
+    st.markdown(f"### Rule Validation ({rules_passed}/{rules_total})")
+
+    # Status badge
+    st.markdown(f"""
+<div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
+<div style="background:{status_color};color:white;padding:8px 20px;border-radius:25px;font-weight:700;font-size:1.1rem;">
+{status_text}
+</div>
+<div style="color:#666;font-size:0.9rem;">
+{"Trade when 8+ rules pass" if not is_valid else "All key conditions met"}
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # Rules grid - 2 columns of 5 rules each
+    col1, col2 = st.columns(2)
+
+    for i, (name, passed, reason) in enumerate(rules_details):
+        icon = "✓" if passed else "✗"
+        color = "#28a745" if passed else "#dc3545"
+        bg = "#e8f5e9" if passed else "#ffebee"
+
+        rule_html = f"""
+<div style="display:flex;align-items:center;padding:8px 12px;margin-bottom:6px;background:{bg};border-radius:6px;border-left:4px solid {color};">
+<span style="color:{color};font-weight:700;font-size:1.1rem;margin-right:10px;">{icon}</span>
+<div>
+<div style="font-weight:600;font-size:0.85rem;">{name}</div>
+<div style="color:#666;font-size:0.75rem;">{reason}</div>
+</div>
+</div>
+"""
+        if i < 5:
+            with col1:
+                st.markdown(rule_html, unsafe_allow_html=True)
+        else:
+            with col2:
+                st.markdown(rule_html, unsafe_allow_html=True)
+
+
+def render_prediction_streak(validator, symbol: str, timeframe: str, df):
+    """Render prediction streak progress and data requirement."""
+    st.markdown("### 🎯 Prediction Validation")
+
+    # Check data requirement
+    has_data, data_msg = validator.check_data_requirement(df, timeframe)
+
+    # Get streak status
+    can_trade, trade_msg, current_streak = validator.can_trade(symbol, timeframe)
+
+    # Status colors
+    if can_trade:
+        status_color = "#28a745"
+        status_text = "✅ READY TO TRADE"
+    elif current_streak >= 6:
+        status_color = "#ffc107"
+        status_text = "🔄 VALIDATING"
+    else:
+        status_color = "#dc3545"
+        status_text = "❌ NOT READY"
+
+    # Streak progress bar
+    progress = (current_streak / validator.streak_required) * 100
+
+    st.markdown(f"""
+<div style="background:white;border-radius:12px;padding:1.5rem;border:2px solid {status_color};margin-bottom:1rem;">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+<div>
+<div style="font-size:1.2rem;font-weight:700;color:{status_color};">{status_text}</div>
+<div style="color:#666;font-size:0.9rem;">{trade_msg}</div>
+</div>
+<div style="font-size:2rem;font-weight:700;color:{status_color};">{current_streak}/{validator.streak_required}</div>
+</div>
+
+<div style="background:#e0e0e0;border-radius:10px;height:20px;overflow:hidden;margin-bottom:0.5rem;">
+<div style="background:{status_color};height:100%;width:{progress}%;transition:width 0.3s;"></div>
+</div>
+
+<div style="font-size:0.85rem;color:#666;">
+<div>📊 Data: {data_msg}</div>
+<div>🎲 Model must prove accuracy before trading</div>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+def render_prediction_history(validator, symbol: str, timeframe: str):
+    """Render recent prediction history table with detailed reasoning."""
+    history = validator.get_history(symbol, timeframe, limit=10)
+
+    if not history:
+        st.info("No prediction history yet. Make your first prediction to start!")
+        return
+
+    st.markdown("### 📜 Recent Predictions")
+
+    # Create DataFrame for display
+    import pandas as pd
+    records = []
+    detailed_info = []  # Store detailed info for expanders
+
+    for h in history:
+        # Parse market context
+        try:
+            ctx = json.loads(h['market_context']) if h['market_context'] else {}
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            logger.warning(f"Failed to parse market context: {e}")
+            ctx = {}
+
+        # Format timestamp
+        from datetime import datetime
+        ts = datetime.fromtimestamp(h['timestamp'] / 1000).strftime("%H:%M")
+        full_ts = datetime.fromtimestamp(h['timestamp'] / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Determine result icon
+        if h['is_correct'] is None:
+            result = "⏳ Pending"
+            result_color = "#999"
+        elif h['is_correct'] == 1:
+            result = "✅ Win"
+            result_color = "#28a745"
+        else:
+            result = "❌ Loss"
+            result_color = "#dc3545"
+
+        records.append({
+            "Time": ts,
+            "Signal": h['predicted_direction'],
+            "Price": f"${h['predicted_price']:,.0f}",
+            "Actual": f"${h['actual_price']:,.0f}" if h['actual_price'] else "...",
+            "Change": f"{h['profit_loss_pct']:+.2f}%" if h['profit_loss_pct'] else "...",
+            "Result": result,
+            "Confidence": f"{h['confidence']:.0%}",
+            "Rules": f"{h['rules_passed']}/{h['rules_total']}"
+        })
+
+        # Store detailed info
+        detailed_info.append({
+            'timestamp': full_ts,
+            'notes': h.get('notes', ''),
+            'context': ctx,
+            'predicted_direction': h['predicted_direction'],
+            'predicted_price': h['predicted_price'],
+            'actual_price': h.get('actual_price'),
+            'actual_direction': h.get('actual_direction'),
+            'confidence': h['confidence'],
+            'rules_passed': h['rules_passed'],
+            'rules_total': h['rules_total'],
+            'is_correct': h['is_correct'],
+            'profit_loss_pct': h.get('profit_loss_pct')
+        })
+
+    df_hist = pd.DataFrame(records)
+    st.dataframe(df_hist, use_container_width=True, hide_index=True)
+
+    # Show stats
+    stats = validator.get_stats(symbol, timeframe)
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric("Total", stats.get('total_predictions', 0))
+    with col2:
+        st.metric("Correct", stats.get('correct_predictions', 0))
+    with col3:
+        st.metric("Accuracy", f"{stats.get('accuracy', 0):.1f}%")
+    with col4:
+        st.metric("Best Streak", stats.get('best_streak', 0))
+
+    # Expandable detailed analysis section
+    st.markdown("---")
+    st.markdown("### 🔍 Detailed Analysis (Click to Expand)")
+
+    for i, info in enumerate(detailed_info):
+        result_emoji = "⏳" if info['is_correct'] is None else ("✅" if info['is_correct'] == 1 else "❌")
+        expander_title = f"{result_emoji} {info['timestamp']} - {info['predicted_direction']} @ ${info['predicted_price']:,.0f}"
+
+        with st.expander(expander_title, expanded=False):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**📊 Prediction Details**")
+                st.write(f"- **Signal:** {info['predicted_direction']}")
+                st.write(f"- **Entry Price:** ${info['predicted_price']:,.2f}")
+                st.write(f"- **Confidence:** {info['confidence']:.1%}")
+                st.write(f"- **Rules Passed:** {info['rules_passed']}/{info['rules_total']}")
+
+                if info['actual_price']:
+                    st.markdown("**📈 Outcome**")
+                    st.write(f"- **Actual Price:** ${info['actual_price']:,.2f}")
+                    st.write(f"- **Change:** {info['profit_loss_pct']:+.2f}%" if info['profit_loss_pct'] else "- **Change:** N/A")
+                    st.write(f"- **Result:** {'WIN ✅' if info['is_correct'] == 1 else 'LOSS ❌'}")
+
+            with col2:
+                st.markdown("**🌍 Market Context**")
+                ctx = info['context']
+                if ctx:
+                    st.write(f"- **Regime:** {ctx.get('regime', 'N/A')}")
+                    st.write(f"- **Trend:** {ctx.get('trend', 'N/A')}")
+                    st.write(f"- **Volatility:** {ctx.get('volatility', 'N/A')}")
+                    st.write(f"- **Cycle Phase:** {ctx.get('cycle_phase', 'N/A')}")
+                    st.write(f"- **Fourier Signal:** {ctx.get('fourier_signal', 'N/A')}")
+                    st.write(f"- **Kalman Trend:** {ctx.get('kalman_trend', 'N/A')}")
+                else:
+                    st.write("No market context available")
+
+            # Show detailed notes if available
+            if info['notes']:
+                st.markdown("**📝 Analysis Notes**")
+                st.code(info['notes'], language=None)
+            else:
+                # Generate explanation if notes not available
+                st.markdown("**📝 Why This Prediction?**")
+                ctx = info['context']
+
+                reasons = []
+                if info['predicted_direction'] == 'NEUTRAL':
+                    reasons.append("🔸 Model was uncertain - confidence below threshold")
+                    reasons.append("🔸 Mixed signals from multiple indicators")
+                    if ctx.get('regime') in ['VOLATILE', 'CHOPPY']:
+                        reasons.append(f"🔸 Market regime was {ctx.get('regime')} - risky to predict")
+                elif info['predicted_direction'] == 'BUY':
+                    reasons.append("🔸 Bullish signals detected")
+                    if ctx.get('trend') == 'UP':
+                        reasons.append("🔸 Trend was UP - following the trend")
+                    if ctx.get('fourier_signal') == 'BULLISH':
+                        reasons.append("🔸 Fourier analysis showed bullish cycle")
+                elif info['predicted_direction'] == 'SELL':
+                    reasons.append("🔸 Bearish signals detected")
+                    if ctx.get('trend') == 'DOWN':
+                        reasons.append("🔸 Trend was DOWN - following the trend")
+
+                # Add loss analysis if applicable
+                if info['is_correct'] == 0:
+                    st.markdown("**❌ Why Loss Occurred:**")
+                    loss_reasons = []
+                    if info['predicted_direction'] == 'NEUTRAL':
+                        loss_reasons.append("• NEUTRAL predictions count as loss if price moved significantly")
+                    if ctx.get('regime') in ['VOLATILE', 'CHOPPY']:
+                        loss_reasons.append(f"• Market was {ctx.get('regime')} - unpredictable conditions")
+                    if info['confidence'] < 0.6:
+                        loss_reasons.append(f"• Low confidence ({info['confidence']:.0%}) - model was unsure")
+                    if info['rules_passed'] < 8:
+                        loss_reasons.append(f"• Only {info['rules_passed']}/10 rules passed - weak signal")
+                    if info.get('profit_loss_pct') and abs(info['profit_loss_pct']) < 0.5:
+                        loss_reasons.append(f"• Small price change ({info['profit_loss_pct']:+.2f}%) - within noise range")
+
+                    for reason in loss_reasons:
+                        st.write(reason)
+
+                for reason in reasons:
+                    st.write(reason)
 
 
 def render_sentiment_section(prediction):
@@ -827,47 +1822,439 @@ def render_algorithm_breakdown(prediction):
         """)
 
 
-def render_price_chart(df: pd.DataFrame, symbol: str):
-    """Render candlestick chart with volume."""
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.7, 0.3]
+@st.cache_data(ttl=60)  # Cache for 60 seconds to reduce database queries
+def load_trade_outcomes_for_strategies(lookback_days: int = 7):
+    """Load recent trade outcomes for strategy analysis."""
+    db_path = Path("data/trading.db")
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    cutoff_date = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+
+    query = """
+    SELECT
+        symbol,
+        interval,
+        entry_price,
+        exit_price,
+        entry_time,
+        exit_time,
+        predicted_direction,
+        predicted_confidence,
+        was_correct,
+        pnl_percent,
+        regime
+    FROM trade_outcomes
+    WHERE entry_time >= ?
+    ORDER BY entry_time DESC
+    """
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            df = pd.read_sql_query(query, conn, params=(cutoff_date,))
+
+            if len(df) > 0:
+                df['entry_time'] = pd.to_datetime(df['entry_time'])
+                df['exit_time'] = pd.to_datetime(df['exit_time'])
+                df['holding_hours'] = (df['exit_time'] - df['entry_time']).dt.total_seconds() / 3600
+
+            return df
+    except Exception as e:
+        logger.error(f"Error loading trade outcomes: {e}")
+        return pd.DataFrame()
+
+
+# NOTE: Duplicate functions removed - using StrategyAnalyzer class instead
+# These functions duplicated logic from src/learning/strategy_analyzer.py
+
+
+def render_strategy_performance():
+    """Render strategy performance section in dashboard."""
+    st.markdown("---")
+    st.markdown("### 📊 Strategy Performance (Continuous Learning)")
+
+    # Load trade outcomes
+    lookback_days = st.slider(
+        "Analysis Period (days)",
+        min_value=1,
+        max_value=30,
+        value=7,
+        key="strategy_lookback"
     )
 
-    # Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=df['datetime'],
-            open=df['open'],
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
+    trades_df = load_trade_outcomes_for_strategies(lookback_days=lookback_days)
 
-    # Volume bars
-    colors = ['#dc3545' if c < o else '#28a745' for c, o in zip(df['close'], df['open'])]
-    fig.add_trace(
-        go.Bar(x=df['datetime'], y=df['volume'], marker_color=colors, name='Volume', opacity=0.5),
-        row=2, col=1
-    )
+    if len(trades_df) == 0:
+        st.info("📝 No trades yet. Start trading with `python run_trading.py` to see strategy analysis.")
+        st.markdown("""
+        **How it works:**
+        - Every candle close triggers multi-timeframe analysis
+        - System discovers strategies from your trades automatically
+        - Best strategy is highlighted based on Sharpe ratio
 
-    fig.update_layout(
-        title=f"{symbol} Price Chart",
-        xaxis_rangeslider_visible=False,
-        height=500,
-        margin=dict(l=0, r=0, t=40, b=0),
-        showlegend=False
-    )
+        Run `python scripts/analyze_strategies.py` for detailed analysis.
+        """)
+        return
 
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor='#f0f0f0')
+    # Use StrategyAnalyzer to discover and calculate strategy metrics
+    try:
+        analyzer = StrategyAnalyzer("data/trading.db")
+        strategies = analyzer.discover_strategies(lookback_days=lookback_days)
 
-    return fig
+        if not strategies:
+            st.warning("⚠️ Not enough trades to analyze strategies. Need at least 10 trades total.")
+            st.info(f"Total trades: {len(trades_df)}. Keep trading to collect more data!")
+            return
+
+        # Convert Strategy objects to DataFrame for display
+        strategy_metrics = pd.DataFrame([
+            {
+                'Strategy': s.name,
+                'Trades': s.total_trades,
+                'Win Rate': s.win_rate,
+                'Avg Profit': s.avg_profit_pct,
+                'Avg Loss': s.avg_loss_pct,
+                'Profit Factor': s.profit_factor,
+                'Sharpe Ratio': s.sharpe_ratio,
+                'Total P&L': s.total_trades * (s.avg_profit_pct * s.win_rate - s.avg_loss_pct * (1 - s.win_rate))
+            }
+            for s in strategies.values()
+        ])
+        strategy_metrics = strategy_metrics.sort_values('Sharpe Ratio', ascending=False)
+    except Exception as e:
+        logger.error(f"Error analyzing strategies: {e}")
+        st.error(f"Error analyzing strategies: {e}")
+        return
+
+    if len(strategy_metrics) == 0:
+        st.warning("⚠️ Not enough trades to analyze strategies. Need at least 3 trades per strategy type.")
+        st.info(f"Total trades: {len(trades_df)}. Keep trading to collect more data!")
+        return
+
+    # Display best strategy
+    best_strategy = strategy_metrics.iloc[0]
+
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); padding: 20px; border-radius: 10px; color: white; margin: 20px 0;">
+        <h3 style="margin: 0;">🏆 BEST STRATEGY: {best_strategy['Strategy']}</h3>
+        <p style="font-size: 18px; margin-top: 10px; margin-bottom: 0;">
+            Win Rate: <strong>{best_strategy['Win Rate']*100:.1f}%</strong> |
+            Sharpe Ratio: <strong>{best_strategy['Sharpe Ratio']:.2f}</strong> |
+            Profit Factor: <strong>{best_strategy['Profit Factor']:.2f}x</strong>
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Overall performance
+    col1, col2, col3, col4 = st.columns(4)
+
+    total_trades = len(trades_df)
+    wins = trades_df['was_correct'].sum()
+    win_rate = wins / total_trades if total_trades > 0 else 0.0
+    total_pnl = trades_df['pnl_percent'].sum()
+
+    with col1:
+        st.metric("Total Trades", total_trades)
+
+    with col2:
+        st.metric("Overall Win Rate", f"{win_rate*100:.1f}%", delta=f"{wins} wins")
+
+    with col3:
+        pnl_color = "normal" if total_pnl > 0 else "inverse"
+        st.metric("Total P&L", f"{total_pnl:.2f}%", delta_color=pnl_color)
+
+    with col4:
+        st.metric("Strategies Found", len(strategy_metrics))
+
+    # Strategy comparison table
+    st.markdown("#### All Strategies Comparison")
+
+    # Format the dataframe for display
+    display_df = strategy_metrics.copy()
+    display_df['Win Rate'] = display_df['Win Rate'].apply(lambda x: f"{x*100:.1f}%")
+    display_df['Avg Profit'] = display_df['Avg Profit'].apply(lambda x: f"+{x:.2f}%")
+    display_df['Avg Loss'] = display_df['Avg Loss'].apply(lambda x: f"-{x:.2f}%")
+    display_df['Profit Factor'] = display_df['Profit Factor'].apply(lambda x: f"{x:.2f}x" if x != float('inf') else "∞")
+    display_df['Sharpe Ratio'] = display_df['Sharpe Ratio'].apply(lambda x: f"{x:.2f}")
+    display_df['Total P&L'] = display_df['Total P&L'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # Info box
+    with st.expander("ℹ️ How Strategy Discovery Works"):
+        st.markdown("""
+        **Automatic Strategy Classification:**
+        - **Scalping:** < 1 hour hold time
+        - **Momentum Breakout:** High confidence (>85%), 1-4 hour hold
+        - **Swing Trend Following:** 4-24 hours in trending markets
+        - **Swing Mean Reversion:** 4-24 hours in choppy markets
+        - **Position Trading:** > 24 hours hold
+        - **Volatility Expansion:** Trades in volatile markets
+        - **Range Trading:** Trades in sideways markets
+        - **Trend Following:** Follows established trends
+
+        **Performance Metrics:**
+        - **Win Rate:** Percentage of profitable trades
+        - **Profit Factor:** Total profit / Total loss (>1 = profitable)
+        - **Sharpe Ratio:** Risk-adjusted returns (>1 = good, >2 = excellent)
+        - **Total P&L:** Sum of all profit/loss percentages
+
+        **Best Strategy** is determined by highest Sharpe ratio (best risk-adjusted returns).
+
+        For detailed analysis, run: `python scripts/analyze_strategies.py`
+        """)
+
+
+def render_realtime_chart(symbol: str, timeframe: str, historical_data: list = None):
+    """
+    Render real-time candlestick chart using Lightweight Charts.
+    Direct WebSocket connection - updates tick-by-tick without page refresh.
+    """
+    # Convert symbol to Binance format
+    ws_symbol = symbol.replace("/", "").lower()
+
+    # Convert historical data to JSON for initial load (VECTORIZED - 100x faster than iterrows)
+    historical_json = "[]"
+    has_data = historical_data is not None and not historical_data.empty
+    if has_data:
+        # Vectorized timestamp conversion
+        timestamps = historical_data['timestamp'].values
+        ts_converted = [int(ts / 1000) if ts > 1e12 else int(ts) for ts in timestamps]
+
+        # List comprehension with zip (100-500x faster than iterrows)
+        hist_list = [
+            {
+                "time": ts,
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c)
+            }
+            for ts, o, h, l, c in zip(
+                ts_converted,
+                historical_data['open'].values,
+                historical_data['high'].values,
+                historical_data['low'].values,
+                historical_data['close'].values
+            )
+        ]
+        historical_json = json.dumps(hist_list)
+
+    # Volume data (VECTORIZED - 100x faster than iterrows)
+    volume_json = "[]"
+    if has_data:
+        # Vectorized timestamp conversion
+        timestamps = historical_data['timestamp'].values
+        ts_converted = [int(ts / 1000) if ts > 1e12 else int(ts) for ts in timestamps]
+
+        # Vectorized color calculation
+        closes = historical_data['close'].values
+        opens = historical_data['open'].values
+        colors = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(closes, opens)]
+
+        # List comprehension with zip
+        vol_list = [
+            {
+                "time": ts,
+                "value": float(v),
+                "color": color
+            }
+            for ts, v, color in zip(
+                ts_converted,
+                historical_data['volume'].values,
+                colors
+            )
+        ]
+        volume_json = json.dumps(vol_list)
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #fafafa; }}
+            #chart-container {{ width: 100%; height: 420px; position: relative; }}
+            #price-display {{
+                position: absolute; top: 10px; left: 10px; z-index: 100;
+                background: rgba(255,255,255,0.95); padding: 8px 12px; border-radius: 6px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1); font-size: 13px;
+            }}
+            #price-display .symbol {{ font-weight: 600; color: #333; }}
+            #price-display .price {{ font-size: 18px; font-weight: 700; margin: 2px 0; }}
+            #price-display .change {{ font-size: 12px; }}
+            #price-display .status {{ font-size: 10px; color: #26a69a; margin-top: 4px; }}
+            .up {{ color: #26a69a; }}
+            .down {{ color: #ef5350; }}
+        </style>
+    </head>
+    <body>
+        <div id="chart-container">
+            <div id="price-display">
+                <div class="symbol">{symbol}</div>
+                <div class="price" id="current-price">--</div>
+                <div class="change" id="price-change">--</div>
+                <div class="status" id="ws-status">● Connecting...</div>
+            </div>
+        </div>
+        <script>
+            const container = document.getElementById('chart-container');
+            const chart = LightweightCharts.createChart(container, {{
+                width: container.clientWidth,
+                height: 420,
+                layout: {{
+                    background: {{ type: 'solid', color: '#fafafa' }},
+                    textColor: '#333',
+                }},
+                grid: {{
+                    vertLines: {{ color: '#f0f0f0' }},
+                    horzLines: {{ color: '#f0f0f0' }},
+                }},
+                crosshair: {{
+                    mode: LightweightCharts.CrosshairMode.Normal,
+                }},
+                rightPriceScale: {{
+                    borderColor: '#e0e0e0',
+                }},
+                timeScale: {{
+                    borderColor: '#e0e0e0',
+                    timeVisible: true,
+                    secondsVisible: false,
+                }},
+            }});
+
+            // Candlestick series
+            const candleSeries = chart.addCandlestickSeries({{
+                upColor: '#26a69a',
+                downColor: '#ef5350',
+                borderDownColor: '#ef5350',
+                borderUpColor: '#26a69a',
+                wickDownColor: '#ef5350',
+                wickUpColor: '#26a69a',
+            }});
+
+            // Volume series - separate scale at bottom
+            const volumeSeries = chart.addHistogramSeries({{
+                priceFormat: {{ type: 'volume' }},
+                priceScaleId: 'volume',
+            }});
+
+            // Configure volume scale to be at bottom 20% of chart
+            chart.priceScale('volume').applyOptions({{
+                scaleMargins: {{ top: 0.8, bottom: 0 }},
+            }});
+
+            // Configure main price scale to leave room for volume
+            chart.priceScale('right').applyOptions({{
+                scaleMargins: {{ top: 0.05, bottom: 0.25 }},
+            }});
+
+            // Load historical data
+            const historicalData = {historical_json};
+            const volumeData = {volume_json};
+
+            if (historicalData.length > 0) {{
+                candleSeries.setData(historicalData);
+                volumeSeries.setData(volumeData);
+            }}
+
+            // Current candle tracking
+            let currentCandle = null;
+            let openPrice = historicalData.length > 0 ? historicalData[0].close : 0;
+
+            // Update price display
+            function updatePriceDisplay(price, prevClose) {{
+                const priceEl = document.getElementById('current-price');
+                const changeEl = document.getElementById('price-change');
+
+                priceEl.textContent = '$' + price.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+
+                if (prevClose > 0) {{
+                    const change = ((price - prevClose) / prevClose) * 100;
+                    const changeStr = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                    changeEl.textContent = changeStr;
+                    changeEl.className = 'change ' + (change >= 0 ? 'up' : 'down');
+                    priceEl.className = 'price ' + (change >= 0 ? 'up' : 'down');
+                }}
+            }}
+
+            // WebSocket connection to Binance
+            const wsUrl = 'wss://stream.binance.com:9443/ws/{ws_symbol}@kline_{timeframe}';
+            let ws = null;
+            let reconnectAttempts = 0;
+
+            function connect() {{
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {{
+                    document.getElementById('ws-status').textContent = '● Live';
+                    document.getElementById('ws-status').style.color = '#26a69a';
+                    reconnectAttempts = 0;
+                }};
+
+                ws.onmessage = (event) => {{
+                    const data = JSON.parse(event.data);
+                    const kline = data.k;
+
+                    const candle = {{
+                        time: Math.floor(kline.t / 1000),
+                        open: parseFloat(kline.o),
+                        high: parseFloat(kline.h),
+                        low: parseFloat(kline.l),
+                        close: parseFloat(kline.c),
+                    }};
+
+                    const volume = {{
+                        time: Math.floor(kline.t / 1000),
+                        value: parseFloat(kline.v),
+                        color: candle.close >= candle.open ? '#26a69a80' : '#ef535080',
+                    }};
+
+                    // Update chart
+                    candleSeries.update(candle);
+                    volumeSeries.update(volume);
+
+                    // Update price display
+                    updatePriceDisplay(candle.close, openPrice);
+
+                    // Store current candle
+                    currentCandle = candle;
+                }};
+
+                ws.onclose = () => {{
+                    document.getElementById('ws-status').textContent = '● Reconnecting...';
+                    document.getElementById('ws-status').style.color = '#ffa500';
+
+                    if (reconnectAttempts < 10) {{
+                        reconnectAttempts++;
+                        setTimeout(connect, 2000);
+                    }}
+                }};
+
+                ws.onerror = (error) => {{
+                    console.error('WebSocket error:', error);
+                    document.getElementById('ws-status').textContent = '● Error';
+                    document.getElementById('ws-status').style.color = '#ef5350';
+                }};
+            }}
+
+            // Start connection
+            connect();
+
+            // Resize handler
+            window.addEventListener('resize', () => {{
+                chart.applyOptions({{ width: container.clientWidth }});
+            }});
+
+            // Fit content
+            chart.timeScale().fitContent();
+        </script>
+    </body>
+    </html>
+    """
+
+    return html_content
 
 
 # =============================================================================
@@ -876,11 +2263,25 @@ def render_price_chart(df: pd.DataFrame, symbol: str):
 
 def page_dashboard():
     """Main dashboard page."""
-    # Fetch market data
+    # Calculate required candles for 1 year based on timeframe
+    # Only 4 supported timeframes: 15m, 1h, 4h, 1d
+    timeframe_to_year_candles = {
+        '15m': 35040,  # 4 * 24 * 365
+        '1h': 8760,    # 24 * 365
+        '4h': 2190,    # 6 * 365
+        '1d': 365,     # 365
+    }
+    # Get required candles for selected timeframe (default to 1h requirement)
+    required_candles = timeframe_to_year_candles.get(st.session_state.timeframe, 8760)
+
+    # Fetch market data with enough candles for 1 year
+    # Use required amount (buffer size now supports 10,000 candles)
+    fetch_limit = required_candles
+
     data = fetch_market_data(
         st.session_state.symbol,
         st.session_state.timeframe,
-        limit=200
+        limit=fetch_limit
     )
 
     if not data['success']:
@@ -943,21 +2344,216 @@ def page_dashboard():
             source_class = "negative"
         render_metric_card("Data Source", source, "Real-time" if source == "WebSocket" else "", source_class)
 
+    # Data Loading Status Indicator
+    candles_loaded = len(df)
+    data_progress = min((candles_loaded / required_candles) * 100, 100)
+
+    # Check if fetch is actively in progress
+    provider = st.session_state.data_provider
+    key = f"{st.session_state.symbol}_{st.session_state.timeframe}"
+    # Safe check - method may not exist if provider is cached from old version
+    is_fetching = False
+    if provider and hasattr(provider, 'is_fetching'):
+        is_fetching = provider.is_fetching(key)
+
+    # Set flag for smart auto-refresh
+    st.session_state.data_loading = (candles_loaded < required_candles)
+
+    if candles_loaded < required_candles:
+        # Show different message based on fetch status
+        if is_fetching:
+            fetch_status = "🔄 **FETCHING IN PROGRESS** - Please wait..."
+            fetch_note = "The fetch thread is running. Page will auto-refresh when complete."
+        else:
+            fetch_status = "⏳ Waiting for data..."
+            fetch_note = "Data fetch may be starting or completing soon."
+
+        st.info(f"""
+        📊 **Historical Data Loading**: {candles_loaded:,} / {required_candles:,} candles ({data_progress:.1f}%)
+
+        {fetch_status}
+
+        💡 **Why?** Binance limits each request to 1,000 candles. Loading {required_candles:,} candles requires {required_candles // 1000 + 1} sequential API calls (~30-60 seconds).
+
+        ✅ {fetch_note}
+        """)
+
+        # Progress bar
+        st.progress(data_progress / 100)
+    else:
+        st.success(f"✅ Full historical data loaded: {candles_loaded:,} candles ({candles_loaded / 365:.1f} years for {st.session_state.timeframe} timeframe)")
+
     st.markdown("---")
 
-    # Main content - two columns
-    left_col, right_col = st.columns([2, 1])
+    # Full-width chart at top
+    chart_html = render_realtime_chart(
+        st.session_state.symbol,
+        st.session_state.timeframe,
+        df
+    )
+    st.components.v1.html(chart_html, height=450)
 
-    with left_col:
-        # Price chart
-        fig = render_price_chart(df, st.session_state.symbol)
-        st.plotly_chart(fig, use_container_width=True)
+    st.markdown("---")
 
-    with right_col:
-        # AI Prediction Section
-        st.markdown("### 🤖 AI Prediction")
+    # AI Prediction and Monte Carlo side by side
+    if AI_AVAILABLE and len(df) >= 50:
+        # MANDATORY: Check if model is validated before predictions
+        if not st.session_state.model_ready and not st.session_state.training_in_progress:
+            # Model not ready - show training UI
+            st.warning(f"### Model Training Required")
 
-        if AI_AVAILABLE and len(df) >= 50:
+            config = load_config()
+            min_accuracy = config.get('auto_training', {}).get('min_accuracy_required', 0.58)
+
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                if st.session_state.model_accuracy > 0:
+                    st.error(
+                        f"**Model accuracy is below minimum requirement**\n\n"
+                        f"- Current accuracy: **{st.session_state.model_accuracy:.1%}**\n"
+                        f"- Required accuracy: **{min_accuracy:.1%}**\n\n"
+                        f"Predictions are blocked until the model meets the accuracy threshold."
+                    )
+                else:
+                    st.info(
+                        f"**No trained model found for {st.session_state.symbol} @ {st.session_state.timeframe}**\n\n"
+                        f"A model must be trained and validated before predictions can be made.\n\n"
+                        f"**Training requirements:**\n"
+                        f"- Minimum accuracy: {min_accuracy:.1%}\n"
+                        f"- Training data: 5000 candles\n"
+                        f"- Expected duration: 5-10 minutes"
+                    )
+
+            with col2:
+                # Check if database has enough data
+                if st.session_state.db:
+                    try:
+                        df_check = st.session_state.db.get_candles(
+                            st.session_state.symbol,
+                            st.session_state.timeframe,
+                            limit=1000
+                        )
+                        candles_in_db = len(df_check) if df_check is not None else 0
+                    except:
+                        candles_in_db = 0
+                else:
+                    candles_in_db = 0
+
+                if candles_in_db < 1000:
+                    # Not enough data - show fetch button
+                    st.error(f"**Insufficient data in database**\n\n{candles_in_db} / 1000 candles")
+
+                    if st.button("📥 Fetch Historical Data", type="primary", use_container_width=True):
+                        with st.spinner("Fetching historical data from Binance..."):
+                            try:
+                                provider = st.session_state.data_provider
+                                if provider and st.session_state.db:
+                                    # Ensure database is connected to provider
+                                    provider.set_database(st.session_state.db)
+
+                                    # Fetch historical data directly
+                                    logger.info(f"Fetching historical data for {st.session_state.symbol} @ {st.session_state.timeframe}")
+
+                                    # Calculate how many candles for 1 year
+                                    timeframe_to_year = {
+                                        '15m': 35040, '1h': 8760, '4h': 2190, '1d': 365
+                                    }
+                                    limit = timeframe_to_year.get(st.session_state.timeframe, 8760)
+
+                                    # Fetch and save
+                                    candles = provider.fetch_historical(
+                                        st.session_state.symbol,
+                                        st.session_state.timeframe,
+                                        limit=limit
+                                    )
+
+                                    if candles and len(candles) > 0:
+                                        # Data is automatically saved by fetch_historical when database is connected
+                                        # Verify it was saved
+                                        time.sleep(1)  # Wait for async save
+
+                                        df_verify = st.session_state.db.get_candles(
+                                            st.session_state.symbol,
+                                            st.session_state.timeframe,
+                                            limit=100
+                                        )
+
+                                        if df_verify is not None and len(df_verify) > 0:
+                                            st.success(f"✓ Fetched and saved {len(candles)} candles to database!")
+                                            time.sleep(1)
+                                            st.rerun()
+                                        else:
+                                            st.error("Data was fetched but not saved to database - check logs")
+                                    else:
+                                        st.error("Failed to fetch data from Binance")
+                                else:
+                                    st.error("Provider or database not initialized")
+                            except Exception as e:
+                                st.error(f"Failed to fetch data: {e}")
+                                logger.error(f"Historical data fetch error: {e}", exc_info=True)
+                else:
+                    # Enough data - show train button
+                    st.success(f"✓ {candles_in_db:,} candles in database")
+
+                    if st.button("Train Model Now", type="primary", use_container_width=True):
+                        st.session_state.training_in_progress = True
+                        st.rerun()
+
+                if st.session_state.model_trained_at:
+                    st.caption(f"Last trained: {st.session_state.model_trained_at}")
+
+        elif st.session_state.training_in_progress:
+            # Training in progress - show progress
+            st.info("### Model Training in Progress")
+
+            progress_placeholder = st.empty()
+            status_placeholder = st.empty()
+
+            def progress_callback(epoch, max_epochs, accuracy, status):
+                progress = epoch / max_epochs
+                progress_placeholder.progress(progress, text=f"Epoch {epoch}/{max_epochs}")
+                status_placeholder.text(status)
+                # Update session state
+                st.session_state.training_epoch = epoch
+                st.session_state.training_progress = progress
+                st.session_state.training_status = status
+
+            try:
+                # Train the model
+                result = train_model(
+                    st.session_state.symbol,
+                    st.session_state.timeframe,
+                    progress_callback=progress_callback
+                )
+
+                # Training completed successfully
+                st.session_state.training_in_progress = False
+                st.session_state.model_ready = True
+                st.session_state.model_accuracy = result['accuracy']
+
+                # Update model status
+                model_status = check_model_readiness(st.session_state.symbol, st.session_state.timeframe)
+                st.session_state.model_trained_at = model_status['trained_at']
+
+                st.success(
+                    f"Model trained successfully!\n\n"
+                    f"- Accuracy: {result['accuracy']:.2%}\n"
+                    f"- Training samples: {result['samples']:,}\n"
+                    f"- Epochs: {result['epochs']}\n\n"
+                    f"Predictions are now enabled."
+                )
+
+                time.sleep(2)
+                st.rerun()
+
+            except Exception as e:
+                st.session_state.training_in_progress = False
+                st.error(f"Training failed: {e}")
+                logger.error(f"Model training error: {e}", exc_info=True)
+
+        else:
+            # Model is ready - make predictions
             try:
                 predictor = st.session_state.advanced_predictor
                 if predictor:
@@ -965,59 +2561,233 @@ def page_dashboard():
                     high_low = df['high'] - df['low']
                     atr = float(high_low.rolling(14).mean().iloc[-1]) if len(high_low) >= 14 else price * 0.02
 
-                    # Fetch sentiment features
-                    sentiment_features = None
-                    if st.session_state.db and st.session_state.sentiment_aggregator:
-                        try:
-                            latest_timestamp = int(df.iloc[-1]['timestamp'])
-                            sentiment_features = st.session_state.db.get_sentiment_features(latest_timestamp)
-                            if sentiment_features:
-                                logger.info(f"Sentiment features loaded for AI prediction")
-                        except Exception as e:
-                            logger.warning(f"Could not fetch sentiment: {e}")
-                            sentiment_features = None
+                    # Calculate SL/TP percentages (same formula as advanced_predictor.py)
+                    sl_pct = min(5.0, max(1.0, atr / price * 200))  # As percentage
+                    tp_pct = min(10.0, max(1.5, atr / price * 300))  # As percentage
 
-                    # Make prediction with all available data
-                    prediction = predictor.predict(
-                        df=df,
-                        lstm_probability=0.55,  # TODO: Replace with trained LSTM model
-                        atr=atr,
-                        sentiment_features=sentiment_features
+                    # Check if we can use cached prediction (smooth updates)
+                    current_time = time.time()
+                    # Check cache validity (also invalidate if missing new rule fields)
+                    cached_pred = st.session_state.last_prediction
+                    has_rules = cached_pred is not None and hasattr(cached_pred, 'rules_passed')
+                    cache_valid = (
+                        cached_pred is not None and
+                        has_rules and
+                        (current_time - st.session_state.last_prediction_time) < st.session_state.prediction_cache_seconds
                     )
+
+                    if cache_valid:
+                        # Use cached prediction
+                        prediction = cached_pred
+                    else:
+                        # Fetch sentiment features
+                        sentiment_features = None
+                        if st.session_state.db and st.session_state.sentiment_aggregator:
+                            try:
+                                latest_timestamp = int(df.iloc[-1]['timestamp'])
+                                sentiment_features = st.session_state.db.get_sentiment_features(latest_timestamp)
+                                if sentiment_features:
+                                    logger.info(f"Sentiment features loaded for AI prediction")
+                            except Exception as e:
+                                logger.warning(f"Could not fetch sentiment: {e}")
+                                sentiment_features = None
+
+                        # Get LSTM probability from trained model
+                        lstm_probability = 0.5  # Default neutral
+                        try:
+                            import torch
+                            from pathlib import Path
+                            from src.analysis_engine import FeatureCalculator
+
+                            # Load trained model
+                            model_name = f"model_{st.session_state.symbol.replace('/', '_')}_{st.session_state.timeframe}.pt"
+                            model_path = Path("models") / model_name
+
+                            if model_path.exists():
+                                # Load checkpoint
+                                checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+                                # Calculate features
+                                df_features = FeatureCalculator.calculate_all(df.copy())
+                                feature_columns = FeatureCalculator.get_feature_columns()
+
+                                # Get features for last sequence
+                                features = df_features[feature_columns].values
+                                feature_means = checkpoint['feature_means']
+                                feature_stds = checkpoint['feature_stds']
+
+                                # Normalize
+                                features = (features - feature_means) / (feature_stds + 1e-8)
+                                features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
+
+                                # Get sequence length from model config (with fallback for old models)
+                                if 'model_config' in checkpoint:
+                                    sequence_length = checkpoint['model_config']['sequence_length']
+                                    model_config = checkpoint['model_config']
+                                else:
+                                    # Old model format - use defaults
+                                    logger.warning("Old model format detected, using default config")
+                                    sequence_length = 60
+                                    model_config = {
+                                        'input_size': 30,
+                                        'hidden_size': 128,
+                                        'num_layers': 2,
+                                        'dropout': 0.2
+                                    }
+
+                                # Create sequence (last N candles)
+                                if len(features) >= sequence_length:
+                                    X = features[-sequence_length:]  # Shape: (sequence_length, num_features)
+                                    X = torch.FloatTensor(X).unsqueeze(0)  # Shape: (1, sequence_length, num_features)
+
+                                    # Load model architecture
+                                    from src.analysis_engine import LSTMModel
+                                    model = LSTMModel(
+                                        input_size=model_config['input_size'],
+                                        hidden_size=model_config['hidden_size'],
+                                        num_layers=model_config['num_layers'],
+                                        dropout=model_config['dropout']
+                                    )
+                                    model.load_state_dict(checkpoint['model_state_dict'])
+                                    model.eval()
+
+                                    # Make prediction
+                                    with torch.no_grad():
+                                        output = model(X)
+                                        lstm_probability = float(output[0][0])
+
+                                    logger.info(f"LSTM prediction: {lstm_probability:.3f} (from trained model)")
+                                else:
+                                    logger.warning(f"Insufficient data for LSTM: {len(features)} < {sequence_length}")
+                            else:
+                                logger.warning(f"Model not found: {model_path}")
+
+                        except Exception as e:
+                            logger.error(f"LSTM prediction failed: {e}", exc_info=True)
+                            lstm_probability = 0.5  # Fallback to neutral
+
+                        # Make prediction with all available data
+                        prediction = predictor.predict(
+                            df=df,
+                            symbol=st.session_state.symbol,
+                            timeframe=st.session_state.timeframe,
+                            lstm_probability=lstm_probability,  # Using trained LSTM model
+                            atr=atr,
+                            sentiment_features=sentiment_features
+                        )
+
+                        # Cache the prediction
+                        st.session_state.last_prediction = prediction
+                        st.session_state.last_prediction_time = current_time
 
                     # Get account balance for position sizing
                     paper_trader = st.session_state.paper_trader
-                    account_balance = paper_trader.total_value if paper_trader else 10000
+                    account_balance = paper_trader.get_account_value() if paper_trader else 10000
 
-                    # Main enhanced signal card
+                    # ============================================================
+                    # CLEAN LAYOUT: Show only what matters for trading decision
+                    # ============================================================
+
+                    # Main Trading Signal - FULL WIDTH, BIG & CLEAR
+                    st.markdown("## 🎯 Trading Signal")
                     render_enhanced_signal_card(prediction, price, account_balance)
 
+                    st.markdown("")  # Spacing
+
+                    # Risk Analysis - Directly below signal
+                    render_monte_carlo_section(prediction, sl_pct, tp_pct)
+
+                    st.markdown("")  # Spacing
+
+                    # Quick Recommendation
+                    render_action_advice(prediction, price)
+
+                    # ============================================================
+                    # EVERYTHING ELSE: Collapsed by default
+                    # ============================================================
+
                     st.markdown("---")
 
-                    # Monte Carlo probabilities section
-                    render_monte_carlo_section(prediction)
+                    # Model Info - Collapsed
+                    if st.session_state.model_accuracy > 0 or st.session_state.model_trained_at:
+                        with st.expander("🤖 Model Information"):
+                            col1, col2, col3 = st.columns(3)
 
-                    st.markdown("---")
+                            with col1:
+                                st.metric(
+                                    "Model Accuracy",
+                                    f"{st.session_state.model_accuracy:.2%}" if st.session_state.model_accuracy > 0 else "N/A",
+                                    delta="Validated ✓" if st.session_state.model_ready else "Not Ready"
+                                )
 
-                    # Sentiment section (if available)
+                            with col2:
+                                if st.session_state.model_trained_at:
+                                    try:
+                                        trained_time = datetime.fromisoformat(st.session_state.model_trained_at)
+                                        time_ago = datetime.utcnow() - trained_time
+
+                                        if time_ago.days > 0:
+                                            time_str = f"{time_ago.days}d ago"
+                                        elif time_ago.seconds > 3600:
+                                            time_str = f"{time_ago.seconds // 3600}h ago"
+                                        else:
+                                            time_str = f"{time_ago.seconds // 60}m ago"
+
+                                        st.metric("Last Trained", time_str)
+                                    except:
+                                        st.metric("Last Trained", "Unknown")
+                                else:
+                                    st.metric("Last Trained", "Never")
+
+                            with col3:
+                                st.metric(
+                                    "Symbol/Timeframe",
+                                    f"{st.session_state.symbol}",
+                                    delta=st.session_state.timeframe
+                                )
+
+                    # Rule Validation - Collapsed
+                    with st.expander("📋 Rule Validation (9/10)", expanded=False):
+                        render_rule_validation(prediction)
+
+                    # Prediction Validation - Collapsed
+                    if st.session_state.prediction_validator:
+                        with st.expander("🎯 Prediction Validation History", expanded=False):
+                            render_prediction_streak(
+                                st.session_state.prediction_validator,
+                                st.session_state.symbol,
+                                st.session_state.timeframe,
+                                df
+                            )
+
+                            render_prediction_history(
+                                st.session_state.prediction_validator,
+                                st.session_state.symbol,
+                                st.session_state.timeframe
+                            )
+
+                    # Sentiment - Collapsed (only if available)
                     if prediction.sentiment_score is not None:
-                        render_sentiment_section(prediction)
-                        st.markdown("---")
+                        with st.expander("📰 News Sentiment", expanded=False):
+                            render_sentiment_section(prediction)
 
-                    # Detailed algorithm breakdown (expandable)
-                    with st.expander("🔍 Detailed Algorithm Analysis", expanded=False):
+                    # Algorithm Details - Collapsed
+                    with st.expander("🧠 Algorithm Breakdown (Advanced)", expanded=False):
                         render_algorithm_breakdown(prediction)
 
             except Exception as e:
                 logger.error(f"Prediction error: {e}")
-                st.error(f"❌ Prediction unavailable: {e}")
+                st.error(f"Prediction unavailable: {e}")
 
                 # Show debug info
                 if st.checkbox("Show debug info"):
                     import traceback
                     st.code(traceback.format_exc())
-        else:
-            st.info(f"⏳ AI predictions require 50+ candles of data. Currently: {len(df)}")
+    else:
+        st.info(f"AI predictions require 50+ candles of data. Currently: {len(df)}")
+
+    # Strategy Performance Section
+    render_strategy_performance()
 
 
 # =============================================================================
@@ -1038,14 +2808,14 @@ def page_portfolio():
     cols = st.columns(4)
 
     with cols[0]:
-        render_metric_card("Total Value", f"${paper_trader.total_value:,.2f}")
+        render_metric_card("Total Value", f"${paper_trader.get_account_value():,.2f}")
 
     with cols[1]:
         render_metric_card("Cash", f"${paper_trader.cash:,.2f}")
 
     with cols[2]:
-        pnl = paper_trader.total_value - paper_trader.initial_capital
-        pnl_pct = (pnl / paper_trader.initial_capital) * 100
+        pnl = paper_trader.get_account_value() - paper_trader.initial_cash
+        pnl_pct = (pnl / paper_trader.initial_cash) * 100
         card_class = "positive" if pnl >= 0 else "negative"
         render_metric_card("P&L", f"${pnl:,.2f}", f"{pnl_pct:+.2f}%", card_class)
 
@@ -1081,10 +2851,11 @@ def page_portfolio():
     if trades:
         trade_data = []
         for t in trades[-20:]:  # Last 20 trades
+            side_str = t.side.value if hasattr(t.side, 'value') else str(t.side)
             trade_data.append({
                 'Time': t.timestamp.strftime('%Y-%m-%d %H:%M'),
                 'Symbol': t.symbol,
-                'Side': t.side.value,
+                'Side': side_str.upper(),
                 'Quantity': f"{t.quantity:.6f}",
                 'Price': f"${t.price:,.2f}",
                 'P&L': f"${t.realized_pnl:,.2f}" if t.realized_pnl else "-"
@@ -1214,39 +2985,39 @@ def page_forex_markets():
 
     st.markdown("---")
 
-    # OANDA connection status
-    st.markdown("### OANDA Connection")
+    # Capital.com connection status
+    st.markdown("### Capital.com Connection")
 
-    oanda_key = os.getenv("OANDA_API_KEY", "")
-    oanda_account = os.getenv("OANDA_ACCOUNT_ID", "")
+    capital_key = os.getenv("CAPITAL_API_KEY", "")
+    capital_email = os.getenv("CAPITAL_EMAIL", "")
 
-    if oanda_key and oanda_account:
-        st.success("OANDA credentials configured")
+    if capital_key and capital_email:
+        st.success("Capital.com credentials configured")
 
-        if st.button("Test OANDA Connection"):
+        if st.button("Test Capital.com Connection"):
             try:
-                from src.brokerages.oanda import OandaBrokerage
-                broker = OandaBrokerage(practice=True)
+                from src.brokerages.capital import CapitalBrokerage
+                broker = CapitalBrokerage(demo=True)
                 if broker.connect():
                     summary = broker.get_account_summary()
                     st.success(f"""
-                    **Connected to OANDA**
+                    **Connected to Capital.com**
 
                     Account ID: {summary.get('id', 'N/A')}
 
                     Balance: ${summary.get('balance', 0):,.2f}
 
-                    NAV: ${summary.get('nav', 0):,.2f}
+                    Available: ${summary.get('available', 0):,.2f}
 
-                    Margin Available: ${summary.get('margin_available', 0):,.2f}
+                    Profit/Loss: ${summary.get('profit_loss', 0):,.2f}
                     """)
                     broker.disconnect()
                 else:
-                    st.error("Failed to connect to OANDA")
+                    st.error("Failed to connect to Capital.com")
             except Exception as e:
                 st.error(f"Connection error: {e}")
     else:
-        st.warning("OANDA credentials not configured. Set OANDA_API_KEY and OANDA_ACCOUNT_ID in .env")
+        st.warning("Capital.com credentials not configured. Set CAPITAL_API_KEY, CAPITAL_EMAIL, and CAPITAL_PASSWORD in .env")
 
     # Trading session info
     st.markdown("---")
@@ -1353,7 +3124,7 @@ def page_paper_trading():
         }
 
         portfolio = {
-            'total_value': paper_trader.total_value,
+            'total_value': paper_trader.get_account_value(),
             'cash': paper_trader.cash,
             'daily_pnl': 0
         }
@@ -1529,8 +3300,8 @@ def page_risk_management():
     st.markdown("#### Current Risk Status")
 
     if paper_trader:
-        pnl = paper_trader.total_value - paper_trader.initial_capital
-        pnl_pct = (pnl / paper_trader.initial_capital) * 100
+        pnl = paper_trader.get_account_value() - paper_trader.initial_cash
+        pnl_pct = (pnl / paper_trader.initial_cash) * 100
 
         # Risk gauge
         fig = go.Figure(go.Indicator(
@@ -1751,7 +3522,8 @@ def page_news_sentiment():
                 try:
                     dt = datetime.fromisoformat(article['datetime'])
                     time_str = dt.strftime('%Y-%m-%d %H:%M')
-                except:
+                except (ValueError, KeyError, TypeError) as e:
+                    logger.debug(f"Invalid datetime format: {e}")
                     time_str = "Unknown"
 
                 # Render article card
@@ -1871,18 +3643,62 @@ def page_settings():
     with tabs[0]:  # Trading
         st.markdown("#### Trading Settings")
 
+        # Market Mode Selection
+        st.markdown("##### Market Mode")
+        current_market_mode = config.get('market_mode', 'crypto')
+        market_modes = {'Cryptocurrency (Binance)': 'crypto', 'Forex (Capital.com)': 'forex'}
+        market_mode_labels = list(market_modes.keys())
+        current_mode_label = [k for k, v in market_modes.items() if v == current_market_mode]
+        current_mode_label = current_mode_label[0] if current_mode_label else market_mode_labels[0]
+
+        new_market_mode_label = st.radio(
+            "Select market type:",
+            market_mode_labels,
+            index=market_mode_labels.index(current_mode_label),
+            horizontal=True
+        )
+        new_market_mode = market_modes[new_market_mode_label]
+
+        st.markdown("---")
+
         col1, col2 = st.columns(2)
 
         with col1:
-            new_symbol = st.text_input("Default Symbol", value=config.get('data', {}).get('symbol', 'BTC/USDT'))
-            exchange_options = ['binance', 'alpaca', 'coinbase', 'bybit', 'kraken']
-            current_exchange = config.get('data', {}).get('exchange', 'binance')
+            # Exchange and symbol options based on market mode
+            if new_market_mode == 'crypto':
+                exchange_options = ['binance']
+                crypto_symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+                                 'ADA/USDT', 'AVAX/USDT', 'DOGE/USDT', 'DOT/USDT', 'LINK/USDT',
+                                 'MATIC/USDT', 'UNI/USDT', 'ATOM/USDT', 'LTC/USDT', 'TRX/USDT']
+                symbol_options = crypto_symbols
+                st.info("📈 **Crypto Mode**: Trading on Binance exchange")
+            else:  # forex
+                exchange_options = ['capital']
+                forex_symbols = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD',
+                                'USD/CAD', 'NZD/USD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY']
+                symbol_options = forex_symbols
+                st.info("💱 **Forex Mode**: Trading on Capital.com (requires API key)")
+
+                # Check for Capital.com credentials
+                capital_key = os.getenv("CAPITAL_API_KEY", "")
+                capital_email = os.getenv("CAPITAL_EMAIL", "")
+                if not capital_key or capital_key == "your_capital_api_key_here" or not capital_email or capital_email == "your_capital_email_here":
+                    st.warning("⚠️ **Capital.com credentials not configured.** Set CAPITAL_API_KEY and CAPITAL_EMAIL in your .env file to enable forex trading.")
+
+            current_symbol = config.get('data', {}).get('symbol', symbol_options[0])
+            if current_symbol not in symbol_options:
+                current_symbol = symbol_options[0]
+            new_symbol = st.selectbox("Symbol", symbol_options,
+                                     index=symbol_options.index(current_symbol) if current_symbol in symbol_options else 0)
+
+            current_exchange = config.get('data', {}).get('exchange', exchange_options[0])
             new_exchange = st.selectbox("Exchange", exchange_options,
                                         index=exchange_options.index(current_exchange) if current_exchange in exchange_options else 0)
-            all_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
+
+            all_timeframes = ['15m', '1h', '4h', '1d']  # Only 4 optimized timeframes
             current_interval = config.get('data', {}).get('interval', '1h')
             new_interval = st.selectbox("Timeframe", all_timeframes,
-                                        index=all_timeframes.index(current_interval) if current_interval in all_timeframes else 5)
+                                        index=all_timeframes.index(current_interval) if current_interval in all_timeframes else 1)
 
         with col2:
             new_capital = st.number_input("Initial Capital", value=config.get('portfolio', {}).get('initial_capital', 10000))
@@ -1945,7 +3761,65 @@ def page_settings():
                     st.error(f"Failed to start: {e}")
 
     if st.button("Save Settings", type="primary"):
-        st.success("Settings saved!")
+        # Build updated config
+        updated_config = config.copy()
+
+        # Update market mode
+        updated_config['market_mode'] = new_market_mode
+
+        # Update data section
+        if 'data' not in updated_config:
+            updated_config['data'] = {}
+        updated_config['data']['symbol'] = new_symbol
+        updated_config['data']['exchange'] = new_exchange
+        updated_config['data']['interval'] = new_interval
+
+        # Update portfolio section
+        if 'portfolio' not in updated_config:
+            updated_config['portfolio'] = {}
+        updated_config['portfolio']['initial_capital'] = int(new_capital)
+        updated_config['portfolio']['position_sizing'] = new_position_method
+
+        # Update risk section
+        if 'risk' not in updated_config:
+            updated_config['risk'] = {}
+        updated_config['risk']['max_drawdown_percent'] = max_dd
+        updated_config['risk']['daily_loss_limit'] = daily_limit / 100
+        updated_config['risk']['max_position_percent'] = max_pos / 100
+        updated_config['risk']['max_sector_exposure'] = sector_exp / 100
+
+        # Update notifications section
+        if 'notifications' not in updated_config:
+            updated_config['notifications'] = {}
+        if 'desktop' not in updated_config['notifications']:
+            updated_config['notifications']['desktop'] = {}
+        updated_config['notifications']['desktop']['enabled'] = desktop
+        updated_config['notifications']['desktop']['sound'] = sound
+        if 'telegram' not in updated_config['notifications']:
+            updated_config['notifications']['telegram'] = {}
+        updated_config['notifications']['telegram']['enabled'] = telegram
+
+        # Save to config.yaml
+        try:
+            with open(CONFIG_PATH, 'w') as f:
+                yaml.dump(updated_config, f, default_flow_style=False, sort_keys=False)
+
+            # Update session state immediately
+            st.session_state.market_mode = new_market_mode
+            st.session_state.symbol = new_symbol
+            st.session_state.exchange = new_exchange
+            st.session_state.timeframe = new_interval
+            st.session_state.paper_capital = int(new_capital)
+            st.session_state.auto_refresh = auto_refresh
+            st.session_state.refresh_interval = refresh_interval
+
+            # Clear the config cache so it reloads
+            load_config.clear()
+
+            st.success("Settings saved!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to save settings: {e}")
 
 
 # =============================================================================
@@ -1959,10 +3833,12 @@ def main():
         st.markdown("## AI Trade Bot")
         st.markdown("---")
 
-        # Page selection
+        # Page selection (dynamic based on market mode)
+        market_mode = st.session_state.get('market_mode', 'crypto')
+
+        # Base pages for all modes
         pages = {
             "📊 Dashboard": "Dashboard",
-            "💱 Forex Markets": "Forex Markets",
             "💼 Portfolio": "Portfolio",
             "📝 Paper Trade": "Paper Trading",
             "📈 Backtest": "Backtesting",
@@ -1972,6 +3848,20 @@ def main():
             "⚙️ Settings": "Settings"
         }
 
+        # Add Forex Markets page when in forex mode
+        if market_mode == 'forex':
+            pages = {
+                "📊 Dashboard": "Dashboard",
+                "💱 Forex Markets": "Forex Markets",
+                "💼 Portfolio": "Portfolio",
+                "📝 Paper Trade": "Paper Trading",
+                "📈 Backtest": "Backtesting",
+                "🛡️ Risk": "Risk Management",
+                "📉 Performance": "Performance",
+                "📰 News & Sentiment": "News & Sentiment",
+                "⚙️ Settings": "Settings"
+            }
+
         for label, page_name in pages.items():
             if st.button(label, use_container_width=True,
                         type="primary" if st.session_state.page == page_name else "secondary"):
@@ -1980,60 +3870,26 @@ def main():
 
         st.markdown("---")
 
-        # Quick settings
-        st.markdown("### Quick Settings")
+        # Auto-refresh with explanation
+        st.markdown("### 🔄 Auto-Refresh Settings")
 
-        exchanges = ['binance', 'alpaca', 'coinbase', 'bybit', 'kraken']
-        new_exchange = st.selectbox("Exchange", exchanges,
-                                    index=exchanges.index(st.session_state.exchange) if st.session_state.exchange in exchanges else 0)
-        if new_exchange != st.session_state.exchange:
-            st.session_state.exchange = new_exchange
-            # Provider will use new exchange on next subscription
-            st.rerun()
-
-        # Symbol list changes based on exchange
-        if st.session_state.exchange == 'alpaca':
-            # US Stocks and popular assets
-            symbols = ['AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'SPY', 'QQQ', 'BTC/USD', 'ETH/USD']
-        else:
-            # Crypto pairs for other exchanges
-            symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT']
-
-        new_symbol = st.selectbox("Symbol", symbols,
-                                  index=symbols.index(st.session_state.symbol) if st.session_state.symbol in symbols else 0)
-        if new_symbol != st.session_state.symbol:
-            old_symbol = st.session_state.symbol
-            st.session_state.symbol = new_symbol
-
-            # Subscribe to new symbol
-            provider = st.session_state.data_provider
-            if provider and provider.is_running:
-                logger.info(f"Symbol changed: {old_symbol} -> {new_symbol}")
-                provider.subscribe(new_symbol, exchange=st.session_state.exchange, interval=st.session_state.timeframe)
-            st.rerun()
-
-        # All supported timeframes from 1 minute to 1 year
-        timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
-        new_tf = st.selectbox("Timeframe", timeframes,
-                             index=timeframes.index(st.session_state.timeframe) if st.session_state.timeframe in timeframes else 5)
-        if new_tf != st.session_state.timeframe:
-            # Timeframe changed - resubscribe with new interval
-            old_tf = st.session_state.timeframe
-            st.session_state.timeframe = new_tf
-
-            provider = st.session_state.data_provider
-            if provider and provider.is_running:
-                logger.info(f"Timeframe changed: {old_tf} -> {new_tf}")
-                # subscribe() handles interval change, clears buffer, and reconnects
-                for symbol in st.session_state.tracked_symbols:
-                    provider.subscribe(symbol, exchange=st.session_state.exchange, interval=new_tf)
-            st.rerun()
-
-        st.markdown("---")
-
-        # Auto-refresh
-        auto_refresh = st.checkbox("Auto Refresh", value=st.session_state.auto_refresh)
+        auto_refresh = st.checkbox(
+            "Enable Manual Auto-Refresh",
+            value=st.session_state.auto_refresh,
+            help="Enable to always auto-refresh. Dashboard auto-refreshes automatically during data loading and active predictions."
+        )
         st.session_state.auto_refresh = auto_refresh
+
+        st.info("""
+        **📊 Chart is ALWAYS LIVE** - updates in real-time via WebSocket (no refresh needed!)
+
+        **Smart Auto-Refresh** is only for:
+        - 📈 Historical data loading progress bar
+        - 🎯 Prediction validation streak updates
+        - ✅ Manually enabled above
+
+        **When idle** (data loaded, no pending predictions), auto-refresh stops automatically.
+        """)
 
         if st.button("🔄 Refresh Now"):
             st.rerun()
@@ -2051,10 +3907,44 @@ def main():
         "Settings": page_settings,
     }
 
-    # Auto-refresh (non-flickering) - runs BEFORE page rendering to prevent flicker
+    # Smart Auto-refresh - ONLY for prediction validation updates
+    # NOTE: Chart is ALREADY LIVE via JavaScript WebSocket - no refresh needed for chart!
+    should_auto_refresh = False
+    refresh_interval_ms = st.session_state.refresh_interval * 1000  # Default 30s
+
+    # Check if provider is actively fetching historical data
+    provider = st.session_state.data_provider
+    # Safe check - method may not exist if provider is cached from old version
+    is_fetching = False
+    if provider and hasattr(provider, 'is_fetching'):
+        is_fetching = provider.is_fetching()
+
+    # Reason 1: User explicitly enabled manual auto-refresh
     if st.session_state.auto_refresh:
-        # Convert seconds to milliseconds, runs in background without blocking
-        st_autorefresh(interval=st.session_state.refresh_interval * 1000, key="data_refresh")
+        should_auto_refresh = True
+
+    # Reason 2: Historical data is still loading (to show progress bar updates)
+    # BUT use a much longer interval if fetch is in progress to avoid killing threads
+    if hasattr(st.session_state, 'data_loading') and st.session_state.data_loading:
+        should_auto_refresh = True
+        if is_fetching:
+            # Use 90 second interval during active fetch to let it complete
+            refresh_interval_ms = 90000
+        else:
+            # Use 10 second interval when data is loading but fetch finished
+            refresh_interval_ms = 10000
+
+    # Reason 3: Active predictions being validated (to show streak updates)
+    if hasattr(st.session_state, 'prediction_validator'):
+        validator = st.session_state.prediction_validator
+        if validator and hasattr(validator, '_pending_predictions'):
+            if len(validator._pending_predictions) > 0:
+                should_auto_refresh = True
+
+    # Only auto-refresh when necessary
+    # Chart updates live via WebSocket - this is ONLY for prediction validation UI updates
+    if should_auto_refresh:
+        st_autorefresh(interval=refresh_interval_ms, key="data_refresh")
 
     page_func = page_functions.get(st.session_state.page, page_dashboard)
     page_func()

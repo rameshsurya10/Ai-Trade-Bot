@@ -84,6 +84,12 @@ class PredictionResult:
     sentiment_momentum: Optional[float] = None  # Sentiment trend
     news_volume_1h: Optional[int] = None  # Number of articles in last hour
 
+    # 8 out of 10 Rule Validation
+    # Each rule returns (passed: bool, description: str)
+    rules_passed: int = 0  # Number of rules that passed
+    rules_total: int = 10  # Total rules checked
+    rules_details: List[Tuple[str, bool, str]] = field(default_factory=list)  # [(name, passed, reason)]
+
     # Meta
     ensemble_weights: Dict[str, float] = field(default_factory=dict)
 
@@ -515,14 +521,14 @@ class MonteCarlo:
 
     def __init__(
         self,
-        n_simulations: int = 1000,
-        time_horizon: int = 10,
+        n_simulations: int = 10000,
+        time_horizon: int = 365,
         default_volatility: float = 0.02
     ):
         """
         Args:
-            n_simulations: Number of simulation paths
-            time_horizon: Days to simulate forward
+            n_simulations: Number of simulation paths (10K is statistically robust)
+            time_horizon: Days to simulate forward (365 = 1 year)
             default_volatility: Default daily volatility if calculation fails
         """
         self.n_simulations = n_simulations
@@ -537,16 +543,19 @@ class MonteCarlo:
         take_profit_pct: float = 0.03
     ) -> Dict:
         """
-        Run Monte Carlo simulation.
+        Run Monte Carlo simulation using vectorized NumPy operations.
+
+        Uses Geometric Brownian Motion (GBM) to simulate price paths.
+        Fully vectorized for performance (100K simulations in ~1 second).
 
         Args:
             current_price: Current asset price
             returns: Historical returns array
-            stop_loss_pct: Stop loss as percentage
-            take_profit_pct: Take profit as percentage
+            stop_loss_pct: Stop loss as percentage (e.g., 0.02 = 2%)
+            take_profit_pct: Take profit as percentage (e.g., 0.03 = 3%)
 
         Returns:
-            Dict with simulation results
+            Dict with simulation results including probabilities and risk metrics
         """
         if len(returns) < 20 or current_price <= 0:
             return self._default_result()
@@ -577,38 +586,49 @@ class MonteCarlo:
             stop_loss_price = current_price * (1 - stop_loss_pct)
             take_profit_price = current_price * (1 + take_profit_pct)
 
-            # Run simulations
-            final_prices = []
-            hit_stop_loss = 0
-            hit_take_profit = 0
+            # Vectorized GBM simulation (100-1000x faster than loops)
+            # Generate all random shocks at once: shape (n_simulations, time_horizon)
+            random_shocks = np.random.normal(0, 1, (self.n_simulations, self.time_horizon))
 
-            for _ in range(self.n_simulations):
-                price = current_price
-                for _ in range(self.time_horizon):
-                    # GBM step
-                    random_shock = np.random.normal()
-                    price = price * np.exp(
-                        (drift - 0.5 * volatility ** 2) * dt +
-                        volatility * np.sqrt(dt) * random_shock
-                    )
+            # Calculate log returns for each step
+            log_returns = (drift - 0.5 * volatility ** 2) * dt + volatility * np.sqrt(dt) * random_shocks
 
-                    # Check stops
-                    if price <= stop_loss_price:
-                        hit_stop_loss += 1
-                        break
-                    elif price >= take_profit_price:
-                        hit_take_profit += 1
-                        break
+            # Cumulative sum to get price paths (in log space)
+            cumulative_log_returns = np.cumsum(log_returns, axis=1)
 
-                final_prices.append(price)
+            # Convert to price paths
+            price_paths = current_price * np.exp(cumulative_log_returns)
 
-            final_prices = np.array(final_prices)
+            # Check for stop loss and take profit hits along each path
+            hit_sl = np.any(price_paths <= stop_loss_price, axis=1)
+            hit_tp = np.any(price_paths >= take_profit_price, axis=1)
+
+            # For paths that hit both, determine which was hit first
+            # Find first index where SL or TP was hit
+            sl_indices = np.argmax(price_paths <= stop_loss_price, axis=1)
+            tp_indices = np.argmax(price_paths >= take_profit_price, axis=1)
+
+            # argmax returns 0 if no True found, so we need to handle that
+            sl_indices = np.where(hit_sl, sl_indices, self.time_horizon + 1)
+            tp_indices = np.where(hit_tp, tp_indices, self.time_horizon + 1)
+
+            # Count paths where SL was hit first vs TP was hit first
+            sl_hit_first = hit_sl & (sl_indices < tp_indices)
+            tp_hit_first = hit_tp & (tp_indices < sl_indices)
+
+            # Get final prices (last column of price paths)
+            final_prices = price_paths[:, -1]
+
+            # Override final price for paths that hit stops
+            # If SL hit first, final price is SL price; if TP hit first, final price is TP price
+            final_prices = np.where(sl_hit_first, stop_loss_price, final_prices)
+            final_prices = np.where(tp_hit_first, take_profit_price, final_prices)
 
             # Calculate statistics
             expected_return = (np.mean(final_prices) - current_price) / current_price
             prob_profit = np.mean(final_prices > current_price)
-            prob_stop_loss = hit_stop_loss / self.n_simulations
-            prob_take_profit = hit_take_profit / self.n_simulations
+            prob_stop_loss = np.mean(sl_hit_first)
+            prob_take_profit = np.mean(tp_hit_first)
 
             # Value at Risk (VaR) - 5th percentile
             var_5 = np.percentile(final_prices, 5)
@@ -679,12 +699,14 @@ class AdvancedPredictor:
         'monte_carlo': 0.05
     }
 
-    def __init__(self, weights: Optional[Dict[str, float]] = None):
+    def __init__(self, weights: Optional[Dict[str, float]] = None, prediction_validator=None):
         """
         Args:
             weights: Custom algorithm weights (must sum to 1.0)
+            prediction_validator: PredictionValidator instance for streak tracking
         """
         self.weights = weights or self.DEFAULT_WEIGHTS.copy()
+        self.prediction_validator = prediction_validator
 
         # Normalize weights
         total = sum(self.weights.values())
@@ -701,6 +723,8 @@ class AdvancedPredictor:
     def predict(
         self,
         df: pd.DataFrame,
+        symbol: str,
+        timeframe: str,
         lstm_probability: float = 0.5,
         atr: Optional[float] = None,
         sentiment_features: Optional[Dict] = None
@@ -710,6 +734,8 @@ class AdvancedPredictor:
 
         Args:
             df: DataFrame with OHLCV data
+            symbol: Trading pair (e.g., "BTC/USDT")
+            timeframe: Timeframe (e.g., "1h", "4h")
             lstm_probability: Probability from LSTM model (0-1)
             atr: Average True Range for stop loss calculation
             sentiment_features: Optional sentiment data from news analysis
@@ -866,6 +892,111 @@ class AdvancedPredictor:
         kelly_fraction = (win_prob * (1 + risk_reward_ratio) - 1) / (risk_reward_ratio + EPSILON)
         kelly_fraction = max(0.0, min(0.25, kelly_fraction))  # Cap at 25% max
 
+        # =================================================================
+        # 8 OUT OF 10 RULE VALIDATION
+        # =================================================================
+        rules_details = []
+
+        # Rule 1: Trend Alignment (Kalman agrees with signal)
+        trend_aligned = (
+            (direction == "BUY" and kalman_result['trend'] == "UP") or
+            (direction == "SELL" and kalman_result['trend'] == "DOWN") or
+            direction == "NEUTRAL"
+        )
+        rules_details.append(("Trend Alignment", trend_aligned,
+            f"Kalman: {kalman_result['trend']}" if trend_aligned else f"Kalman shows {kalman_result['trend']}"))
+
+        # Rule 2: Cycle Position (Fourier - not buying at top, not selling at bottom)
+        cycle_phase = fourier_result['cycle_phase']
+        cycle_ok = (
+            (direction == "BUY" and cycle_phase < 0.7) or
+            (direction == "SELL" and cycle_phase > 0.3) or
+            direction == "NEUTRAL"
+        )
+        rules_details.append(("Cycle Position", cycle_ok,
+            f"Phase {cycle_phase:.0%}" if cycle_ok else f"Phase {cycle_phase:.0%} - bad entry"))
+
+        # Rule 3: Market Regime (Not choppy/volatile for trades)
+        regime = entropy_result['regime']
+        regime_ok = regime in ['TRENDING', 'NORMAL'] or direction == "NEUTRAL"
+        rules_details.append(("Market Regime", regime_ok,
+            f"{regime}" if regime_ok else f"{regime} - too risky"))
+
+        # Rule 4: Markov Probability (>55% for direction)
+        markov_ok = (
+            (direction == "BUY" and markov_result['prob_up'] > 0.55) or
+            (direction == "SELL" and markov_result['prob_down'] > 0.55) or
+            direction == "NEUTRAL"
+        )
+        prob_used = markov_result['prob_up'] if direction == "BUY" else markov_result['prob_down']
+        rules_details.append(("Markov Probability", markov_ok,
+            f"{prob_used:.0%}" if markov_ok else f"Only {prob_used:.0%}"))
+
+        # Rule 5: Monte Carlo Win Rate (>50%)
+        mc_win_ok = monte_carlo_result['prob_profit'] > 0.50
+        rules_details.append(("Win Probability", mc_win_ok,
+            f"{monte_carlo_result['prob_profit']:.0%}" if mc_win_ok else f"Only {monte_carlo_result['prob_profit']:.0%}"))
+
+        # Rule 6: Risk/Reward Ratio (>1.5)
+        rr_ok = risk_reward_ratio >= 1.5
+        rules_details.append(("Risk/Reward", rr_ok,
+            f"1:{risk_reward_ratio:.1f}" if rr_ok else f"1:{risk_reward_ratio:.1f} - too low"))
+
+        # Rule 7: Volatility Check (Daily vol < 5%)
+        vol_ok = monte_carlo_result['volatility_daily'] < 0.05
+        rules_details.append(("Volatility", vol_ok,
+            f"{monte_carlo_result['volatility_daily']*100:.1f}%" if vol_ok else f"{monte_carlo_result['volatility_daily']*100:.1f}% - too high"))
+
+        # Rule 8: Confidence Level (>60%)
+        conf_ok = confidence > 0.60
+        rules_details.append(("Confidence", conf_ok,
+            f"{confidence*100:.0f}%" if conf_ok else f"Only {confidence*100:.0f}%"))
+
+        # Rule 9: Position Size Valid (Kelly > 1%)
+        kelly_ok = kelly_fraction > 0.01 or direction == "NEUTRAL"
+        rules_details.append(("Position Size", kelly_ok,
+            f"{kelly_fraction*100:.1f}%" if kelly_ok else "Too small"))
+
+        # Rule 10: Fourier Signal Agreement
+        fourier_ok = (
+            (direction == "BUY" and fourier_result['signal'] in ["BULLISH", "NEUTRAL"]) or
+            (direction == "SELL" and fourier_result['signal'] in ["BEARISH", "NEUTRAL"]) or
+            direction == "NEUTRAL"
+        )
+        rules_details.append(("Fourier Signal", fourier_ok,
+            fourier_result['signal'] if fourier_ok else f"{fourier_result['signal']} disagrees"))
+
+        # Count passed rules
+        rules_passed = sum(1 for _, passed, _ in rules_details if passed)
+
+        # Record prediction for validation tracking (8/10 streak system)
+        if self.prediction_validator:
+            try:
+                self.prediction_validator.record_prediction(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    direction=direction,
+                    current_price=current_price,
+                    confidence=float(confidence),
+                    target_price=current_price,  # Will be compared to next candle close
+                    stop_loss=float(stop_loss),
+                    take_profit=float(take_profit),
+                    rules_passed=rules_passed,
+                    rules_total=10,
+                    market_context={
+                        'regime': entropy_result['regime'],
+                        'trend': kalman_result['trend'],
+                        'volatility': monte_carlo_result['volatility_daily'],
+                        'cycle_phase': fourier_result['cycle_phase']
+                    }
+                )
+                logger.info(
+                    f"✅ Prediction recorded: {symbol} {timeframe} {direction} "
+                    f"@ ${current_price:,.2f} (conf: {confidence:.1%}, rules: {rules_passed}/10)"
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to record prediction: {e}")
+
         return PredictionResult(
             # Core signal
             direction=direction,
@@ -921,6 +1052,11 @@ class AdvancedPredictor:
             sentiment_6h=sentiment_6h,
             sentiment_momentum=sentiment_momentum,
             news_volume_1h=news_volume_1h,
+
+            # 8 out of 10 Rule Validation
+            rules_passed=rules_passed,
+            rules_total=10,
+            rules_details=rules_details,
 
             # Meta
             ensemble_weights=weights_with_sentiment.copy()

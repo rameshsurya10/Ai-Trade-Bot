@@ -17,6 +17,7 @@ class DataConfig:
     exchange: str = "coinbase"
     interval: str = "1h"
     history_days: int = 365
+    websocket: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -31,10 +32,12 @@ class AnalysisConfig:
 class ModelConfig:
     """ML model settings."""
     path: str = "models/best_model.pt"
+    models_dir: str = "models"
     sequence_length: int = 60
     hidden_size: int = 128
     num_layers: int = 2
     dropout: float = 0.2
+    features: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -81,6 +84,8 @@ class NotificationConfig:
 class DatabaseConfig:
     """Database settings."""
     path: str = "data/trading.db"
+    backup_enabled: bool = True
+    backup_interval_hours: int = 24
 
 
 @dataclass
@@ -166,6 +171,9 @@ class Config:
     brokerage: BrokerageConfig = field(default_factory=BrokerageConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
 
+    # Raw config dict for backwards compatibility
+    raw: Dict[str, Any] = field(default_factory=dict)
+
     _config_path: Optional[Path] = field(default=None, repr=False)
 
     @classmethod
@@ -190,6 +198,7 @@ class Config:
 
         config = cls()
         config._config_path = path
+        config.raw = data  # Store raw config dict
 
         # Load each section
         if 'data' in data:
