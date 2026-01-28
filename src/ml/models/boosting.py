@@ -119,19 +119,23 @@ class XGBoostModel(BaseBoostingModel):
         except ImportError:
             raise ImportError("XGBoost not installed. Run: pip install xgboost")
 
-        self.model = xgb.XGBClassifier(
-            objective='binary:logistic',
-            eval_metric='logloss',
-            use_label_encoder=False,
+        # Build model params - early_stopping_rounds goes to constructor in newer XGBoost
+        model_params = {
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
             **self.params
-        )
+        }
+
+        # Add early stopping to constructor if eval_set provided
+        if eval_set is not None and early_stopping_rounds:
+            model_params['early_stopping_rounds'] = early_stopping_rounds
+
+        self.model = xgb.XGBClassifier(**model_params)
 
         fit_params = {'verbose': verbose}
 
         if eval_set is not None:
             fit_params['eval_set'] = eval_set
-            if early_stopping_rounds:
-                fit_params['early_stopping_rounds'] = early_stopping_rounds
 
         self.model.fit(X, y, **fit_params)
         self._is_fitted = True
@@ -297,17 +301,22 @@ class CatBoostModel(BaseBoostingModel):
         except ImportError:
             raise ImportError("CatBoost not installed. Run: pip install catboost")
 
-        self.model = CatBoostClassifier(
-            loss_function='Logloss',
-            verbose=verbose,
+        # Build model params
+        model_params = {
+            'loss_function': 'Logloss',
+            'verbose': verbose,
             **self.params
-        )
+        }
+
+        # Add early stopping to constructor if eval_set will be provided
+        if eval_set is not None and early_stopping_rounds:
+            model_params['early_stopping_rounds'] = early_stopping_rounds
+
+        self.model = CatBoostClassifier(**model_params)
 
         fit_params = {}
         if eval_set is not None:
             fit_params['eval_set'] = eval_set
-        if early_stopping_rounds:
-            fit_params['early_stopping_rounds'] = early_stopping_rounds
 
         self.model.fit(X, y, **fit_params)
         self._is_fitted = True

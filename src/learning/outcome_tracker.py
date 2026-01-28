@@ -107,7 +107,8 @@ class OutcomeTracker:
         confidence: float,
         features: np.ndarray = None,
         regime: str = None,
-        is_paper_trade: bool = False
+        is_paper_trade: bool = False,
+        strategy_name: str = None
     ) -> dict:
         """
         Record trade outcome and check retraining triggers.
@@ -123,6 +124,7 @@ class OutcomeTracker:
             features: Feature vector used for prediction (for replay buffer)
             regime: Market regime at trade time
             is_paper_trade: True if paper trade
+            strategy_name: Name of the strategy used for this trade
 
         Returns:
             {
@@ -188,7 +190,8 @@ class OutcomeTracker:
                 pnl_absolute=pnl_absolute,
                 features_snapshot=features_json,
                 regime=regime,
-                is_paper_trade=is_paper_trade
+                is_paper_trade=is_paper_trade,
+                strategy_name=strategy_name
             )
 
             logger.info(

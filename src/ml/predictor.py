@@ -16,18 +16,18 @@ This is the central orchestrator for making trading predictions.
 import numpy as np
 import pandas as pd
 import torch
-from typing import Optional, Dict, Any, Tuple
+import threading
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
 import logging
 import joblib
 from datetime import datetime
 
-from .decomposition import SVMDDecomposer
-from .regime import RegimeDetector, MarketRegime
+from .regime import RegimeDetector
 from .models import create_base_models
-from .ensemble import StackingEnsemble, EnsemblePrediction
-from .risk import RiskManager, RiskAssessment
+from .ensemble import StackingEnsemble
+from .risk import RiskManager
 from .learning import ContinualLearner
 from .features import FeatureEngineer
 
@@ -67,9 +67,17 @@ class TradingSignal:
     timestamp: datetime
     model_confidence: float  # Model's internal confidence
     drift_score: float  # Concept drift score
+    lstm_probability: float = 0.5  # Raw LSTM probability (for continuous learning compatibility)
 
     # Warnings
-    warnings: list
+    warnings: list = None
+
+    def __post_init__(self):
+        """Initialize default values after dataclass init."""
+        if self.warnings is None:
+            self.warnings = []
+        if self.lstm_probability is None:
+            self.lstm_probability = self.probability
 
 
 class UnbreakablePredictor:
@@ -121,7 +129,6 @@ class UnbreakablePredictor:
         self.device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
 
         # Initialize components
-        self.decomposer = SVMDDecomposer(max_modes=5)
         self.regime_detector = RegimeDetector()
         self.feature_engineer = FeatureEngineer(
             sequence_length=sequence_length,
@@ -142,6 +149,9 @@ class UnbreakablePredictor:
 
         self._is_fitted = False
         self._last_prediction: Optional[TradingSignal] = None
+
+        # Thread safety lock for model operations
+        self._model_lock = threading.Lock()
 
         logger.info(f"UnbreakablePredictor initialized on {self.device}")
 
@@ -335,7 +345,12 @@ class UnbreakablePredictor:
                 y_batch = y_batch.to(self.device)
 
                 optimizer.zero_grad()
-                outputs = model(X_batch).squeeze()
+                outputs = model(X_batch).squeeze(-1)  # Squeeze only last dimension
+                # Ensure both tensors have same shape for BCE loss
+                if outputs.dim() == 0:
+                    outputs = outputs.unsqueeze(0)
+                if y_batch.dim() == 0:
+                    y_batch = y_batch.unsqueeze(0)
                 loss = criterion(outputs, y_batch)
                 loss.backward()
                 optimizer.step()
@@ -350,7 +365,12 @@ class UnbreakablePredictor:
                 with torch.no_grad():
                     X_val_tensor = torch.FloatTensor(X_val).to(self.device)
                     y_val_tensor = torch.FloatTensor(y_val).to(self.device)
-                    val_outputs = model(X_val_tensor).squeeze()
+                    val_outputs = model(X_val_tensor).squeeze(-1)
+                    # Ensure both tensors have same shape
+                    if val_outputs.dim() == 0:
+                        val_outputs = val_outputs.unsqueeze(0)
+                    if y_val_tensor.dim() == 0:
+                        y_val_tensor = y_val_tensor.unsqueeze(0)
                     val_loss = criterion(val_outputs, y_val_tensor).item()
 
                 scheduler.step(val_loss)
@@ -383,12 +403,21 @@ class UnbreakablePredictor:
             high_conf_acc = (preds[high_conf_mask] == y_val[high_conf_mask]).mean()
             logger.info(f"   High Confidence Accuracy: {high_conf_acc:.2%} ({high_conf_mask.sum()} samples)")
 
-    def predict(self, df: pd.DataFrame) -> TradingSignal:
+    def predict(
+        self,
+        df: pd.DataFrame,
+        symbol: str = None,
+        interval: str = None
+    ) -> TradingSignal:
         """
         Make a trading prediction.
 
+        Thread-safe: Uses model lock to prevent conflicts with online_update.
+
         Args:
             df: DataFrame with recent OHLCV data
+            symbol: Trading pair (optional, for logging/multi-asset support)
+            interval: Timeframe (optional, for logging/multi-timeframe support)
 
         Returns:
             TradingSignal with complete analysis
@@ -425,11 +454,13 @@ class UnbreakablePredictor:
         if len(feature_set.tabular_data) == 0:
             return self._create_neutral_signal(current_price, current_time, "Insufficient data")
 
-        # 3. Get ensemble prediction
+        # 3. Get ensemble prediction (thread-safe)
         X = feature_set.tabular_data[-1:] if len(feature_set.tabular_data) > 0 else None
         X_seq = feature_set.sequence_data[-1:] if feature_set.sequence_data is not None and len(feature_set.sequence_data) > 0 else None
 
-        ensemble_pred = self.ensemble.predict_detailed(X, X_seq)
+        # Use lock to ensure model stays in eval mode during prediction
+        with self._model_lock:
+            ensemble_pred = self.ensemble.predict_detailed(X, X_seq)
 
         probability = ensemble_pred.probability
         model_confidence = ensemble_pred.confidence
@@ -486,6 +517,9 @@ class UnbreakablePredictor:
             final_confidence *= 0.7
             warnings.append("SELL signal in BULL regime - use caution")
 
+        # Get LSTM-specific probability for continuous learning
+        lstm_prob = ensemble_pred.base_model_predictions.get('tcn_lstm_attention', probability)
+
         signal = TradingSignal(
             direction=direction,
             confidence=final_confidence,
@@ -506,6 +540,7 @@ class UnbreakablePredictor:
             timestamp=current_time,
             model_confidence=model_confidence,
             drift_score=drift_score,
+            lstm_probability=lstm_prob,
             warnings=warnings
         )
 
@@ -532,6 +567,7 @@ class UnbreakablePredictor:
             regime='UNKNOWN',
             regime_confidence=0.0,
             base_model_predictions={},
+            lstm_probability=0.5,
             rsi=50,
             macd_hist=0,
             atr=0,
@@ -585,6 +621,102 @@ class UnbreakablePredictor:
             target=actual_outcome,
             regime=last_pred.regime
         )
+
+    def online_update(
+        self,
+        df: pd.DataFrame,
+        symbol: str = None,
+        interval: str = None,
+        learning_rate: float = 0.0001,
+        actual_outcome: int = None
+    ):
+        """
+        Perform online learning update with new candle data.
+
+        This is called by ContinuousLearningSystem after each candle.
+        Performs small incremental update to the neural network.
+
+        Args:
+            df: DataFrame with recent OHLCV data (excluding the outcome candle)
+            symbol: Trading pair (for logging, optional)
+            interval: Timeframe (for logging, optional)
+            learning_rate: Learning rate for online update
+            actual_outcome: Actual outcome (1 if price went up, 0 if down).
+                           If None, uses the last prediction's confirmed outcome.
+        """
+        if not self._is_fitted:
+            logger.debug("Model not fitted, skipping online update")
+            return
+
+        if self.continual_learner is None:
+            logger.debug("Continual learner not initialized, skipping online update")
+            return
+
+        # Require actual_outcome to be explicitly provided to avoid information leakage
+        if actual_outcome is None:
+            logger.debug("No actual_outcome provided, skipping online update")
+            return
+
+        # Validate actual_outcome
+        if actual_outcome not in (0, 1, 0.0, 1.0):
+            logger.warning(f"Invalid actual_outcome: {actual_outcome}, must be 0 or 1")
+            return
+
+        # Thread-safe model update
+        with self._model_lock:
+            try:
+                # Get features for the latest candle
+                feature_set = self.feature_engineer.transform(df, self.regime_detector)
+
+                if feature_set.tabular_data is None or len(feature_set.tabular_data) == 0:
+                    return
+
+                # Get sequence data for LSTM
+                X_seq = feature_set.sequence_data[-1:] if feature_set.sequence_data is not None else None
+
+                if X_seq is None or len(X_seq) == 0:
+                    return
+
+                # Only update PyTorch model (LSTM/TCN) with online learning
+                # Boosting models don't support online updates
+                lstm_model = self.base_models.get('tcn_lstm_attention')
+                if lstm_model is None:
+                    return
+
+                # Perform small gradient step with guaranteed eval mode restoration
+                lstm_model.train()
+                try:
+                    X_tensor = torch.FloatTensor(X_seq).to(self.device)
+                    y_tensor = torch.FloatTensor([float(actual_outcome)]).to(self.device)
+
+                    # Small learning rate for online update
+                    optimizer = torch.optim.SGD(lstm_model.parameters(), lr=learning_rate)
+                    criterion = torch.nn.BCELoss()
+
+                    optimizer.zero_grad()
+                    output = lstm_model(X_tensor).squeeze()
+                    if output.dim() == 0:
+                        output = output.unsqueeze(0)
+
+                    loss = criterion(output, y_tensor)
+                    loss.backward()
+
+                    # Gradient clipping for stability in online learning
+                    torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), max_norm=1.0)
+
+                    optimizer.step()
+
+                    log_msg = f"Online update: loss={loss.item():.4f}, outcome={actual_outcome}"
+                    if symbol and interval:
+                        log_msg = f"[{symbol} @ {interval}] {log_msg}"
+                    logger.debug(log_msg)
+
+                finally:
+                    # Always restore eval mode even if exception occurs
+                    lstm_model.eval()
+
+            except Exception as e:
+                logger.error(f"Online update failed: {e}", exc_info=True)
 
     def save(self, path: str = None):
         """Save all models to disk."""

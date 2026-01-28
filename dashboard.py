@@ -2864,6 +2864,78 @@ def page_portfolio():
     else:
         st.info("No trades yet")
 
+    # Show continuous learning trade outcomes from database
+    st.markdown("---")
+    st.markdown("### AI Learning Trades (from Database)")
+
+    try:
+        db = st.session_state.db  # Use correct session state key
+        if db:
+            # Get recent trade outcomes
+            with db.connection() as conn:
+                outcomes_df = pd.read_sql_query('''
+                    SELECT
+                        entry_time,
+                        symbol,
+                        interval,
+                        predicted_direction,
+                        predicted_confidence,
+                        entry_price,
+                        exit_price,
+                        was_correct,
+                        pnl_percent,
+                        regime,
+                        is_paper_trade
+                    FROM trade_outcomes
+                    ORDER BY entry_time DESC
+                    LIMIT 50
+                ''', conn)
+
+            if len(outcomes_df) > 0:
+                # Format for display
+                outcomes_df['Result'] = outcomes_df['was_correct'].apply(
+                    lambda x: '✅ Win' if x else '❌ Loss'
+                )
+                outcomes_df['Type'] = outcomes_df['is_paper_trade'].apply(
+                    lambda x: '📝 Paper' if x else '💰 Live'
+                )
+                outcomes_df['Confidence'] = outcomes_df['predicted_confidence'].apply(
+                    lambda x: f"{x*100:.1f}%" if x else 'N/A'
+                )
+                outcomes_df['P&L'] = outcomes_df['pnl_percent'].apply(
+                    lambda x: f"{x:+.2f}%" if x else 'N/A'
+                )
+
+                display_df = outcomes_df[[
+                    'entry_time', 'symbol', 'interval', 'predicted_direction',
+                    'Confidence', 'P&L', 'Result', 'Type', 'regime'
+                ]].rename(columns={
+                    'entry_time': 'Time',
+                    'symbol': 'Symbol',
+                    'interval': 'Timeframe',
+                    'predicted_direction': 'Direction',
+                    'regime': 'Regime'
+                })
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # Summary stats
+                total_trades = len(outcomes_df)
+                wins = outcomes_df['was_correct'].sum()
+                win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+                paper_trades = outcomes_df['is_paper_trade'].sum()
+
+                st.markdown(f"""
+                **Summary:** {total_trades} trades | {wins} wins ({win_rate:.1f}% win rate) |
+                {paper_trades} paper / {total_trades - paper_trades} live
+                """)
+            else:
+                st.info("No AI learning trades recorded yet. Start the analysis engine to generate trades.")
+        else:
+            st.warning("Database not initialized")
+    except Exception as e:
+        st.error(f"Error loading trade outcomes: {e}")
+
 
 # =============================================================================
 # PAGE: FOREX MARKETS
@@ -3078,88 +3150,549 @@ def _render_forex_pairs_grid(pairs: dict):
 # PAGE: PAPER TRADING
 # =============================================================================
 
+@st.cache_data(ttl=30)  # Cache for 30 seconds
+def load_ai_trades_for_chart(symbol: str, lookback_days: int = 7) -> pd.DataFrame:
+    """Load AI training trades from database for chart markers with TP/SL levels."""
+    db_path = Path("data/trading.db")
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    # Use UTC for consistent timezone handling with database
+    cutoff_date = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()
+
+    # Join with signals table to get TP/SL levels
+    query = """
+    SELECT
+        t.id,
+        t.symbol,
+        t.interval,
+        t.entry_price,
+        t.exit_price,
+        t.entry_time,
+        t.exit_time,
+        t.predicted_direction,
+        t.predicted_confidence,
+        t.was_correct,
+        t.pnl_percent,
+        t.regime,
+        t.is_paper_trade,
+        t.strategy_name,
+        t.closed_by,
+        s.stop_loss,
+        s.take_profit,
+        s.atr
+    FROM trade_outcomes t
+    LEFT JOIN signals s ON t.signal_id = s.id
+    WHERE t.symbol = ? AND t.entry_time >= ?
+    ORDER BY t.entry_time DESC
+    """
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            df = pd.read_sql_query(query, conn, params=(symbol, cutoff_date))
+
+            if len(df) > 0:
+                df['entry_time'] = pd.to_datetime(df['entry_time'], utc=True)
+                df['exit_time'] = pd.to_datetime(df['exit_time'], utc=True)
+                # Fill NaN values for numeric columns
+                df['pnl_percent'] = df['pnl_percent'].fillna(0)
+                df['predicted_confidence'] = df['predicted_confidence'].fillna(0)
+                df['stop_loss'] = df['stop_loss'].fillna(0)
+                df['take_profit'] = df['take_profit'].fillna(0)
+
+            return df
+    except Exception as e:
+        logger.error(f"Error loading AI trades: {e}")
+        return pd.DataFrame()
+
+
+def render_chart_with_trades(symbol: str, timeframe: str, historical_data: pd.DataFrame, trades_df: pd.DataFrame):
+    """
+    Render candlestick chart with AI trade markers using Plotly.
+
+    Shows:
+    - BUY signals as green triangles pointing up
+    - SELL signals as red triangles pointing down
+    - Trade PnL color coding (green=profit, red=loss)
+    - Strategy name labels
+    """
+    if historical_data is None or historical_data.empty:
+        st.warning("No historical data available for chart")
+        return
+
+    # Create figure with secondary y-axis for volume
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        subplot_titles=(f'{symbol} - AI Training Trades', 'Volume'),
+        row_heights=[0.75, 0.25]
+    )
+
+    # Candlestick chart
+    fig.add_trace(
+        go.Candlestick(
+            x=historical_data['datetime'],
+            open=historical_data['open'],
+            high=historical_data['high'],
+            low=historical_data['low'],
+            close=historical_data['close'],
+            name='Price',
+            increasing_line_color='#26a69a',
+            decreasing_line_color='#ef5350'
+        ),
+        row=1, col=1
+    )
+
+    # Volume bars
+    colors = ['#26a69a' if c >= o else '#ef5350'
+              for c, o in zip(historical_data['close'], historical_data['open'])]
+
+    fig.add_trace(
+        go.Bar(
+            x=historical_data['datetime'],
+            y=historical_data['volume'],
+            name='Volume',
+            marker_color=colors,
+            opacity=0.5
+        ),
+        row=2, col=1
+    )
+
+    # Add trade markers if we have trades
+    if trades_df is not None and len(trades_df) > 0:
+        # Helper function to get color based on correctness (handles None/NaN)
+        def get_result_color(correct):
+            if pd.isna(correct) or correct is None:
+                return '#999999'  # Gray for unknown
+            return '#00ff00' if correct else '#ff6b6b'
+
+        def get_result_text(correct):
+            if pd.isna(correct) or correct is None:
+                return '⏳ Pending'
+            return '✓ Correct' if correct else '✗ Wrong'
+
+        # BUY trades
+        buy_trades = trades_df[trades_df['predicted_direction'] == 'BUY']
+        if len(buy_trades) > 0:
+            # Color based on correctness (handles None properly)
+            buy_colors = [get_result_color(c) for c in buy_trades['was_correct']]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=buy_trades['entry_time'],
+                    y=buy_trades['entry_price'],
+                    mode='markers+text',
+                    name='BUY Signals',
+                    marker=dict(
+                        symbol='triangle-up',
+                        size=15,
+                        color=buy_colors,
+                        line=dict(width=2, color='darkgreen')
+                    ),
+                    text=[f"BUY<br>{s if s else 'AI'}<br>{p:.1f}%"
+                          for s, p in zip(buy_trades['strategy_name'].fillna(''), buy_trades['pnl_percent'].fillna(0))],
+                    textposition='bottom center',
+                    textfont=dict(size=9),
+                    hovertemplate=(
+                        "<b>BUY Signal</b><br>"
+                        "Time: %{x}<br>"
+                        "Price: $%{y:,.2f}<br>"
+                        "Strategy: %{customdata[0]}<br>"
+                        "Confidence: %{customdata[1]:.1%}<br>"
+                        "PnL: %{customdata[2]:.2f}%<br>"
+                        "Result: %{customdata[3]}<extra></extra>"
+                    ),
+                    customdata=list(zip(
+                        buy_trades['strategy_name'].fillna('AI Model'),
+                        buy_trades['predicted_confidence'].fillna(0),
+                        buy_trades['pnl_percent'].fillna(0),
+                        [get_result_text(c) for c in buy_trades['was_correct']]
+                    ))
+                ),
+                row=1, col=1
+            )
+
+        # SELL trades
+        sell_trades = trades_df[trades_df['predicted_direction'] == 'SELL']
+        if len(sell_trades) > 0:
+            # Color based on correctness (handles None properly)
+            sell_colors = [get_result_color(c) for c in sell_trades['was_correct']]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=sell_trades['entry_time'],
+                    y=sell_trades['entry_price'],
+                    mode='markers+text',
+                    name='SELL Signals',
+                    marker=dict(
+                        symbol='triangle-down',
+                        size=15,
+                        color=sell_colors,
+                        line=dict(width=2, color='darkred')
+                    ),
+                    text=[f"SELL<br>{s if s else 'AI'}<br>{p:.1f}%"
+                          for s, p in zip(sell_trades['strategy_name'].fillna(''), sell_trades['pnl_percent'].fillna(0))],
+                    textposition='top center',
+                    textfont=dict(size=9),
+                    hovertemplate=(
+                        "<b>SELL Signal</b><br>"
+                        "Time: %{x}<br>"
+                        "Price: $%{y:,.2f}<br>"
+                        "Strategy: %{customdata[0]}<br>"
+                        "Confidence: %{customdata[1]:.1%}<br>"
+                        "PnL: %{customdata[2]:.2f}%<br>"
+                        "Result: %{customdata[3]}<extra></extra>"
+                    ),
+                    customdata=list(zip(
+                        sell_trades['strategy_name'].fillna('AI Model'),
+                        sell_trades['predicted_confidence'].fillna(0),
+                        sell_trades['pnl_percent'].fillna(0),
+                        [get_result_text(c) for c in sell_trades['was_correct']]
+                    ))
+                ),
+                row=1, col=1
+            )
+
+        # TP/SL LINES - Draw Take Profit and Stop Loss levels for each trade
+        # This shows the true structure of paper trades for verification
+        for idx, trade in trades_df.iterrows():
+            entry_time = trade['entry_time']
+            exit_time = trade.get('exit_time')
+            entry_price = trade['entry_price']
+            stop_loss = trade.get('stop_loss', 0)
+            take_profit = trade.get('take_profit', 0)
+            direction = trade['predicted_direction']
+            was_correct = trade.get('was_correct')
+            closed_by = trade.get('closed_by', '')
+
+            # Skip if no TP/SL data
+            if stop_loss == 0 and take_profit == 0:
+                continue
+
+            # Calculate time range for lines (entry to exit, or entry + 24h if no exit)
+            if pd.notna(exit_time):
+                line_end = exit_time
+            else:
+                line_end = entry_time + pd.Timedelta(hours=24)
+
+            # Take Profit line (green dashed)
+            if take_profit > 0:
+                tp_color = '#00ff00' if closed_by == 'take_profit' else '#00ff0080'
+                fig.add_trace(
+                    go.Scatter(
+                        x=[entry_time, line_end],
+                        y=[take_profit, take_profit],
+                        mode='lines',
+                        name=f'TP ${take_profit:,.2f}',
+                        line=dict(color=tp_color, width=2, dash='dash'),
+                        showlegend=False,
+                        hovertemplate=f"<b>Take Profit</b><br>Price: ${take_profit:,.2f}<br>Direction: {direction}<extra></extra>"
+                    ),
+                    row=1, col=1
+                )
+
+            # Stop Loss line (red dashed)
+            if stop_loss > 0:
+                sl_color = '#ff0000' if closed_by == 'stop_loss' else '#ff000080'
+                fig.add_trace(
+                    go.Scatter(
+                        x=[entry_time, line_end],
+                        y=[stop_loss, stop_loss],
+                        mode='lines',
+                        name=f'SL ${stop_loss:,.2f}',
+                        line=dict(color=sl_color, width=2, dash='dash'),
+                        showlegend=False,
+                        hovertemplate=f"<b>Stop Loss</b><br>Price: ${stop_loss:,.2f}<br>Direction: {direction}<extra></extra>"
+                    ),
+                    row=1, col=1
+                )
+
+            # Entry price line (blue solid)
+            fig.add_trace(
+                go.Scatter(
+                    x=[entry_time, line_end],
+                    y=[entry_price, entry_price],
+                    mode='lines',
+                    name=f'Entry ${entry_price:,.2f}',
+                    line=dict(color='#2196F3', width=1, dash='dot'),
+                    showlegend=False,
+                    hovertemplate=f"<b>Entry</b><br>Price: ${entry_price:,.2f}<br>Direction: {direction}<extra></extra>"
+                ),
+                row=1, col=1
+            )
+
+            # Exit price marker (if trade is closed)
+            if pd.notna(exit_time) and trade.get('exit_price'):
+                exit_price = trade['exit_price']
+                exit_color = '#00ff00' if was_correct else '#ff6b6b'
+                fig.add_trace(
+                    go.Scatter(
+                        x=[exit_time],
+                        y=[exit_price],
+                        mode='markers',
+                        name=f'Exit ${exit_price:,.2f}',
+                        marker=dict(
+                            symbol='x',
+                            size=12,
+                            color=exit_color,
+                            line=dict(width=2, color='black')
+                        ),
+                        showlegend=False,
+                        hovertemplate=f"<b>Exit</b><br>Price: ${exit_price:,.2f}<br>PnL: {trade.get('pnl_percent', 0):.2f}%<extra></extra>"
+                    ),
+                    row=1, col=1
+                )
+
+    # Update layout
+    fig.update_layout(
+        height=600,
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        xaxis_rangeslider_visible=False,
+        template='plotly_white'
+    )
+
+    fig.update_xaxes(title_text="Time", row=2, col=1)
+    fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def page_paper_trading():
-    """Paper trading page."""
-    st.markdown("### Paper Trading")
+    """Paper trading page with AI training visualization."""
+    st.markdown("### 📊 AI Training & Paper Trading")
 
     paper_trader = st.session_state.paper_trader
 
-    if paper_trader is None:
-        st.warning("Paper trading not initialized")
-        return
+    # Settings row
+    col_settings1, col_settings2 = st.columns([1, 1])
 
-    # Fetch current price
-    data = fetch_market_data(st.session_state.symbol, limit=1)
+    with col_settings1:
+        lookback_days = st.slider(
+            "Show trades from last (days)",
+            min_value=1,
+            max_value=30,
+            value=7,
+            key="paper_trade_lookback"
+        )
+
+    with col_settings2:
+        show_chart = st.checkbox("Show Candlestick Chart with Trades", value=True)
+
+    # Fetch market data for chart
+    data = fetch_market_data(
+        st.session_state.symbol,
+        st.session_state.timeframe,
+        limit=500  # ~3 weeks of 1h data
+    )
+
     current_price = data.get('price', 0) if data['success'] else 0
 
-    # Order form
-    st.markdown("#### Place Order")
+    # Load AI trades
+    ai_trades = load_ai_trades_for_chart(st.session_state.symbol, lookback_days)
 
-    col1, col2 = st.columns(2)
+    # Show chart with trade markers
+    if show_chart and data['success']:
+        st.markdown("---")
+        st.markdown("#### 📈 Price Chart with AI Trade Signals & TP/SL Levels")
+        st.markdown("""
+        <div style="font-size: 12px; color: #666; margin-bottom: 10px;">
+        <span style="color: #26a69a;">▲</span> BUY signals |
+        <span style="color: #ef5350;">▼</span> SELL signals |
+        <span style="color: #00ff00;">●</span> Correct |
+        <span style="color: #ff6b6b;">●</span> Wrong |
+        <span style="color: #00ff00;">- - -</span> Take Profit |
+        <span style="color: #ff0000;">- - -</span> Stop Loss |
+        <span style="color: #2196F3;">···</span> Entry |
+        <span style="color: black;">✕</span> Exit
+        </div>
+        """, unsafe_allow_html=True)
 
-    with col1:
-        order_side = st.radio("Side", ["BUY", "SELL"], horizontal=True)
-        quantity = st.number_input("Quantity", min_value=0.0001, value=0.01, step=0.001, format="%.4f")
+        render_chart_with_trades(
+            symbol=st.session_state.symbol,
+            timeframe=st.session_state.timeframe,
+            historical_data=data['df'],
+            trades_df=ai_trades
+        )
 
-    with col2:
-        order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"])
-        if order_type == "LIMIT":
-            limit_price = st.number_input("Limit Price", value=float(current_price), step=0.01)
-        else:
-            limit_price = current_price
+    # AI Learning Trades Summary
+    st.markdown("---")
+    st.markdown("#### 🤖 AI Learning Trades")
 
-    # Order preview
-    order_value = quantity * limit_price
-    st.markdown(f"**Order Value:** ${order_value:,.2f}")
+    if len(ai_trades) > 0:
+        # Summary metrics
+        total_trades = len(ai_trades)
+        paper_trades = ai_trades['is_paper_trade'].sum()
+        wins = ai_trades['was_correct'].sum()
+        win_rate = wins / total_trades if total_trades > 0 else 0
+        total_pnl = ai_trades['pnl_percent'].sum()
 
-    # Validate order
-    if st.session_state.order_validator:
-        order = {
-            'symbol': st.session_state.symbol,
-            'quantity': quantity,
-            'side': order_side,
-            'order_type': order_type,
-            'price': limit_price,
-            'current_price': current_price
+        col1, col2, col3, col4, col5 = st.columns(5)
+
+        with col1:
+            st.metric("Total Trades", total_trades)
+        with col2:
+            st.metric("Paper Trades", f"{paper_trades} ({100*paper_trades/total_trades:.0f}%)" if total_trades > 0 else "0")
+        with col3:
+            st.metric("Win Rate", f"{win_rate*100:.1f}%")
+        with col4:
+            pnl_color = "normal" if total_pnl >= 0 else "inverse"
+            st.metric("Total PnL", f"{total_pnl:+.2f}%", delta_color=pnl_color)
+        with col5:
+            # Unique strategies used
+            strategies_used = ai_trades['strategy_name'].dropna().nunique()
+            st.metric("Strategies Used", strategies_used)
+
+        # Show trade table
+        st.markdown("##### Recent Trades (with TP/SL)")
+
+        # Format for display - include TP/SL columns
+        columns_to_show = [
+            'entry_time', 'predicted_direction', 'entry_price', 'stop_loss', 'take_profit',
+            'exit_price', 'pnl_percent', 'was_correct', 'predicted_confidence', 'strategy_name', 'closed_by'
+        ]
+
+        # Only include columns that exist
+        available_columns = [c for c in columns_to_show if c in ai_trades.columns]
+        display_df = ai_trades[available_columns].copy()
+
+        # Rename columns for display
+        column_names = {
+            'entry_time': 'Time',
+            'predicted_direction': 'Dir',
+            'entry_price': 'Entry',
+            'stop_loss': 'SL',
+            'take_profit': 'TP',
+            'exit_price': 'Exit',
+            'pnl_percent': 'PnL %',
+            'was_correct': '✓',
+            'predicted_confidence': 'Conf',
+            'strategy_name': 'Strategy',
+            'closed_by': 'Closed By'
         }
+        display_df.rename(columns=column_names, inplace=True)
 
-        portfolio = {
-            'total_value': paper_trader.get_account_value(),
-            'cash': paper_trader.cash,
-            'daily_pnl': 0
-        }
-
-        validation = st.session_state.order_validator.validate(order, portfolio)
-
-        if validation.warnings:
-            for w in validation.warnings:
-                st.warning(w)
-
-        if validation.errors:
-            for e in validation.errors:
-                st.error(e)
-
-    # Submit button
-    if st.button("Submit Order", type="primary", disabled=not validation.is_valid if validation else False):
-        try:
-            side = OrderSide.BUY if order_side == "BUY" else OrderSide.SELL
-            otype = OrderType.MARKET if order_type == "MARKET" else OrderType.LIMIT
-
-            trade = paper_trader.place_order(
-                symbol=st.session_state.symbol,
-                side=side,
-                quantity=quantity,
-                order_type=otype,
-                price=limit_price
+        # Format values
+        if 'Time' in display_df.columns:
+            display_df['Time'] = display_df['Time'].dt.strftime('%m-%d %H:%M')
+        if 'Entry' in display_df.columns:
+            display_df['Entry'] = display_df['Entry'].apply(lambda x: f"${x:,.0f}" if x > 1000 else f"${x:,.2f}")
+        if 'SL' in display_df.columns:
+            display_df['SL'] = display_df['SL'].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x > 0 else "-")
+        if 'TP' in display_df.columns:
+            display_df['TP'] = display_df['TP'].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x > 0 else "-")
+        if 'Exit' in display_df.columns:
+            display_df['Exit'] = display_df['Exit'].apply(lambda x: f"${x:,.0f}" if pd.notna(x) and x > 1000 else (f"${x:,.2f}" if pd.notna(x) else "⏳"))
+        if 'PnL %' in display_df.columns:
+            display_df['PnL %'] = display_df['PnL %'].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-")
+        if '✓' in display_df.columns:
+            display_df['✓'] = display_df['✓'].apply(lambda x: "✅" if x == True else ("❌" if x == False else "⏳"))
+        if 'Conf' in display_df.columns:
+            display_df['Conf'] = display_df['Conf'].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "-")
+        if 'Strategy' in display_df.columns:
+            display_df['Strategy'] = display_df['Strategy'].fillna('AI')
+        if 'Dir' in display_df.columns:
+            display_df['Dir'] = display_df['Dir'].apply(lambda x: "🟢" if x == 'BUY' else "🔴")
+        if 'Closed By' in display_df.columns:
+            display_df['Closed By'] = display_df['Closed By'].apply(
+                lambda x: "🎯 TP" if x == 'take_profit' else ("🛑 SL" if x == 'stop_loss' else (x if pd.notna(x) else "⏳"))
             )
 
-            if trade:
-                st.success(f"Order executed: {order_side} {quantity} {st.session_state.symbol} @ ${limit_price:,.2f}")
-                st.rerun()
-            else:
-                st.error("Order failed")
-        except Exception as e:
-            st.error(f"Order error: {e}")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    else:
+        st.info("""
+        📝 **No AI trades yet.**
+
+        Start the trading system with:
+        ```bash
+        python run_trading.py
+        ```
+
+        The AI will:
+        1. Analyze market data with multiple strategies
+        2. Execute paper trades in LEARNING mode
+        3. Record outcomes for continuous learning
+        4. Trades will appear here with strategy markers
+        """)
+
+    # Manual Order Form (collapsible)
+    st.markdown("---")
+    with st.expander("📝 Place Manual Order", expanded=False):
+        if paper_trader is None:
+            st.warning("Paper trading not initialized")
+        else:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                order_side = st.radio("Side", ["BUY", "SELL"], horizontal=True, key="manual_order_side")
+                quantity = st.number_input("Quantity", min_value=0.0001, value=0.01, step=0.001, format="%.4f")
+
+            with col2:
+                order_type = st.selectbox("Order Type", ["MARKET", "LIMIT"])
+                if order_type == "LIMIT":
+                    limit_price = st.number_input("Limit Price", value=float(current_price), step=0.01)
+                else:
+                    limit_price = current_price
+
+            order_value = quantity * limit_price
+            st.markdown(f"**Order Value:** ${order_value:,.2f}")
+
+            validation = None
+            if st.session_state.order_validator:
+                order = {
+                    'symbol': st.session_state.symbol,
+                    'quantity': quantity,
+                    'side': order_side,
+                    'order_type': order_type,
+                    'price': limit_price,
+                    'current_price': current_price
+                }
+
+                portfolio = {
+                    'total_value': paper_trader.get_account_value(),
+                    'cash': paper_trader.cash,
+                    'daily_pnl': 0
+                }
+
+                validation = st.session_state.order_validator.validate(order, portfolio)
+
+                if validation.warnings:
+                    for w in validation.warnings:
+                        st.warning(w)
+
+                if validation.errors:
+                    for e in validation.errors:
+                        st.error(e)
+
+            if st.button("Submit Order", type="primary", disabled=not validation.is_valid if validation else False):
+                try:
+                    side = OrderSide.BUY if order_side == "BUY" else OrderSide.SELL
+                    otype = OrderType.MARKET if order_type == "MARKET" else OrderType.LIMIT
+
+                    trade = paper_trader.place_order(
+                        symbol=st.session_state.symbol,
+                        side=side,
+                        quantity=quantity,
+                        order_type=otype,
+                        price=limit_price
+                    )
+
+                    if trade:
+                        st.success(f"Order executed: {order_side} {quantity} {st.session_state.symbol} @ ${limit_price:,.2f}")
+                        st.rerun()
+                    else:
+                        st.error("Order failed")
+                except Exception as e:
+                    st.error(f"Order error: {e}")
 
 
 # =============================================================================

@@ -380,9 +380,13 @@ class ConceptDriftDetector:
         """Set baseline statistics from current windows."""
         if len(self._performance_window) > 0:
             self._baseline_performance = np.mean(self._performance_window)
+        else:
+            self._baseline_performance = 0.5  # Default baseline
 
         if len(self._confidence_window) > 0:
             self._baseline_confidence = np.mean(self._confidence_window)
+        else:
+            self._baseline_confidence = 0.5  # Default baseline
 
         for name, window in self._feature_windows.items():
             if len(window) > 0:
@@ -391,7 +395,9 @@ class ConceptDriftDetector:
                     np.std(window) + 1e-6
                 )
 
-        logger.info(f"Baseline set: perf={self._baseline_performance:.3f}, conf={self._baseline_confidence:.3f}")
+        perf = self._baseline_performance if self._baseline_performance is not None else 0.5
+        conf = self._baseline_confidence if self._baseline_confidence is not None else 0.5
+        logger.info(f"Baseline set: perf={perf:.3f}, conf={conf:.3f}")
 
     def detect(self) -> Optional[DriftAlert]:
         """

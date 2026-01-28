@@ -3,6 +3,57 @@
 # AI TRADE BOT - ONE-COMMAND SETUP & START
 # This script fixes EVERYTHING and gets you running in 5 minutes
 ##############################################################################
+#
+# TRAINING MODEL WORKFLOW & STRATEGY OVERVIEW
+# ============================================
+#
+# 1. MODEL TRAINING FLOW:
+#    a) Data Collection (7-365 days of historical candles)
+#    b) Feature Engineering (32 technical + 7 sentiment features)
+#    c) Multi-Model Training Pipeline:
+#       - LSTM Neural Network (pattern recognition)
+#       - TCN-LSTM-Attention (deep learning)
+#       - XGBoost, LightGBM, CatBoost (gradient boosting)
+#       - Stacking Meta-Learner (combines all models)
+#    d) Model Validation & Performance Testing
+#    e) Continuous Learning & Auto-Retraining
+#
+# 2. WORKING STRATEGIES (Discovered via Strategy Analyzer):
+#
+#    Strategy Name              Win Rate    Best For            Holding Time
+#    -------------------------  ----------  ------------------  --------------
+#    Momentum Breakout          High conf   Trending markets    1-4 hours
+#    Scalping                   Quick wins  Any market          < 1 hour
+#    Swing Trend Following      Medium      Strong trends       4-24 hours
+#    Swing Mean Reversion       Moderate    Ranging markets     4-24 hours
+#    Position Trading           Long-term   Major trends        > 24 hours
+#    Volatility Expansion       Breakouts   High volatility     Variable
+#    Range Trading              Sideways    Choppy markets      Variable
+#    Trend Following            Consistent  Established trends  > 24 hours
+#
+#    * Strategy selection is AUTOMATIC based on market regime detection
+#    * System uses GMM-HMM for regime classification (TRENDING, VOLATILE, CHOPPY)
+#    * Multi-timeframe analysis (15m, 1h, 4h, 1d) with weighted voting
+#
+# 3. AUTO-LEARNING TRIGGERS:
+#    - Retrain when win rate drops below 45%
+#    - Retrain every 30 days OR after 100 trades
+#    - Retrain after 3 consecutive losses
+#    - Concept drift detection (monitors market pattern changes)
+#
+# 4. RISK MANAGEMENT:
+#    - Max 2% risk per trade
+#    - 2:1 Risk/Reward ratio minimum
+#    - Dynamic position sizing (Kelly Criterion + Risk Parity)
+#    - Stop Loss & Take Profit calculated per regime
+#
+# 5. MODEL PERFORMANCE METRICS:
+#    - Win Rate Target: 55-65%
+#    - Sharpe Ratio: > 1.0 (good), > 1.5 (excellent)
+#    - Profit Factor: > 1.5 (profitable)
+#    - Max Drawdown: < 20%
+#
+##############################################################################
 
 set -e  # Exit on error
 
@@ -224,4 +275,5 @@ echo ""
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 echo "💡 TIP: Open dashboard in browser at http://localhost:8501"
+echo "💡 READ: Check ReadMe.md for complete workflow documentation"
 echo ""

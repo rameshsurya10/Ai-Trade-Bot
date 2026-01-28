@@ -92,7 +92,8 @@
       "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/pip uninstall:*)",
       "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/pip list:*)",
       "Bash(./venv/bin/python:*)",
-      "Bash(timeout 8 ./venv/bin/streamlit run:*)"
+      "Bash(timeout 8 ./venv/bin/streamlit run:*)",
+      "Bash(bash:*)"
     ]
   }
 }

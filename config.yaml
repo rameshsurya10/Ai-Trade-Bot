@@ -38,22 +38,22 @@ timeframes:
   intervals:
   - interval: 15m
     enabled: true
-    weight: 0.2
+    weight: 0.4
     sequence_length: 96
     min_training_interval_minutes: 120
   - interval: 1h
     enabled: true
-    weight: 0.35
+    weight: 0.6
     sequence_length: 60
     min_training_interval_minutes: 240
   - interval: 4h
-    enabled: true
-    weight: 0.25
+    enabled: false
+    weight: 0.0
     sequence_length: 42
     min_training_interval_minutes: 480
   - interval: 1d
-    enabled: true
-    weight: 0.2
+    enabled: false
+    weight: 0.0
     sequence_length: 30
     min_training_interval_minutes: 1440
 news:

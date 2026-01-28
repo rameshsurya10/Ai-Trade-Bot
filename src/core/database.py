@@ -132,10 +132,75 @@ class Database:
             cursor.execute(query, params if params else ())
             return cursor.fetchall()
 
+    def _migrate_schema(self, conn):
+        """
+        Add missing columns to existing tables (migrations).
+
+        NOTE: Column names and types are hardcoded allowlists - this is intentional
+        for security. Do NOT use dynamic values from external sources.
+        """
+        cursor = conn.cursor()
+
+        # Check if signals table exists before migrating
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'")
+        if not cursor.fetchone():
+            return  # Table doesn't exist yet, skip migration
+
+        # Get existing columns in signals table
+        cursor.execute("PRAGMA table_info(signals)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Columns that should exist in signals table (hardcoded allowlist)
+        # SECURITY: These values are intentionally hardcoded - do not make dynamic
+        new_columns = {
+            'signal_type': 'TEXT',
+            'strength': 'TEXT',
+            'atr': 'REAL',
+            'symbol': 'TEXT',
+            'interval': 'TEXT',
+            'actual_outcome': 'TEXT',
+            'outcome_price': 'REAL',
+            'outcome_timestamp': 'TEXT',
+            'pnl_percent': 'REAL',
+        }
+
+        for column, col_type in new_columns.items():
+            if column not in existing_columns:
+                try:
+                    cursor.execute(f'ALTER TABLE signals ADD COLUMN {column} {col_type}')
+                    logger.info(f"Added column {column} to signals table")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        logger.warning(f"Could not add column {column}: {e}")
+
+        # Rename 'signal' column to 'signal_type' if needed
+        if 'signal' in existing_columns and 'signal_type' not in existing_columns:
+            try:
+                cursor.execute("ALTER TABLE signals RENAME COLUMN signal TO signal_type")
+                logger.info("Renamed column 'signal' to 'signal_type'")
+            except sqlite3.OperationalError:
+                pass  # Older SQLite version, column already renamed, or other issue
+
+        # Add strategy_name to trade_outcomes if table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trade_outcomes'")
+        if cursor.fetchone():
+            try:
+                cursor.execute("PRAGMA table_info(trade_outcomes)")
+                trade_outcomes_columns = {row[1] for row in cursor.fetchall()}
+                if trade_outcomes_columns and 'strategy_name' not in trade_outcomes_columns:
+                    cursor.execute('ALTER TABLE trade_outcomes ADD COLUMN strategy_name TEXT')
+                    logger.info("Added column strategy_name to trade_outcomes table")
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    logger.warning(f"Could not add strategy_name column: {e}")
+
     def _init_schema(self):
         """Create database tables if they don't exist."""
         with self.connection() as conn:
             cursor = conn.cursor()
+
+            # Run migrations first for existing tables
+            self._migrate_schema(conn)
 
             # Candles table (OHLCV data)
             cursor.execute('''
@@ -277,6 +342,7 @@ class Database:
                     regime TEXT,
                     is_paper_trade INTEGER DEFAULT 0,
                     closed_by TEXT,
+                    strategy_name TEXT,
                     FOREIGN KEY (signal_id) REFERENCES signals(id)
                 )
             ''')
@@ -414,6 +480,40 @@ class Database:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_confidence_history
                 ON confidence_history(symbol, interval, timestamp DESC)
+            ''')
+
+            # Strategy performance table - stores analyzed strategy metrics
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS strategy_performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    analyzed_at TEXT NOT NULL,
+                    total_trades INTEGER NOT NULL,
+                    win_rate REAL NOT NULL,
+                    avg_profit_pct REAL,
+                    avg_loss_pct REAL,
+                    profit_factor REAL,
+                    sharpe_ratio REAL,
+                    max_drawdown_pct REAL,
+                    avg_holding_hours REAL,
+                    best_regime TEXT,
+                    confidence_threshold REAL,
+                    is_recommended INTEGER DEFAULT 0,
+                    recommendation TEXT,
+                    UNIQUE(strategy_name, symbol, interval, analyzed_at)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_strategy_performance
+                ON strategy_performance(symbol, interval, analyzed_at DESC)
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_strategy_performance_name
+                ON strategy_performance(strategy_name, sharpe_ratio DESC)
             ''')
 
             logger.debug(f"Database initialized: {self.db_path}")
@@ -964,7 +1064,8 @@ class Database:
         features_snapshot: str = None,
         regime: str = None,
         is_paper_trade: bool = False,
-        closed_by: str = None
+        closed_by: str = None,
+        strategy_name: str = None
     ) -> int:
         """
         Record detailed trade outcome.
@@ -988,6 +1089,7 @@ class Database:
             regime: Market regime at trade time
             is_paper_trade: True if paper trade
             closed_by: Reason for trade closure
+            strategy_name: Name of strategy used for this trade
 
         Returns:
             Trade outcome record ID
@@ -1000,14 +1102,15 @@ class Database:
                  entry_time, exit_time, predicted_direction, predicted_confidence,
                  predicted_probability, actual_direction, was_correct,
                  pnl_percent, pnl_absolute, features_snapshot, regime,
-                 is_paper_trade, closed_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_paper_trade, closed_by, strategy_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 signal_id, symbol, interval, entry_price, exit_price,
                 entry_time, exit_time,
                 predicted_direction, predicted_confidence, predicted_probability,
                 actual_direction, int(was_correct), pnl_percent, pnl_absolute,
-                features_snapshot, regime, int(is_paper_trade), closed_by
+                features_snapshot, regime, int(is_paper_trade), closed_by,
+                strategy_name
             ))
             return cursor.lastrowid
 
@@ -1410,3 +1513,130 @@ class Database:
             cursor.execute("DELETE FROM candles WHERE timestamp < ?", (cutoff,))
             deleted = cursor.rowcount
             logger.info(f"Deleted {deleted} old candles")
+
+    # =========================================================================
+    # STRATEGY PERFORMANCE OPERATIONS
+    # =========================================================================
+
+    def save_strategy_performance(
+        self,
+        strategy_name: str,
+        symbol: str,
+        interval: str,
+        metrics: dict
+    ) -> int:
+        """
+        Save strategy performance metrics to database.
+
+        Args:
+            strategy_name: Name of the strategy
+            symbol: Trading pair
+            interval: Timeframe
+            metrics: Dict with performance metrics
+
+        Returns:
+            Row ID of inserted record
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO strategy_performance
+                (strategy_name, symbol, interval, analyzed_at, total_trades,
+                 win_rate, avg_profit_pct, avg_loss_pct, profit_factor,
+                 sharpe_ratio, max_drawdown_pct, avg_holding_hours,
+                 best_regime, confidence_threshold, is_recommended, recommendation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                strategy_name,
+                symbol,
+                interval,
+                datetime.utcnow().isoformat(),
+                metrics.get('total_trades', 0),
+                metrics.get('win_rate', 0.0),
+                metrics.get('avg_profit_pct', 0.0),
+                metrics.get('avg_loss_pct', 0.0),
+                metrics.get('profit_factor', 0.0),
+                metrics.get('sharpe_ratio', 0.0),
+                metrics.get('max_drawdown_pct', 0.0),
+                metrics.get('avg_holding_hours', 0.0),
+                metrics.get('best_regime', 'NORMAL'),
+                metrics.get('confidence_threshold', 0.5),
+                1 if metrics.get('is_recommended', False) else 0,
+                metrics.get('recommendation', '')
+            ))
+            return cursor.lastrowid
+
+    def get_best_strategy(
+        self,
+        symbol: str,
+        interval: str,
+        by: str = 'sharpe_ratio'
+    ) -> Optional[Dict]:
+        """
+        Get the best-performing strategy for a symbol/interval.
+
+        Args:
+            symbol: Trading pair
+            interval: Timeframe
+            by: Metric to rank by ('sharpe_ratio', 'win_rate', 'profit_factor')
+
+        Returns:
+            Strategy dict or None if no strategies found
+        """
+        # Validate ranking column to prevent SQL injection
+        valid_columns = {'sharpe_ratio', 'win_rate', 'profit_factor', 'total_trades'}
+        if by not in valid_columns:
+            by = 'sharpe_ratio'
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f'''
+                SELECT * FROM strategy_performance
+                WHERE symbol = ? AND interval = ?
+                ORDER BY {by} DESC
+                LIMIT 1
+            ''', (symbol, interval))
+
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
+
+    def get_all_strategies(
+        self,
+        symbol: str,
+        interval: str,
+        min_trades: int = 3
+    ) -> List[Dict]:
+        """
+        Get all strategies for a symbol/interval, ranked by Sharpe ratio.
+
+        Args:
+            symbol: Trading pair
+            interval: Timeframe
+            min_trades: Minimum trades required
+
+        Returns:
+            List of strategy dicts
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM strategy_performance
+                WHERE symbol = ? AND interval = ? AND total_trades >= ?
+                ORDER BY sharpe_ratio DESC
+            ''', (symbol, interval, min_trades))
+
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_recommended_strategies(self, symbol: str, interval: str) -> List[Dict]:
+        """Get strategies marked as recommended."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM strategy_performance
+                WHERE symbol = ? AND interval = ? AND is_recommended = 1
+                ORDER BY sharpe_ratio DESC
+            ''', (symbol, interval))
+
+            return [dict(row) for row in cursor.fetchall()]

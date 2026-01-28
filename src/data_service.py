@@ -11,6 +11,7 @@ Usage:
 
 import sqlite3
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
@@ -322,6 +323,91 @@ class DataService:
     def last_update(self) -> Optional[datetime]:
         """Get last update time."""
         return self._last_update
+
+    def fetch_historical_data(self, days: int = 90) -> pd.DataFrame:
+        """
+        Fetch historical candle data from exchange.
+
+        Uses ccxt to fetch OHLCV data from the configured exchange.
+        This is for initial data population or re-training.
+
+        Args:
+            days: Number of days of historical data to fetch (1-1825)
+
+        Returns:
+            DataFrame with OHLCV columns: timestamp, datetime, open, high, low, close, volume
+
+        Raises:
+            ValueError: If days is not positive
+        """
+        import ccxt
+        from datetime import timedelta
+
+        # Input validation
+        if days <= 0:
+            raise ValueError("days must be a positive integer")
+        if days > 1825:  # 5 years max
+            logger.warning(f"Capping days from {days} to 1825 (5 years max)")
+            days = 1825
+
+        logger.info(f"Fetching {days} days of historical data for {self.symbol} @ {self.interval}")
+
+        # Initialize exchange
+        exchange_class = getattr(ccxt, self.exchange_name.lower())
+        exchange = exchange_class({
+            'enableRateLimit': True,
+        })
+
+        # Calculate time range
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(days=days)
+        since = int(start_time.timestamp() * 1000)
+
+        # Fetch OHLCV data
+        all_candles = []
+        limit_per_request = 1000
+
+        while since < int(end_time.timestamp() * 1000):
+            try:
+                ohlcv = exchange.fetch_ohlcv(
+                    symbol=self.symbol,
+                    timeframe=self.interval,
+                    since=since,
+                    limit=limit_per_request
+                )
+
+                if not ohlcv:
+                    break
+
+                all_candles.extend(ohlcv)
+
+                # Move to next batch
+                last_timestamp = ohlcv[-1][0]
+                if last_timestamp == since:
+                    break
+                since = last_timestamp + 1
+
+                logger.debug(f"Fetched {len(all_candles)} candles so far...")
+
+            except Exception as e:
+                logger.error(f"Error fetching OHLCV: {e}")
+                break
+
+        if not all_candles:
+            logger.warning("No historical data fetched")
+            return pd.DataFrame(columns=['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume'])
+
+        # Convert to DataFrame
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+
+        # Remove duplicates
+        df = df.drop_duplicates(subset=['timestamp'], keep='last')
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        logger.info(f"Fetched {len(df)} candles from {df['datetime'].min()} to {df['datetime'].max()}")
+
+        return df
 
     def get_status(self) -> dict:
         """Get service status (performance optimized)."""

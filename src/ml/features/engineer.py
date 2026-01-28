@@ -398,11 +398,14 @@ class FeatureEngineer:
         features_normalized = (features - self._feature_means) / self._feature_stds
 
         # Create sequences for LSTM
-        sequence_data = self._create_sequences(features_normalized)
+        # Exclude the last sample (no valid target for it due to shift(-1))
+        sequence_data = self._create_sequences(features_normalized[:-1])
 
         # Tabular data for boosting (use last point features)
-        tabular_data = features_normalized[self.sequence_length:]
-        targets = targets[self.sequence_length:-1]  # Align with sequences
+        # Note: sequence_data has len(features) - sequence_length - 1 samples
+        # Tabular and targets need to match this length
+        tabular_data = features_normalized[self.sequence_length:-1]  # Drop first seq_len and last
+        targets = targets[self.sequence_length:-1]  # Align with sequences (drop last as shift(-1) creates NaN)
 
         self._is_fitted = True
 

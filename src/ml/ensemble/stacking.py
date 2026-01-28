@@ -408,12 +408,55 @@ class StackingEnsemble:
         """Load ensemble from disk."""
         path = Path(path)
 
-        self.meta_learner = joblib.load(path / 'meta_learner.joblib')
-        self.scaler = joblib.load(path / 'scaler.joblib')
-        self._base_model_weights = joblib.load(path / 'weights.joblib')
+        # Check required files exist
+        meta_learner_path = path / 'meta_learner.joblib'
+        scaler_path = path / 'scaler.joblib'
+        weights_path = path / 'weights.joblib'
+
+        if not meta_learner_path.exists():
+            raise FileNotFoundError(f"Meta-learner not found: {meta_learner_path}")
+        if not scaler_path.exists():
+            raise FileNotFoundError(f"Scaler not found: {scaler_path}")
+
+        self.meta_learner = joblib.load(meta_learner_path)
+        self.scaler = joblib.load(scaler_path)
+        self._base_model_weights = joblib.load(weights_path) if weights_path.exists() else {}
+
+        # Load base models - collect updates first to avoid dict modification during iteration
+        models_to_update = {}
+        models_loaded = 0
+
+        for name, model in self.base_models.items():
+            if isinstance(model, nn.Module):
+                model_path = path / f'{name}.pt'
+                if model_path.exists():
+                    state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
+                    model.load_state_dict(state_dict)
+                    model.eval()
+                    models_loaded += 1
+                    logger.debug(f"Loaded PyTorch model: {name}")
+                else:
+                    logger.warning(f"PyTorch model file not found: {model_path}")
+            else:
+                model_path = path / f'{name}.joblib'
+                if model_path.exists():
+                    loaded_model = joblib.load(model_path)
+                    # Queue update instead of modifying during iteration
+                    models_to_update[name] = loaded_model
+                    models_loaded += 1
+                    logger.debug(f"Loaded sklearn/boosting model: {name}")
+                else:
+                    logger.warning(f"Sklearn model file not found: {model_path}")
+
+        # Apply queued updates after iteration completes
+        for name, loaded_model in models_to_update.items():
+            self.base_models[name] = loaded_model
+
+        if models_loaded == 0:
+            logger.warning("No base models were loaded - ensemble may not work correctly")
 
         self._is_fitted = True
-        logger.info(f"Ensemble loaded from {path}")
+        logger.info(f"Ensemble loaded from {path} ({models_loaded} models)")
 
 
 class RegimeAwareEnsemble:

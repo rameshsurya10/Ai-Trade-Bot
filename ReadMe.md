@@ -1540,6 +1540,86 @@ class RiskMonitor:
 
 ---
 
+## 🎓 Training Workflow & Active Strategies
+
+### Model Training Pipeline
+
+The system uses a **multi-model ensemble** trained on historical market data:
+
+```
+Data Collection → Feature Engineering → Multi-Model Training → Validation → Deployment
+```
+
+**Training Flow:**
+1. **Data**: 7-365 days of OHLCV candles from exchange
+2. **Features**: 32 technical + 7 sentiment = 39 total features
+3. **Models**:
+   - LSTM (pattern recognition)
+   - TCN-LSTM-Attention (deep learning)
+   - XGBoost, LightGBM, CatBoost (gradient boosting)
+   - Meta-Learner (combines all predictions)
+4. **Validation**: Walk-forward testing, no look-ahead bias
+5. **Auto-Retraining**: Triggered by performance drops, time elapsed, or concept drift
+
+### Active Trading Strategies
+
+The system **automatically selects strategies** based on market regime detection (GMM-HMM):
+
+| Strategy | Best For | Holding Time | Confidence | Market Regime |
+|----------|----------|--------------|------------|---------------|
+| **Momentum Breakout** | Trending markets | 1-4 hours | >85% | TRENDING |
+| **Scalping** | Quick opportunities | <1 hour | >70% | ANY |
+| **Swing Trend Following** | Strong trends | 4-24 hours | >75% | TRENDING |
+| **Swing Mean Reversion** | Ranging markets | 4-24 hours | >70% | CHOPPY |
+| **Position Trading** | Major trends | >24 hours | >80% | TRENDING |
+| **Volatility Expansion** | High volatility | Variable | >75% | VOLATILE |
+| **Range Trading** | Sideways markets | Variable | >70% | CHOPPY |
+
+**Market Regimes:**
+- **TRENDING**: Strong directional movement → Use trend-following strategies
+- **VOLATILE**: High price swings → Use breakout strategies
+- **CHOPPY**: Sideways/ranging → Use mean reversion strategies
+
+**Multi-Timeframe Analysis:**
+- 15m (20% weight) - Short-term noise filtering
+- 1h (35% weight) - Primary trading timeframe
+- 4h (25% weight) - Medium-term trend
+- 1d (20% weight) - Long-term bias
+
+### Auto-Learning System
+
+The bot automatically retrains when:
+- Win rate drops below 45% (performance degradation)
+- After 100 trades OR 30 days pass (periodic refresh)
+- 3 consecutive losses (immediate adaptation)
+- Concept drift detected (market pattern changes)
+
+**Continuous Learning Features:**
+- Experience Replay (10,000 trade buffer)
+- Prioritizes learning from losses
+- EWC (Elastic Weight Consolidation) prevents forgetting
+- Online learning with micro-updates after each trade
+
+### Risk Management
+
+- **Position Size**: 2% risk per trade (Kelly Criterion)
+- **Risk/Reward**: Minimum 2:1 ratio
+- **Stop Loss**: Dynamic based on ATR and market regime
+- **Take Profit**: Calculated from regime volatility
+- **Max Drawdown**: 20% portfolio limit
+- **Cooldown**: 60 minutes between trades
+
+### Performance Targets
+
+| Metric | Good | Excellent | Elite |
+|--------|------|-----------|-------|
+| Win Rate | 55-60% | 60-65% | >65% |
+| Sharpe Ratio | >1.0 | >1.5 | >2.0 |
+| Profit Factor | >1.5 | >2.0 | >2.5 |
+| Max Drawdown | <20% | <15% | <10% |
+
+---
+
 ## 🚀 Getting Started
 
 ### Prerequisites

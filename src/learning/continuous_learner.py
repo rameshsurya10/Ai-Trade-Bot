@@ -23,10 +23,8 @@ Features:
 
 import logging
 import threading
-import time
 from typing import Dict, List, Optional
 from datetime import datetime
-import pandas as pd
 import numpy as np
 
 from src.core.database import Database
@@ -36,6 +34,7 @@ from src.learning.confidence_gate import ConfidenceGate
 from src.learning.state_manager import LearningStateManager
 from src.learning.outcome_tracker import OutcomeTracker
 from src.learning.retraining_engine import RetrainingEngine
+from src.learning.strategy_analyzer import StrategyAnalyzer
 from src.ml.learning.continual import ContinualLearner
 
 logger = logging.getLogger(__name__)
@@ -158,6 +157,25 @@ class ContinuousLearningSystem:
         self._latest_predictions: Dict[str, AggregatedSignal] = {}
         self._predictions_lock = threading.Lock()
 
+        # Track last processed outcome per symbol/interval to avoid duplicate updates
+        self._last_online_update_outcome_id: Dict[str, int] = {}
+        self._outcome_tracking_lock = threading.Lock()
+
+        # Strategy analyzer for strategy-based trade decisions
+        db_path = self.config.get('database', {}).get('path', 'data/trading.db')
+        try:
+            self.strategy_analyzer = StrategyAnalyzer(
+                database_path=db_path,
+                config_path='config.yaml'
+            )
+        except Exception as e:
+            logger.warning(f"Strategy analyzer initialization failed: {e}. Strategy-based filtering disabled.")
+            self.strategy_analyzer = None
+
+        self._strategy_cache: Dict[str, dict] = {}  # symbol -> best strategy
+        self._strategy_cache_lock = threading.Lock()
+        self._last_strategy_analysis: Dict[str, datetime] = {}
+
         # Get enabled intervals
         self.enabled_intervals = self._get_enabled_intervals()
 
@@ -254,30 +272,53 @@ class ContinuousLearningSystem:
                     reason=reason
                 )
 
-            # 7. EXECUTE TRADE (if signal exists)
+            # 7. STRATEGY EVALUATION - Check all strategies before trading
+            best_strategy = self._evaluate_strategies_for_trade(
+                symbol=symbol,
+                interval=primary_interval,
+                direction=aggregated.direction,
+                confidence=aggregated.confidence,
+                regime=aggregated.regime
+            )
+
+            # 8. EXECUTE TRADE (only if signal exists AND strategy approves)
             executed = False
             signal_id = None
+            strategy_approved = best_strategy is not None and best_strategy.get('is_recommended', False)
 
             if aggregated.direction != 'NEUTRAL':
-                signal_id = self._execute_trade(
-                    brokerage=brokerage,
-                    symbol=symbol,
-                    prediction=aggregated,
-                    is_paper=(mode == 'LEARNING')
-                )
-                executed = True
+                # In LEARNING mode, always execute paper trades for training data
+                # In TRADING mode, only trade if strategy is recommended
+                should_execute = (mode == 'LEARNING') or (mode == 'TRADING' and strategy_approved)
 
-                logger.info(
-                    f"[{symbol}] {mode} MODE: {aggregated.direction} @ "
-                    f"{aggregated.confidence:.2%} ({brokerage_type})"
-                )
+                if should_execute:
+                    signal_id = self._execute_trade(
+                        brokerage=brokerage,
+                        symbol=symbol,
+                        prediction=aggregated,
+                        is_paper=(mode == 'LEARNING'),
+                        strategy_name=best_strategy.get('strategy_name') if best_strategy else None
+                    )
+                    executed = True
 
-                with self._stats_lock:
-                    self._stats['trades_executed'] += 1
-                    if mode == 'LEARNING':
-                        self._stats['paper_trades'] += 1
-                    else:
-                        self._stats['live_trades'] += 1
+                    strategy_info = f" [Strategy: {best_strategy['strategy_name']}]" if best_strategy else ""
+                    logger.info(
+                        f"[{symbol}] {mode} MODE: {aggregated.direction} @ "
+                        f"{aggregated.confidence:.2%} ({brokerage_type}){strategy_info}"
+                    )
+
+                    with self._stats_lock:
+                        self._stats['trades_executed'] += 1
+                        if mode == 'LEARNING':
+                            self._stats['paper_trades'] += 1
+                        else:
+                            self._stats['live_trades'] += 1
+                else:
+                    logger.info(
+                        f"[{symbol}] Trade SKIPPED: {aggregated.direction} @ "
+                        f"{aggregated.confidence:.2%} - No recommended strategy "
+                        f"(best: {best_strategy.get('strategy_name', 'None') if best_strategy else 'None'})"
+                    )
 
             # 8. STORE LATEST PREDICTION (for opposite signal detection)
             with self._predictions_lock:
@@ -299,7 +340,9 @@ class ContinuousLearningSystem:
                     k: v.to_dict() for k, v in timeframe_signals.items()
                 },
                 'reason': reason,
-                'signal_id': signal_id
+                'signal_id': signal_id,
+                'strategy': best_strategy,
+                'strategy_approved': strategy_approved
             }
 
         except Exception as e:
@@ -439,12 +482,150 @@ class ContinuousLearningSystem:
         with self._stats_lock:
             self._stats['mode_transitions'] += 1
 
+    def _evaluate_strategies_for_trade(
+        self,
+        symbol: str,
+        interval: str,
+        direction: str,
+        confidence: float,
+        regime: str
+    ) -> Optional[dict]:
+        """
+        Evaluate all strategies and determine if we should trade.
+
+        This method:
+        1. Analyzes historical trade outcomes to discover strategies
+        2. Ranks strategies by Sharpe ratio
+        3. Saves strategy performance to database
+        4. Returns the best strategy if it's recommended for trading
+
+        Args:
+            symbol: Trading pair
+            interval: Timeframe
+            direction: Predicted direction ('BUY', 'SELL', 'NEUTRAL')
+            confidence: Model confidence
+            regime: Current market regime
+
+        Returns:
+            Best strategy dict with is_recommended flag, or None
+        """
+        # If strategy analyzer not available, skip strategy-based filtering
+        if self.strategy_analyzer is None:
+            logger.debug("Strategy analyzer not available, skipping strategy evaluation")
+            return None
+
+        try:
+            # Check if we need to refresh strategy analysis (every hour)
+            key = f"{symbol}_{interval}"
+            now = datetime.utcnow()
+
+            # Thread-safe check for cache freshness
+            with self._strategy_cache_lock:
+                last_analysis = self._last_strategy_analysis.get(key)
+                should_refresh = (
+                    last_analysis is None or
+                    (now - last_analysis).total_seconds() > 3600  # 1 hour
+                )
+
+                # If another thread is already refreshing, use existing cache
+                if should_refresh and key in self._strategy_cache:
+                    # Return cached while another thread refreshes
+                    cached = self._strategy_cache.get(key)
+                    if cached:
+                        # Another thread might be refreshing, just use cache
+                        pass
+
+            if should_refresh:
+                logger.info(f"[{symbol} @ {interval}] Refreshing strategy analysis...")
+
+                # Discover strategies from historical data
+                strategies = self.strategy_analyzer.discover_strategies(lookback_days=365)
+
+                if strategies:
+                    # Rank strategies
+                    ranked = self.strategy_analyzer.rank_strategies(by='sharpe')
+
+                    # Save all strategies to database
+                    for strategy_name, strategy in strategies.items():
+                        is_recommended = (
+                            strategy.sharpe_ratio > 1.0 and
+                            strategy.win_rate > 0.50 and
+                            strategy.total_trades >= 10
+                        )
+
+                        recommendation = self.strategy_analyzer._get_recommendation(strategy)
+
+                        self.database.save_strategy_performance(
+                            strategy_name=strategy_name,
+                            symbol=symbol,
+                            interval=interval,
+                            metrics={
+                                'total_trades': strategy.total_trades,
+                                'win_rate': strategy.win_rate,
+                                'avg_profit_pct': strategy.avg_profit_pct,
+                                'avg_loss_pct': strategy.avg_loss_pct,
+                                'profit_factor': strategy.profit_factor,
+                                'sharpe_ratio': strategy.sharpe_ratio,
+                                'max_drawdown_pct': strategy.max_drawdown_pct,
+                                'avg_holding_hours': strategy.avg_holding_hours,
+                                'best_regime': strategy.best_regime,
+                                'confidence_threshold': strategy.confidence_threshold,
+                                'is_recommended': is_recommended,
+                                'recommendation': recommendation
+                            }
+                        )
+
+                    logger.info(
+                        f"[{symbol} @ {interval}] Saved {len(strategies)} strategies to database"
+                    )
+
+                    # Cache the best strategy
+                    if ranked:
+                        best_name, best_strategy = ranked[0]
+                        is_rec = (
+                            best_strategy.sharpe_ratio > 1.0 and
+                            best_strategy.win_rate > 0.50 and
+                            best_strategy.total_trades >= 10
+                        )
+
+                        with self._strategy_cache_lock:
+                            self._strategy_cache[key] = {
+                                'strategy_name': best_name,
+                                'sharpe_ratio': best_strategy.sharpe_ratio,
+                                'win_rate': best_strategy.win_rate,
+                                'profit_factor': best_strategy.profit_factor,
+                                'total_trades': best_strategy.total_trades,
+                                'best_regime': best_strategy.best_regime,
+                                'is_recommended': is_rec,
+                                'recommendation': self.strategy_analyzer._get_recommendation(best_strategy)
+                            }
+
+                # Update timestamp inside the lock
+                self._last_strategy_analysis[key] = now
+
+            # Get cached best strategy (already within lock scope above for refresh case)
+            with self._strategy_cache_lock:
+                best_strategy = self._strategy_cache.get(key)
+
+            # If no strategy found, try from database
+            if not best_strategy:
+                db_strategy = self.database.get_best_strategy(symbol, interval)
+                if db_strategy:
+                    best_strategy = dict(db_strategy)
+
+            return best_strategy
+
+        except Exception as e:
+            logger.error(f"Strategy evaluation failed: {e}", exc_info=True)
+            return None
+
     def _execute_trade(
         self,
         brokerage: any,
         symbol: str,
         prediction: AggregatedSignal,
-        is_paper: bool
+        is_paper: bool,
+        strategy_name: str = None
     ) -> Optional[int]:
         """
         Execute trade via brokerage.
@@ -454,6 +635,7 @@ class ContinuousLearningSystem:
             symbol: Trading pair
             prediction: Aggregated prediction
             is_paper: Whether this is a paper trade
+            strategy_name: Name of the strategy being used
 
         Returns:
             Signal ID or None
@@ -666,16 +848,6 @@ class ContinuousLearningSystem:
         # Keep position open
         return (False, "holding")
 
-    def _should_close_trade_wrapper(self, signal: dict, candle: any) -> bool:
-        """
-        Wrapper for backward compatibility.
-
-        Returns:
-            bool: True if should close
-        """
-        should_close, reason = self._should_close_trade(signal, candle)
-        return should_close
-
     def _schedule_retrain(
         self,
         symbol: str,
@@ -752,9 +924,11 @@ class ContinuousLearningSystem:
         data: dict = None
     ):
         """
-        Perform online learning update.
+        Check for completed trades and perform online learning update with confirmed outcomes.
 
-        Small, incremental update based on latest candle.
+        Online learning requires actual outcomes to avoid information leakage.
+        This method checks if we have pending trades that can now be evaluated,
+        and only then performs the online update.
 
         Args:
             symbol: Trading pair
@@ -769,7 +943,49 @@ class ContinuousLearningSystem:
             if not online_config.get('enabled', True):
                 return
 
-            # Get data
+            if not hasattr(self.predictor, 'online_update'):
+                return
+
+            # Get recent confirmed outcomes for this symbol/interval
+            # These are outcomes that have been recorded with actual price movements
+            recent_outcomes = self.outcome_tracker.get_performance_summary(
+                symbol=symbol,
+                interval=interval,
+                limit=5
+            ).get('recent_outcomes', [])
+
+            if not recent_outcomes:
+                return
+
+            # Only update with confirmed outcomes that haven't been used yet
+            latest_outcome = recent_outcomes[0] if recent_outcomes else None
+            if latest_outcome is None:
+                return
+
+            # Get outcome ID for tracking (avoid duplicate updates)
+            outcome_id = latest_outcome.get('id') or latest_outcome.get('signal_id') or latest_outcome.get('outcome_id')
+            key = f"{symbol}_{interval}"
+
+            with self._outcome_tracking_lock:
+                if self._last_online_update_outcome_id.get(key) == outcome_id:
+                    # Already processed this outcome
+                    return
+                self._last_online_update_outcome_id[key] = outcome_id
+
+            # Get the actual outcome (1 if price went up, 0 if down)
+            # Must consider the original trade direction for correct labeling
+            predicted_direction = latest_outcome.get('predicted_direction', 'BUY')
+            was_correct = latest_outcome.get('was_correct', False)
+
+            # Derive actual price movement from prediction and correctness
+            # BUY correct -> price UP (1), BUY wrong -> price DOWN (0)
+            # SELL correct -> price DOWN (0), SELL wrong -> price UP (1)
+            if predicted_direction == 'BUY':
+                actual_outcome = 1 if was_correct else 0
+            else:  # SELL
+                actual_outcome = 0 if was_correct else 1
+
+            # Get data for features
             if data and data.get('candles') is not None:
                 df = data['candles']
             else:
@@ -783,20 +999,22 @@ class ContinuousLearningSystem:
             if df is None or len(df) < 10:
                 return
 
-            # Perform small online update
-            # (Implementation depends on predictor's online learning capabilities)
-            if hasattr(self.predictor, 'online_update'):
-                self.predictor.online_update(
-                    df=df,
-                    symbol=symbol,
-                    interval=interval,
-                    learning_rate=online_config.get('learning_rate', 0.0001)
-                )
+            # Perform online update with the actual outcome
+            self.predictor.online_update(
+                df=df,
+                symbol=symbol,
+                interval=interval,
+                learning_rate=online_config.get('learning_rate', 0.0001),
+                actual_outcome=actual_outcome
+            )
 
-                with self._stats_lock:
-                    self._stats['online_updates'] += 1
+            with self._stats_lock:
+                self._stats['online_updates'] += 1
 
-                logger.debug(f"[{symbol} @ {interval}] Online learning update performed")
+            logger.debug(
+                f"[{symbol} @ {interval}] Online learning update performed "
+                f"(direction={predicted_direction}, was_correct={was_correct}, outcome={actual_outcome})"
+            )
 
         except Exception as e:
             logger.error(f"Online update failed: {e}", exc_info=True)

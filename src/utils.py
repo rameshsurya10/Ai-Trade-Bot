@@ -126,12 +126,6 @@ def get_model_path() -> Path:
     return PROJECT_ROOT / model_path_str
 
 
-def get_log_path() -> Path:
-    """Get log file path from config."""
-    log_path_str = get_config_value('logging.file', 'data/trading.log')
-    return PROJECT_ROOT / log_path_str
-
-
 def get_dashboard_config() -> dict:
     """Get dashboard configuration."""
     return {

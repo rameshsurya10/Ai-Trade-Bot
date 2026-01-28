@@ -49,6 +49,8 @@ streamlit>=1.28.0,<2.0.0        # Web dashboard
 plotly>=5.17.0,<6.0.0           # Interactive charts
 streamlit-autorefresh>=1.0.0    # Non-blocking auto-refresh for live updates
 websocket-client>=1.6.0,<2.0.0  # WebSocket streaming for real-time data
+websockets>=12.0,<14.0.0        # Async WebSocket for data provider
+aiohttp>=3.9.0,<4.0.0           # Async HTTP for REST API calls
 
 # =============================================================================
 # UTILITIES
