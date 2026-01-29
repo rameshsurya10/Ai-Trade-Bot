@@ -4,7 +4,6 @@
 # SECURITY - Never commit these!
 # =============================================================================
 config.yaml          # Contains credentials - use config.example.yaml as template
-.env
 *.pem
 *.key
 secrets/

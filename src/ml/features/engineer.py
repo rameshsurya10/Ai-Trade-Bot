@@ -218,17 +218,232 @@ class FeatureEngineer:
         df['trend_21'] = (df['close'] - df['close'].shift(21)) / (df['close'].shift(21) + 1e-10)
 
         # =====================================================================
-        # PATTERN FEATURES
+        # PATTERN FEATURES (Basic)
         # =====================================================================
         df['candle_body'] = abs(df['close'] - df['open'])
         df['candle_wick_upper'] = df['high'] - df[['open', 'close']].max(axis=1)
         df['candle_wick_lower'] = df[['open', 'close']].min(axis=1) - df['low']
         df['candle_body_ratio'] = df['candle_body'] / (df['high'] - df['low'] + 1e-10)
+        candle_range = df['high'] - df['low'] + 1e-10
 
         # Higher highs / lower lows
         df['higher_high'] = (df['high'] > df['high'].shift(1)).astype(int)
         df['lower_low'] = (df['low'] < df['low'].shift(1)).astype(int)
         df['higher_close'] = (df['close'] > df['close'].shift(1)).astype(int)
+
+        # =====================================================================
+        # JAPANESE CANDLESTICK PATTERNS
+        # =====================================================================
+        # These patterns are used for reversal and continuation detection
+        # Research shows candlestick patterns improve short-term prediction
+
+        # --- SINGLE CANDLE PATTERNS ---
+
+        # Doji: Open ≈ Close (tiny body, indecision)
+        # Body is less than 10% of range
+        df['doji'] = (df['candle_body'] / candle_range < 0.1).astype(int)
+
+        # Hammer: Small body at top, long lower wick (bullish reversal)
+        # Lower wick >= 2x body, upper wick <= 10% of range, body in upper 1/3
+        df['hammer'] = (
+            (df['candle_wick_lower'] >= 2 * df['candle_body']) &
+            (df['candle_wick_upper'] <= candle_range * 0.1) &
+            (df['candle_body_ratio'] < 0.35)
+        ).astype(int)
+
+        # Inverted Hammer: Small body at bottom, long upper wick (bullish after downtrend)
+        df['inverted_hammer'] = (
+            (df['candle_wick_upper'] >= 2 * df['candle_body']) &
+            (df['candle_wick_lower'] <= candle_range * 0.1) &
+            (df['candle_body_ratio'] < 0.35)
+        ).astype(int)
+
+        # Shooting Star: Small body at bottom, long upper wick (bearish reversal)
+        # Same shape as inverted hammer but appears after uptrend
+        df['shooting_star'] = (
+            (df['candle_wick_upper'] >= 2 * df['candle_body']) &
+            (df['candle_wick_lower'] <= candle_range * 0.1) &
+            (df['candle_body_ratio'] < 0.35) &
+            (df['close'] < df['open']) &  # Bearish candle
+            (df['close'].shift(1) > df['close'].shift(2))  # After uptrend (FIXED)
+        ).astype(int)
+
+        # Hanging Man: Same as hammer but after uptrend (bearish)
+        df['hanging_man'] = (
+            (df['candle_wick_lower'] >= 2 * df['candle_body']) &
+            (df['candle_wick_upper'] <= candle_range * 0.1) &
+            (df['candle_body_ratio'] < 0.35) &  # Added body ratio constraint
+            (df['close'].shift(1) > df['close'].shift(2))  # After uptrend
+        ).astype(int)
+
+        # Marubozu: Full body, no wicks (strong momentum)
+        # Bullish marubozu: close > open, no wicks
+        df['marubozu_bull'] = (
+            (df['close'] > df['open']) &
+            (df['candle_wick_upper'] <= candle_range * 0.05) &
+            (df['candle_wick_lower'] <= candle_range * 0.05)
+        ).astype(int)
+
+        # Bearish marubozu: close < open, no wicks
+        df['marubozu_bear'] = (
+            (df['close'] < df['open']) &
+            (df['candle_wick_upper'] <= candle_range * 0.05) &
+            (df['candle_wick_lower'] <= candle_range * 0.05)
+        ).astype(int)
+
+        # Spinning Top: Small body, long wicks on both sides (indecision)
+        df['spinning_top'] = (
+            (df['candle_body_ratio'] < 0.3) &
+            (df['candle_wick_upper'] >= df['candle_body']) &
+            (df['candle_wick_lower'] >= df['candle_body'])
+        ).astype(int)
+
+        # --- TWO CANDLE PATTERNS ---
+
+        prev_open = df['open'].shift(1)
+        prev_close = df['close'].shift(1)
+        prev_high = df['high'].shift(1)
+        prev_low = df['low'].shift(1)
+        prev_body = abs(prev_close - prev_open)
+
+        # Bullish Engulfing: Current bullish candle engulfs previous bearish
+        df['engulfing_bull'] = (
+            (df['close'] > df['open']) &  # Current is bullish
+            (prev_close < prev_open) &  # Previous is bearish
+            (df['open'] < prev_close) &  # Open below prev close
+            (df['close'] > prev_open)  # Close above prev open
+        ).astype(int)
+
+        # Bearish Engulfing: Current bearish candle engulfs previous bullish
+        df['engulfing_bear'] = (
+            (df['close'] < df['open']) &  # Current is bearish
+            (prev_close > prev_open) &  # Previous is bullish
+            (df['open'] > prev_close) &  # Open above prev close
+            (df['close'] < prev_open)  # Close below prev open
+        ).astype(int)
+
+        # Bullish Harami: Small bullish inside previous large bearish
+        df['harami_bull'] = (
+            (df['close'] > df['open']) &  # Current is bullish
+            (prev_close < prev_open) &  # Previous is bearish
+            (df['open'] > prev_close) &  # Open inside prev body
+            (df['close'] < prev_open) &  # Close inside prev body
+            (df['candle_body'] < prev_body * 0.5)  # Current body smaller
+        ).astype(int)
+
+        # Bearish Harami: Small bearish inside previous large bullish
+        df['harami_bear'] = (
+            (df['close'] < df['open']) &  # Current is bearish
+            (prev_close > prev_open) &  # Previous is bullish
+            (df['open'] < prev_close) &  # Open inside prev body
+            (df['close'] > prev_open) &  # Close inside prev body
+            (df['candle_body'] < prev_body * 0.5)  # Current body smaller
+        ).astype(int)
+
+        # Piercing Line: Bullish 2-candle reversal
+        # Day 1: Bearish, Day 2: Opens below low, closes above midpoint
+        prev_midpoint = (prev_open + prev_close) / 2
+        df['piercing_line'] = (
+            (prev_close < prev_open) &  # Previous bearish
+            (df['open'] < prev_low) &  # Open below prev low
+            (df['close'] > prev_midpoint) &  # Close above prev midpoint
+            (df['close'] < prev_open) &  # But not above prev open
+            (df['close'] > df['open'])  # Current is bullish
+        ).astype(int)
+
+        # Dark Cloud Cover: Bearish 2-candle reversal
+        # Day 1: Bullish, Day 2: Opens above high, closes below midpoint
+        df['dark_cloud'] = (
+            (prev_close > prev_open) &  # Previous bullish
+            (df['open'] > prev_high) &  # Open above prev high
+            (df['close'] < prev_midpoint) &  # Close below prev midpoint
+            (df['close'] > prev_open) &  # But not below prev open
+            (df['close'] < df['open'])  # Current is bearish
+        ).astype(int)
+
+        # Tweezer Top: Two candles with same high (reversal)
+        df['tweezer_top'] = (
+            (abs(df['high'] - prev_high) <= candle_range * 0.02) &
+            (prev_close > prev_open) &  # Previous bullish
+            (df['close'] < df['open'])  # Current bearish
+        ).astype(int)
+
+        # Tweezer Bottom: Two candles with same low (reversal)
+        df['tweezer_bottom'] = (
+            (abs(df['low'] - prev_low) <= candle_range * 0.02) &
+            (prev_close < prev_open) &  # Previous bearish
+            (df['close'] > df['open'])  # Current bullish
+        ).astype(int)
+
+        # --- THREE CANDLE PATTERNS ---
+
+        prev2_close = df['close'].shift(2)
+        prev2_open = df['open'].shift(2)
+
+        # Morning Star: Bullish 3-candle reversal
+        # Day 1: Large bearish, Day 2: Small body (gap down), Day 3: Large bullish
+        df['morning_star'] = (
+            (prev2_close < prev2_open) &  # Day 1 bearish
+            (abs(prev2_close - prev2_open) > candle_range.shift(2) * 0.5) &  # Large body
+            (abs(prev_close - prev_open) < candle_range.shift(1) * 0.3) &  # Day 2 small
+            (df['close'] > df['open']) &  # Day 3 bullish
+            (df['close'] > (prev2_open + prev2_close) / 2)  # Closes above day 1 midpoint
+        ).astype(int)
+
+        # Evening Star: Bearish 3-candle reversal
+        df['evening_star'] = (
+            (prev2_close > prev2_open) &  # Day 1 bullish
+            (abs(prev2_close - prev2_open) > candle_range.shift(2) * 0.5) &  # Large body
+            (abs(prev_close - prev_open) < candle_range.shift(1) * 0.3) &  # Day 2 small
+            (df['close'] < df['open']) &  # Day 3 bearish
+            (df['close'] < (prev2_open + prev2_close) / 2)  # Closes below day 1 midpoint
+        ).astype(int)
+
+        # Three White Soldiers: 3 consecutive bullish (strong bullish)
+        df['three_white_soldiers'] = (
+            (df['close'] > df['open']) &
+            (prev_close > prev_open) &
+            (prev2_close > prev2_open) &
+            (df['close'] > prev_close) &
+            (prev_close > prev2_close) &
+            (df['candle_body_ratio'] > 0.5) &
+            (df['candle_body'].shift(1) / candle_range.shift(1) > 0.5)
+        ).astype(int)
+
+        # Three Black Crows: 3 consecutive bearish (strong bearish)
+        df['three_black_crows'] = (
+            (df['close'] < df['open']) &
+            (prev_close < prev_open) &
+            (prev2_close < prev2_open) &
+            (df['close'] < prev_close) &
+            (prev_close < prev2_close) &
+            (df['candle_body_ratio'] > 0.5) &
+            (df['candle_body'].shift(1) / candle_range.shift(1) > 0.5)
+        ).astype(int)
+
+        # --- PATTERN STRENGTH AGGREGATES ---
+
+        # Bullish pattern score: Sum of all bullish patterns
+        df['bullish_patterns'] = (
+            df['hammer'] + df['inverted_hammer'] + df['marubozu_bull'] +
+            df['engulfing_bull'] + df['harami_bull'] + df['piercing_line'] +
+            df['tweezer_bottom'] + df['morning_star'] + df['three_white_soldiers']
+        )
+
+        # Bearish pattern score: Sum of all bearish patterns
+        df['bearish_patterns'] = (
+            df['shooting_star'] + df['hanging_man'] + df['marubozu_bear'] +
+            df['engulfing_bear'] + df['harami_bear'] + df['dark_cloud'] +
+            df['tweezer_top'] + df['evening_star'] + df['three_black_crows']
+        )
+
+        # Net pattern signal: Bullish - Bearish
+        df['pattern_signal'] = df['bullish_patterns'] - df['bearish_patterns']
+
+        # Reversal pattern detected (any)
+        df['reversal_pattern'] = (
+            (df['bullish_patterns'] > 0) | (df['bearish_patterns'] > 0)
+        ).astype(int)
 
         return df
 
@@ -306,30 +521,71 @@ class FeatureEngineer:
             return df
 
     def get_feature_columns(self) -> List[str]:
-        """Get list of feature column names."""
+        """
+        Get list of feature column names.
+
+        Returns optimized feature set based on research:
+        - Removed redundant/low-value indicators
+        - Added Japanese candlestick patterns
+        - Focus on high-predictive-power features
+        """
         base_features = [
-            # Price
-            'returns', 'log_returns',
-            'price_sma_7_ratio', 'price_sma_21_ratio', 'price_sma_50_ratio',
+            # =================================================================
+            # PRICE (2 features) - Core price movement
+            # =================================================================
+            'returns',           # Simple returns - essential
+            'log_returns',       # Log returns - better for ML
 
-            # Volatility
-            'atr_14', 'atr_7', 'bb_width', 'bb_position',
-            'volatility_7', 'volatility_14',
+            # =================================================================
+            # VOLATILITY (4 features) - Risk measurement
+            # =================================================================
+            'atr_14',            # Average True Range - key for SL/TP
+            'bb_width',          # Bollinger Band width - volatility expansion
+            'bb_position',       # Position within bands - mean reversion
+            'volatility_14',     # Historical volatility
 
-            # Momentum
-            'rsi_14', 'rsi_7', 'stoch_k', 'stoch_d',
-            'macd', 'macd_signal', 'macd_hist',
-            'roc_5', 'roc_10', 'williams_r', 'cci',
+            # =================================================================
+            # MOMENTUM (6 features) - Speed of price change
+            # =================================================================
+            'rsi_14',            # RSI - oversold/overbought
+            'macd_hist',         # MACD histogram - momentum strength
+            'stoch_k',           # Stochastic %K - momentum oscillator
+            'roc_10',            # Rate of change - momentum
+            'williams_r',        # Williams %R - similar to stoch but inverted
+            'cci',               # Commodity Channel Index - trend strength
 
-            # Volume
-            'volume_ratio', 'volume_change',
+            # =================================================================
+            # VOLUME (2 features) - Trading activity
+            # =================================================================
+            'volume_ratio',      # Current vs avg volume
+            'volume_change',     # Volume momentum
 
-            # Trend
-            'adx', 'plus_di', 'minus_di', 'di_diff',
-            'trend_7', 'trend_14',
+            # =================================================================
+            # TREND (4 features) - Direction and strength
+            # =================================================================
+            'adx',               # Trend strength (not direction)
+            'di_diff',           # Directional indicator difference
+            'trend_14',          # 14-period trend
+            'price_sma_21_ratio', # Price vs 21 SMA
 
-            # Pattern
-            'candle_body_ratio', 'higher_high', 'lower_low', 'higher_close'
+            # =================================================================
+            # CANDLESTICK PATTERNS (8 features) - Reversal/Continuation
+            # =================================================================
+            'doji',              # Indecision pattern
+            'hammer',            # Bullish reversal
+            'shooting_star',     # Bearish reversal
+            'engulfing_bull',    # Strong bullish reversal
+            'engulfing_bear',    # Strong bearish reversal
+            'morning_star',      # 3-candle bullish reversal
+            'evening_star',      # 3-candle bearish reversal
+            'pattern_signal',    # Net bullish/bearish pattern score
+
+            # =================================================================
+            # PATTERN BASICS (3 features) - Price action
+            # =================================================================
+            'candle_body_ratio', # Body as % of range
+            'higher_high',       # Making new highs
+            'lower_low',         # Making new lows
         ]
 
         return base_features

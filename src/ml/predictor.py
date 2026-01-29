@@ -17,12 +17,13 @@ import numpy as np
 import pandas as pd
 import torch
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from pathlib import Path
 import logging
 import joblib
 from datetime import datetime
+from sklearn.ensemble import RandomForestClassifier
 
 from .regime import RegimeDetector
 from .models import create_base_models
@@ -30,6 +31,7 @@ from .ensemble import StackingEnsemble
 from .risk import RiskManager
 from .learning import ContinualLearner
 from .features import FeatureEngineer
+from .features.selector import AdaptiveFeatureSelector, MarketRegime, get_features_for_regime
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +108,9 @@ class UnbreakablePredictor:
         sequence_length: int = 60,
         hidden_size: int = 128,
         use_gpu: bool = True,
-        capital: float = 100000.0
+        capital: float = 100000.0,
+        adaptive_features: bool = True,
+        max_features: int = 15
     ):
         """
         Initialize the Unbreakable Predictor.
@@ -118,6 +122,8 @@ class UnbreakablePredictor:
             hidden_size: Hidden layer size
             use_gpu: Whether to use GPU
             capital: Trading capital for risk calculations
+            adaptive_features: Enable adaptive feature selection per regime
+            max_features: Maximum features to use (if adaptive_features=True)
         """
         self.config_path = config_path
         self.model_dir = Path(model_dir)
@@ -126,6 +132,8 @@ class UnbreakablePredictor:
         self.sequence_length = sequence_length
         self.hidden_size = hidden_size
         self.capital = capital
+        self.adaptive_features = adaptive_features
+        self.max_features = max_features
         self.device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
 
         # Initialize components
@@ -142,6 +150,16 @@ class UnbreakablePredictor:
             atr_multiplier_tp=4.0
         )
 
+        # Adaptive feature selector
+        self.feature_selector: Optional[AdaptiveFeatureSelector] = None
+        if adaptive_features:
+            self.feature_selector = AdaptiveFeatureSelector(
+                n_features=max_features,
+                use_shap=True,
+                regime_weight=0.4,
+                importance_weight=0.6
+            )
+
         # These will be initialized after fitting
         self.base_models: Dict[str, Any] = {}
         self.ensemble: Optional[StackingEnsemble] = None
@@ -149,11 +167,27 @@ class UnbreakablePredictor:
 
         self._is_fitted = False
         self._last_prediction: Optional[TradingSignal] = None
+        self._selected_features: Dict[str, List[str]] = {}  # Cache selected features per regime
+        self._training_features: List[str] = []  # Features used during training (for prediction consistency)
 
         # Thread safety lock for model operations
         self._model_lock = threading.Lock()
 
         logger.info(f"UnbreakablePredictor initialized on {self.device}")
+
+    @property
+    def tcn_lstm_model(self):
+        """
+        Get the TCN-LSTM-Attention neural network model.
+
+        Used by PerformanceBasedLearner for reinforcement learning.
+
+        Returns:
+            The neural network model or None if not fitted
+        """
+        return self.base_models.get('tcn_lstm_attention')
+        if adaptive_features:
+            logger.info(f"Adaptive feature selection enabled (max {max_features} features)")
 
     def fit(
         self,
@@ -190,12 +224,108 @@ class UnbreakablePredictor:
             logger.info("Step 2: Engineering features with SVMD...")
         feature_set = self.feature_engineer.fit_transform(df, self.regime_detector)
 
-        n_features = feature_set.tabular_data.shape[1]
-        logger.info(f"   Created {n_features} features from {len(df)} samples")
+        n_features_original = feature_set.tabular_data.shape[1]
+        logger.info(f"   Created {n_features_original} features from {len(df)} samples")
 
-        # 3. Create base models
+        # 3. Apply adaptive feature selection BEFORE training
+        if self.adaptive_features and self.feature_selector is not None:
+            if verbose:
+                logger.info("Step 3: Applying adaptive feature selection...")
+
+            # Get all feature names from engineer
+            all_feature_names = list(self.feature_engineer._feature_names)  # Copy to avoid mutation
+
+            # Calculate feature importance using sampled data for efficiency
+            X_full = feature_set.tabular_data
+            y_full = feature_set.targets
+
+            # Sample data for importance calculation (memory efficient)
+            sample_size = min(5000, len(X_full))
+            X_sample = X_full[:sample_size]
+            y_sample = y_full[:sample_size]
+
+            # Use a lightweight RF for initial importance
+            rf = RandomForestClassifier(n_estimators=30, max_depth=8, random_state=42, n_jobs=2)
+            rf.fit(X_sample, y_sample)
+
+            # Calculate importance from RF + regime effectiveness
+            self.feature_selector.calculate_importance(
+                {'random_forest': rf}, X_sample, y_sample, all_feature_names
+            )
+
+            # Select features using UNION of top features across ALL regimes
+            # This ensures model works well regardless of market conditions
+            all_selected = set()
+            feature_counts = {}
+            all_regimes = [MarketRegime.BULL, MarketRegime.BEAR, MarketRegime.SIDEWAYS, MarketRegime.VOLATILE]
+
+            for regime in all_regimes:
+                regime_selection = self.feature_selector.select_features(
+                    all_feature_names, regime, n_features=self.max_features
+                )
+                for f in regime_selection.selected_features:
+                    all_selected.add(f)
+                    feature_counts[f] = feature_counts.get(f, 0) + 1
+
+            # Limit to max_features by taking most common across regimes
+            if len(all_selected) > self.max_features:
+                # Sort by count (most common first), then by importance
+                sorted_features = sorted(
+                    all_selected,
+                    key=lambda f: (feature_counts.get(f, 0), self.feature_selector._feature_importance.get(f, 0)),
+                    reverse=True
+                )
+                selected_features = sorted_features[:self.max_features]
+            else:
+                selected_features = list(all_selected)
+
+            # Validate all selected features exist in original
+            valid_selected = [f for f in selected_features if f in all_feature_names]
+            if len(valid_selected) != len(selected_features):
+                logger.warning(f"Some selected features not found, using {len(valid_selected)} of {len(selected_features)}")
+            selected_features = valid_selected
+
+            if not selected_features:
+                raise ValueError("Feature selection returned no valid features - cannot train model")
+
+            self._training_features = selected_features  # Store for prediction consistency
+
+            logger.info(f"   Selected {len(selected_features)} of {n_features_original} features (cross-regime optimal)")
+            logger.info(f"   Top features: {', '.join(selected_features[:5])}...")
+
+            # Build feature index mapping
+            feature_indices = [all_feature_names.index(f) for f in selected_features]
+
+            # Validate dimensions before slicing
+            if feature_set.sequence_data is not None and len(feature_set.sequence_data) > 0:
+                if feature_set.sequence_data.shape[2] != len(all_feature_names):
+                    logger.warning(f"Sequence data feature mismatch: {feature_set.sequence_data.shape[2]} vs {len(all_feature_names)}")
+
+            # Update tabular data to only include selected features
+            feature_set.tabular_data = feature_set.tabular_data[:, feature_indices]
+
+            # Update sequence data if present (filter last dimension)
+            if feature_set.sequence_data is not None and len(feature_set.sequence_data) > 0:
+                feature_set.sequence_data = feature_set.sequence_data[:, :, feature_indices]
+
+            # Update feature engineer's internal state to match
+            self.feature_engineer._feature_names = selected_features
+            self.feature_engineer._feature_means = self.feature_engineer._feature_means[feature_indices]
+            self.feature_engineer._feature_stds = self.feature_engineer._feature_stds[feature_indices]
+
+            # Cache selection for all regimes
+            for regime in all_regimes:
+                self._selected_features[regime.value] = selected_features
+
+            n_features = len(selected_features)
+            logger.info(f"   Training will use {n_features} features")
+        else:
+            n_features = n_features_original
+            self._training_features = list(self.feature_engineer._feature_names) if self.feature_engineer._feature_names else []
+
+        # 4. Create base models with CORRECT feature count
         if verbose:
-            logger.info("Step 3: Creating base models...")
+            logger.info(f"Step {'4' if self.adaptive_features else '3'}: Creating base models (input_size={n_features})...")
         self.base_models = create_base_models(
             input_size=n_features,
             hidden_size=self.hidden_size,
@@ -203,9 +333,10 @@ class UnbreakablePredictor:
             use_gpu=(self.device.type == 'cuda')
         )
 
-        # 4. Train base models
+        # 5. Train base models
         if verbose:
-            logger.info("Step 4: Training base models...")
+            step = 5 if self.adaptive_features else 4
+            logger.info(f"Step {step}: Training base models...")
 
         X = feature_set.tabular_data
         y = feature_set.targets
@@ -242,9 +373,10 @@ class UnbreakablePredictor:
                     verbose=False
                 )
 
-        # 5. Create and train stacking ensemble
+        # 6. Create and train stacking ensemble
         if verbose:
-            logger.info("Step 5: Training stacking ensemble...")
+            step = 6 if self.adaptive_features else 5
+            logger.info(f"Step {step}: Training stacking ensemble...")
 
         self.ensemble = StackingEnsemble(
             base_models=self.base_models,
@@ -260,9 +392,10 @@ class UnbreakablePredictor:
             verbose=verbose
         )
 
-        # 6. Initialize continual learner
+        # 7. Initialize continual learner
         if verbose:
-            logger.info("Step 6: Initializing continual learning...")
+            step = 7 if self.adaptive_features else 6
+            logger.info(f"Step {step}: Initializing continual learning...")
 
         # Get the PyTorch model for continual learning
         pytorch_model = None
@@ -289,12 +422,13 @@ class UnbreakablePredictor:
 
         self._is_fitted = True
 
-        # 7. Evaluate
+        # 8. Evaluate
         if verbose:
-            logger.info("Step 7: Evaluating model...")
+            step = 8 if self.adaptive_features else 7
+            logger.info(f"Step {step}: Evaluating model...")
             self._evaluate(X_val, y_val, X_seq_val)
 
-        # 8. Save models
+        # 9. Save models
         self.save()
 
         logger.info("="*60)
@@ -578,50 +712,6 @@ class UnbreakablePredictor:
             warnings=[reason]
         )
 
-    def update(
-        self,
-        df: pd.DataFrame,
-        actual_outcome: int
-    ):
-        """
-        Update model with new observation (for continuous learning).
-
-        Args:
-            df: DataFrame with OHLCV data
-            actual_outcome: Actual outcome (1 if price went up, 0 if down)
-        """
-        if self.continual_learner is None:
-            return
-
-        # Get features
-        feature_set = self.feature_engineer.transform(df, self.regime_detector)
-
-        if len(feature_set.tabular_data) == 0:
-            return
-
-        # Get last prediction
-        last_pred = self._last_prediction
-        if last_pred is None:
-            return
-
-        # Update drift detector
-        alert = self.continual_learner.update_drift_detector(
-            prediction=last_pred.probability,
-            actual=actual_outcome,
-            confidence=last_pred.model_confidence
-        )
-
-        if alert:
-            logger.warning(f"Drift alert: {alert.recommendation}")
-
-        # Add to replay buffer
-        features = feature_set.tabular_data[-1]
-        self.continual_learner.add_to_replay(
-            features=features,
-            target=actual_outcome,
-            regime=last_pred.regime
-        )
-
     def online_update(
         self,
         df: pd.DataFrame,
@@ -733,11 +823,14 @@ class UnbreakablePredictor:
         # Save regime detector
         joblib.dump(self.regime_detector, path / 'regime_detector.joblib')
 
-        # Save feature engineer parameters
+        # Save feature engineer parameters and training features
         joblib.dump({
             'feature_means': self.feature_engineer._feature_means,
             'feature_stds': self.feature_engineer._feature_stds,
-            'feature_names': self.feature_engineer._feature_names
+            'feature_names': self.feature_engineer._feature_names,
+            'training_features': self._training_features,
+            'adaptive_features': self.adaptive_features,
+            'max_features': self.max_features
         }, path / 'feature_params.joblib')
 
         logger.info(f"Models saved to {path}")
@@ -761,6 +854,11 @@ class UnbreakablePredictor:
         self.feature_engineer._feature_stds = feature_params['feature_stds']
         self.feature_engineer._feature_names = feature_params['feature_names']
         self.feature_engineer._is_fitted = True
+
+        # Load training features (for prediction consistency)
+        self._training_features = feature_params.get('training_features', feature_params['feature_names'])
+        self.adaptive_features = feature_params.get('adaptive_features', self.adaptive_features)
+        self.max_features = feature_params.get('max_features', self.max_features)
 
         # Load ensemble
         if (path / 'ensemble').exists():
@@ -787,6 +885,96 @@ class UnbreakablePredictor:
             'base_models': list(self.base_models.keys()),
             'sequence_length': self.sequence_length,
             'hidden_size': self.hidden_size,
+            'adaptive_features': self.adaptive_features,
+            'max_features': self.max_features,
+            'n_training_features': len(self._training_features) if self._training_features else 0,
+            'training_features': self._training_features[:5] if self._training_features else [],  # Show top 5
+            'n_total_features': len(self.feature_engineer._feature_names) if self.feature_engineer._feature_names else 0,
             'continual_learning': self.continual_learner.get_status() if self.continual_learner else None,
             'last_prediction': self._last_prediction.direction if self._last_prediction else None
         }
+
+    def get_feature_importance(self, regime: str = None) -> Dict[str, float]:
+        """
+        Get feature importance rankings.
+
+        Args:
+            regime: Market regime (bull/bear/sideways/volatile). If None, uses current.
+
+        Returns:
+            Dict of feature name -> importance score
+        """
+        if not self._is_fitted or self.feature_selector is None:
+            return {}
+
+        feature_names = self.feature_engineer._feature_names
+        if not feature_names:
+            return {}
+
+        # Calculate importance if not already done
+        if not self.feature_selector._feature_importance:
+            X = np.zeros((100, len(feature_names)))  # Dummy for structure
+            y = np.zeros(100)
+            self.feature_selector.calculate_importance(
+                self.base_models, X, y, feature_names
+            )
+
+        return self.feature_selector._feature_importance
+
+    def get_selected_features(self, regime: str) -> List[str]:
+        """
+        Get selected features for a specific regime.
+
+        Args:
+            regime: Market regime (bull/bear/sideways/volatile)
+
+        Returns:
+            List of selected feature names
+        """
+        if not self.adaptive_features:
+            return self.feature_engineer._feature_names or []
+
+        # Check cache
+        if regime in self._selected_features:
+            return self._selected_features[regime]
+
+        # Calculate selection
+        try:
+            market_regime = MarketRegime(regime.lower())
+            feature_names = self.feature_engineer._feature_names or []
+
+            if self.feature_selector and feature_names:
+                result = self.feature_selector.select_features(
+                    feature_names, market_regime, self.max_features
+                )
+                self._selected_features[regime] = result.selected_features
+                return result.selected_features
+        except (ValueError, KeyError):
+            pass
+
+        # Fallback to research-backed defaults
+        return get_features_for_regime(regime)
+
+    def print_feature_rankings(self, regime: str = 'sideways', top_n: int = 20) -> str:
+        """
+        Print feature importance rankings.
+
+        Args:
+            regime: Market regime
+            top_n: Number of top features to show
+
+        Returns:
+            Formatted string output
+        """
+        if self.feature_selector is None:
+            return "Adaptive feature selection not enabled"
+
+        feature_names = self.feature_engineer._feature_names or []
+        if not feature_names:
+            return "No features available (model not fitted?)"
+
+        try:
+            market_regime = MarketRegime(regime.lower())
+            return self.feature_selector.print_rankings(feature_names, market_regime, top_n)
+        except ValueError:
+            return f"Invalid regime: {regime}"

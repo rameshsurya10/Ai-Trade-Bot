@@ -27,11 +27,9 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import yaml
-from pathlib import Path
 from typing import Dict, List, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -218,65 +216,6 @@ class StrategyAnalyzer:
             result[unclassified & (df['regime'] == 'TRENDING')] = 'Trend Following'
 
         return result
-
-    def _classify_trade(self, trade: pd.Series) -> str:
-        """
-        Classify a trade into a strategy type based on behavior.
-
-        Strategy identification logic:
-        - Scalping: < 1 hour hold
-        - Momentum Breakout: High confidence (>85%), 1-4 hour hold
-        - Swing Trading: 4-24 hour hold
-        - Mean Reversion: Enters on dips, exits on bounces
-        - Trend Following: Holds longer (>24h), follows trend
-        - Counter-Trend: Trades against prevailing direction
-        - Range Trading: Low volatility regime
-        - Volatility Expansion: High volatility regime
-        """
-        holding_hours = trade['holding_hours']
-        confidence = trade['predicted_confidence']
-        regime = trade.get('regime', 'NORMAL')
-        pnl = trade['pnl_percent']
-
-        # Get thresholds from config (with defaults)
-        classification = self.config.get('classification', {})
-        scalping_hours = classification.get('scalping_hours', 1)
-        momentum_conf = classification.get('momentum_confidence', 0.85)
-        momentum_min = classification.get('momentum_min_hours', 1)
-        momentum_max = classification.get('momentum_max_hours', 4)
-        swing_min = classification.get('swing_min_hours', 4)
-        swing_max = classification.get('swing_max_hours', 24)
-        position_min = classification.get('position_min_hours', 24)
-
-        # Scalping: Quick trades
-        if holding_hours < scalping_hours:
-            return "Scalping"
-
-        # Momentum Breakout: High confidence + short hold
-        if confidence >= momentum_conf and momentum_min <= holding_hours < momentum_max:
-            return "Momentum Breakout"
-
-        # Swing Trading: Medium hold
-        if swing_min <= holding_hours <= swing_max:
-            if regime == 'TRENDING':
-                return "Swing Trend Following"
-            else:
-                return "Swing Mean Reversion"
-
-        # Position Trading: Long hold
-        if holding_hours > position_min:
-            return "Position Trading"
-
-        # Regime-based strategies
-        if regime == 'VOLATILE':
-            return "Volatility Expansion"
-        elif regime == 'CHOPPY':
-            return "Range Trading"
-        elif regime == 'TRENDING':
-            return "Trend Following"
-
-        # Default
-        return "General Strategy"
 
     def _calculate_strategy_metrics(self, name: str, trades: pd.DataFrame) -> Strategy:
         """Calculate comprehensive metrics for a strategy."""

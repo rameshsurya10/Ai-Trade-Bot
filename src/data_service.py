@@ -324,7 +324,7 @@ class DataService:
         """Get last update time."""
         return self._last_update
 
-    def fetch_historical_data(self, days: int = 90) -> pd.DataFrame:
+    def fetch_historical_data(self, days: int = 90, interval: str = None) -> pd.DataFrame:
         """
         Fetch historical candle data from exchange.
 
@@ -333,6 +333,7 @@ class DataService:
 
         Args:
             days: Number of days of historical data to fetch (1-1825)
+            interval: Timeframe to fetch (e.g., '15m', '1h'). If None, uses configured interval.
 
         Returns:
             DataFrame with OHLCV columns: timestamp, datetime, open, high, low, close, volume
@@ -343,6 +344,9 @@ class DataService:
         import ccxt
         from datetime import timedelta
 
+        # Use provided interval or fall back to configured interval
+        timeframe = interval or self.interval
+
         # Input validation
         if days <= 0:
             raise ValueError("days must be a positive integer")
@@ -350,7 +354,7 @@ class DataService:
             logger.warning(f"Capping days from {days} to 1825 (5 years max)")
             days = 1825
 
-        logger.info(f"Fetching {days} days of historical data for {self.symbol} @ {self.interval}")
+        logger.info(f"Fetching {days} days of historical data for {self.symbol} @ {timeframe}")
 
         # Initialize exchange
         exchange_class = getattr(ccxt, self.exchange_name.lower())
@@ -371,7 +375,7 @@ class DataService:
             try:
                 ohlcv = exchange.fetch_ohlcv(
                     symbol=self.symbol,
-                    timeframe=self.interval,
+                    timeframe=timeframe,
                     since=since,
                     limit=limit_per_request
                 )

@@ -1,17 +1,13 @@
 """
 AI Trade Bot - Unified Dashboard
 =================================
-Single-page dashboard with all trading features.
+Streamlined dashboard with consolidated navigation.
 
-Features:
-- Real-time market data
-- AI predictions with ensemble analysis
-- Portfolio tracking
-- Paper trading
-- Backtesting
-- Risk management
-- Performance metrics
-- System monitoring
+Pages:
+- Dashboard: Real-time chart, AI predictions, market analysis
+- Trading Center: AI Trading, Portfolio, Performance (3 tabs)
+- Forex Markets: (forex mode only) Currency pairs and position sizing
+- Settings: Trading, Risk, Learning, Notifications, System
 
 Usage:
     streamlit run dashboard.py
@@ -30,6 +26,7 @@ from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import json
+import sqlite3
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -41,7 +38,6 @@ import signal
 import subprocess
 import html
 import atexit
-import sqlite3
 from dotenv import load_dotenv
 
 # Load environment variables FIRST
@@ -76,7 +72,7 @@ from src.learning.strategy_analyzer import StrategyAnalyzer
 
 try:
     from src.core.database import Database
-    from src.core.metrics import MetricsCalculator, SignalQualityScorer
+    from src.core.metrics import MetricsCalculator
     from src.core.validation import OrderValidator
     from src.paper_trading import PaperTradingSimulator, OrderSide, OrderType
     from src.advanced_predictor import AdvancedPredictor
@@ -86,11 +82,16 @@ try:
     # CONTINUOUS LEARNING: Strategic Learning Bridge
     from src.learning.strategic_learning_bridge import StrategicLearningBridge
 
+    # PERFORMANCE-BASED LEARNING: Per-candle learning system
+    from src.learning.performance_learner import PerformanceBasedLearner, create_performance_learner
+
     AI_AVAILABLE = True
     LEARNING_AVAILABLE = True
+    PERF_LEARNING_AVAILABLE = True
 except ImportError as e:
     AI_AVAILABLE = False
     LEARNING_AVAILABLE = False
+    PERF_LEARNING_AVAILABLE = False
     logger.warning(f"AI modules not available: {e}")
 
 # =============================================================================
@@ -235,12 +236,24 @@ def init_session_state():
         'data_provider': None,
 
         # AI/ML
-        'predictor': None,
         'advanced_predictor': None,
 
         # CONTINUOUS LEARNING: Strategic Learning Bridge
         'learning_bridge': None,
         'use_continuous_learning': True,  # Enable continuous learning by default
+
+        # PERFORMANCE-BASED LEARNING: Per-candle learning
+        'performance_learner': None,
+        'perf_learning_config': {
+            'enabled': True,
+            'loss_retrain': True,
+            'reinforce_wins': True,
+            'consecutive_loss_threshold': 3,
+            'light_epochs': 30,
+            'medium_epochs': 50,
+            'full_epochs': 100,
+            'win_rate_threshold': 0.45,
+        },
 
         # Prediction Validation (8/10 streak system)
         'prediction_validator': None,
@@ -260,7 +273,6 @@ def init_session_state():
 
         # Metrics
         'metrics_calculator': None,
-        'signal_scorer': None,
 
         # Order validator
         'order_validator': None,
@@ -279,7 +291,6 @@ def init_session_state():
         'training_in_progress': False,
         'training_progress': 0,
         'training_epoch': 0,
-        'training_max_epochs': 100,
         'training_status': '',
     }
 
@@ -896,32 +907,47 @@ def initialize_components():
             logger.info("🧠 Initializing Continuous Learning System...")
 
             # Get paper brokerage (uses paper trading simulator)
-            paper_brokerage = st.session_state.paper_simulator
+            paper_brokerage = st.session_state.paper_trader  # Fixed: was paper_simulator
 
-            # Initialize bridge
-            st.session_state.learning_bridge = StrategicLearningBridge(
-                database=st.session_state.database,
-                predictor=st.session_state.advanced_predictor,
-                paper_brokerage=paper_brokerage,
-                live_brokerage=None,  # Dashboard is paper-only
-                config=config
-            )
+            # Load config for learning bridge
+            learning_config = load_config()
 
-            logger.info("✅ Continuous Learning System initialized")
-            st.success("🧠 Continuous Learning ENABLED - Models will learn from every trade!")
+            # Initialize bridge (only if db and predictor are available)
+            if st.session_state.db and st.session_state.advanced_predictor and paper_brokerage:
+                st.session_state.learning_bridge = StrategicLearningBridge(
+                    database=st.session_state.db,  # Fixed: was database
+                    predictor=st.session_state.advanced_predictor,
+                    paper_brokerage=paper_brokerage,
+                    live_brokerage=None,  # Dashboard is paper-only
+                    config=learning_config
+                )
+                logger.info("✅ Continuous Learning System initialized")
+            else:
+                logger.debug("Learning bridge dependencies not ready yet")
 
         except Exception as e:
             logger.error(f"Failed to initialize learning bridge: {e}", exc_info=True)
-            st.warning(f"⚠️ Continuous learning disabled: {e}")
             st.session_state.learning_bridge = None
+
+    # PERFORMANCE-BASED LEARNING: Initialize PerformanceBasedLearner
+    if st.session_state.performance_learner is None and PERF_LEARNING_AVAILABLE:
+        try:
+            perf_config = st.session_state.get('perf_learning_config', {})
+            if st.session_state.advanced_predictor and st.session_state.db and perf_config.get('enabled', True):
+                st.session_state.performance_learner = create_performance_learner(
+                    predictor=st.session_state.advanced_predictor,
+                    database=st.session_state.db,
+                    timeframes=['15m', '1h'],
+                    loss_retrain=perf_config.get('loss_retrain', True),
+                    reinforce_wins=perf_config.get('reinforce_wins', True)
+                )
+                logger.info("✅ PerformanceBasedLearner initialized")
+        except Exception as e:
+            logger.debug(f"PerformanceBasedLearner init deferred: {e}")
 
     # Metrics calculator
     if st.session_state.metrics_calculator is None and AI_AVAILABLE:
         st.session_state.metrics_calculator = MetricsCalculator()
-
-    # Signal scorer
-    if st.session_state.signal_scorer is None and AI_AVAILABLE:
-        st.session_state.signal_scorer = SignalQualityScorer()
 
     # Order validator
     if st.session_state.order_validator is None and AI_AVAILABLE:
@@ -1142,34 +1168,6 @@ def render_metric_card(label: str, value: str, delta: str = "", card_class: str 
             <div class="label">{label_escaped}</div>
             <div class="value">{value_escaped}</div>
             {delta_html}
-        </div>
-    """, unsafe_allow_html=True)
-
-
-def render_signal_card(direction: str, confidence: float, price: float, stop_loss: float, take_profit: float):
-    """Render basic signal card."""
-    signal_class = f"signal-{direction.lower()}"
-    color = "#28a745" if direction == "BUY" else "#dc3545" if direction == "SELL" else "#6c757d"
-
-    st.markdown(f"""
-        <div class="signal-card {signal_class}">
-            <div style="font-size: 0.9rem; color: #6c757d; margin-bottom: 0.5rem;">AI SIGNAL</div>
-            <div style="font-size: 3rem; font-weight: 800; color: {color};">{direction}</div>
-            <div style="font-size: 1.2rem; margin-top: 0.5rem;">Confidence: {confidence*100:.1f}%</div>
-            <div style="margin-top: 1rem; display: flex; justify-content: space-around;">
-                <div>
-                    <div style="font-size: 0.75rem; color: #6c757d;">STOP LOSS</div>
-                    <div style="color: #dc3545; font-weight: 600;">${stop_loss:,.2f}</div>
-                </div>
-                <div>
-                    <div style="font-size: 0.75rem; color: #6c757d;">ENTRY</div>
-                    <div style="font-weight: 600;">${price:,.2f}</div>
-                </div>
-                <div>
-                    <div style="font-size: 0.75rem; color: #6c757d;">TAKE PROFIT</div>
-                    <div style="color: #28a745; font-weight: 600;">${take_profit:,.2f}</div>
-                </div>
-            </div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -1655,6 +1653,105 @@ def render_prediction_history(validator, symbol: str, timeframe: str):
                     st.write(reason)
 
 
+def render_performance_learning_status():
+    """Render performance-based learning status and statistics."""
+    perf_learner = st.session_state.get('performance_learner')
+
+    if not perf_learner:
+        st.info("Performance learner not initialized. Start trading to enable per-candle learning.")
+        return
+
+    try:
+        stats = perf_learner.get_stats()
+        action = perf_learner.get_recommended_action()
+
+        # Status header with recommended action
+        action_colors = {
+            'NORMAL_TRADING': '🟢',
+            'CAUTIOUS_TRADING': '🟡',
+            'REDUCE_POSITION_SIZE': '🟠',
+            'PAUSE_TRADING': '🔴'
+        }
+        action_icon = action_colors.get(action, '⚪')
+
+        st.markdown(f"**Recommended Action:** {action_icon} {action.replace('_', ' ').title()}")
+
+        # Main metrics
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            win_rate = stats.get('overall_win_rate', 0)
+            recent_rate = stats.get('recent_win_rate', 0)
+            delta = f"Recent: {recent_rate:.0%}" if recent_rate else None
+            st.metric("Win Rate", f"{win_rate:.1%}", delta=delta)
+
+        with col2:
+            total_candles = stats.get('total_candles', 0)
+            wins = stats.get('total_wins', 0)
+            losses = stats.get('total_losses', 0)
+            st.metric("Trades", f"{wins + losses}", delta=f"W:{wins} L:{losses}")
+
+        with col3:
+            retrains = stats.get('retrains_triggered', 0)
+            last_reason = stats.get('last_retrain_reason', '')
+            delta_text = last_reason.replace('_', ' ') if last_reason else None
+            st.metric("Retrains", retrains, delta=delta_text)
+
+        with col4:
+            reinforcements = stats.get('reinforcements_applied', 0)
+            st.metric("Reinforcements", reinforcements)
+
+        # Streak information
+        st.markdown("---")
+        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+
+        with col_s1:
+            consec_wins = stats.get('consecutive_wins', 0)
+            max_wins = stats.get('max_consecutive_wins', 0)
+            if consec_wins > 0:
+                st.success(f"🔥 **{consec_wins}** consecutive wins (max: {max_wins})")
+            else:
+                st.info(f"Consecutive wins: 0 (max: {max_wins})")
+
+        with col_s2:
+            consec_losses = stats.get('consecutive_losses', 0)
+            max_losses = stats.get('max_consecutive_losses', 0)
+            if consec_losses > 0:
+                st.warning(f"⚠️ **{consec_losses}** consecutive losses (max: {max_losses})")
+            else:
+                st.info(f"Consecutive losses: 0 (max: {max_losses})")
+
+        with col_s3:
+            is_retraining = stats.get('is_retraining', False)
+            if is_retraining:
+                st.warning("🔄 **Retraining in progress...**")
+            else:
+                st.success("✅ Ready for trading")
+
+        with col_s4:
+            last_retrain = stats.get('last_retrain')
+            if last_retrain:
+                st.info(f"Last retrain: {last_retrain[:16]}")
+            else:
+                st.info("No retrains yet")
+
+        # Timeframe-specific stats
+        tf_stats = stats.get('timeframe_stats', {})
+        if tf_stats:
+            st.markdown("---")
+            st.markdown("**Per-Timeframe Stats:**")
+            tf_cols = st.columns(len(tf_stats))
+            for idx, (tf, tf_stat) in enumerate(tf_stats.items()):
+                with tf_cols[idx]:
+                    candles = tf_stat.get('candles', 0)
+                    wr = tf_stat.get('win_rate', 0)
+                    cl = tf_stat.get('consecutive_losses', 0)
+                    st.metric(f"{tf}", f"{wr:.0%} WR", delta=f"{candles} candles")
+
+    except Exception as e:
+        st.error(f"Error loading performance stats: {e}")
+
+
 def render_sentiment_section(prediction):
     """Render news sentiment analysis."""
     if prediction.sentiment_score is None:
@@ -1862,10 +1959,6 @@ def load_trade_outcomes_for_strategies(lookback_days: int = 7):
     except Exception as e:
         logger.error(f"Error loading trade outcomes: {e}")
         return pd.DataFrame()
-
-
-# NOTE: Duplicate functions removed - using StrategyAnalyzer class instead
-# These functions duplicated logic from src/learning/strategy_analyzer.py
 
 
 def render_strategy_performance():
@@ -2435,7 +2528,8 @@ def page_dashboard():
                             limit=1000
                         )
                         candles_in_db = len(df_check) if df_check is not None else 0
-                    except:
+                    except Exception as e:
+                        logger.debug(f"Failed to check candles in DB: {e}")
                         candles_in_db = 0
                 else:
                     candles_in_db = 0
@@ -2734,7 +2828,8 @@ def page_dashboard():
                                             time_str = f"{time_ago.seconds // 60}m ago"
 
                                         st.metric("Last Trained", time_str)
-                                    except:
+                                    except Exception as e:
+                                        logger.debug(f"Failed to parse last trained time: {e}")
                                         st.metric("Last Trained", "Unknown")
                                 else:
                                     st.metric("Last Trained", "Never")
@@ -2766,6 +2861,11 @@ def page_dashboard():
                                 st.session_state.timeframe
                             )
 
+                    # Performance Learning Status - Collapsed
+                    if st.session_state.get('performance_learner'):
+                        with st.expander("📊 Performance Learning Status", expanded=False):
+                            render_performance_learning_status()
+
                     # Sentiment - Collapsed (only if available)
                     if prediction.sentiment_score is not None:
                         with st.expander("📰 News Sentiment", expanded=False):
@@ -2788,153 +2888,6 @@ def page_dashboard():
 
     # Strategy Performance Section
     render_strategy_performance()
-
-
-# =============================================================================
-# PAGE: PORTFOLIO
-# =============================================================================
-
-def page_portfolio():
-    """Portfolio tracking page."""
-    st.markdown("### Portfolio Overview")
-
-    paper_trader = st.session_state.paper_trader
-
-    if paper_trader is None:
-        st.warning("Paper trading not initialized")
-        return
-
-    # Portfolio metrics
-    cols = st.columns(4)
-
-    with cols[0]:
-        render_metric_card("Total Value", f"${paper_trader.get_account_value():,.2f}")
-
-    with cols[1]:
-        render_metric_card("Cash", f"${paper_trader.cash:,.2f}")
-
-    with cols[2]:
-        pnl = paper_trader.get_account_value() - paper_trader.initial_cash
-        pnl_pct = (pnl / paper_trader.initial_cash) * 100
-        card_class = "positive" if pnl >= 0 else "negative"
-        render_metric_card("P&L", f"${pnl:,.2f}", f"{pnl_pct:+.2f}%", card_class)
-
-    with cols[3]:
-        positions = paper_trader.get_positions()
-        render_metric_card("Positions", str(len(positions)))
-
-    st.markdown("---")
-
-    # Positions table
-    st.markdown("### Open Positions")
-
-    if positions:
-        pos_data = []
-        for pos in positions:
-            pos_data.append({
-                'Symbol': pos.symbol,
-                'Side': pos.side.value,
-                'Quantity': f"{pos.quantity:.6f}",
-                'Entry Price': f"${pos.entry_price:,.2f}",
-                'Current Price': f"${pos.current_price:,.2f}",
-                'P&L': f"${pos.unrealized_pnl:,.2f}",
-                'P&L %': f"{pos.unrealized_pnl_percent:.2f}%"
-            })
-        st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
-    else:
-        st.info("No open positions")
-
-    # Trade history
-    st.markdown("### Trade History")
-
-    trades = paper_trader.get_trades()
-    if trades:
-        trade_data = []
-        for t in trades[-20:]:  # Last 20 trades
-            side_str = t.side.value if hasattr(t.side, 'value') else str(t.side)
-            trade_data.append({
-                'Time': t.timestamp.strftime('%Y-%m-%d %H:%M'),
-                'Symbol': t.symbol,
-                'Side': side_str.upper(),
-                'Quantity': f"{t.quantity:.6f}",
-                'Price': f"${t.price:,.2f}",
-                'P&L': f"${t.realized_pnl:,.2f}" if t.realized_pnl else "-"
-            })
-        st.dataframe(pd.DataFrame(trade_data), use_container_width=True, hide_index=True)
-    else:
-        st.info("No trades yet")
-
-    # Show continuous learning trade outcomes from database
-    st.markdown("---")
-    st.markdown("### AI Learning Trades (from Database)")
-
-    try:
-        db = st.session_state.db  # Use correct session state key
-        if db:
-            # Get recent trade outcomes
-            with db.connection() as conn:
-                outcomes_df = pd.read_sql_query('''
-                    SELECT
-                        entry_time,
-                        symbol,
-                        interval,
-                        predicted_direction,
-                        predicted_confidence,
-                        entry_price,
-                        exit_price,
-                        was_correct,
-                        pnl_percent,
-                        regime,
-                        is_paper_trade
-                    FROM trade_outcomes
-                    ORDER BY entry_time DESC
-                    LIMIT 50
-                ''', conn)
-
-            if len(outcomes_df) > 0:
-                # Format for display
-                outcomes_df['Result'] = outcomes_df['was_correct'].apply(
-                    lambda x: '✅ Win' if x else '❌ Loss'
-                )
-                outcomes_df['Type'] = outcomes_df['is_paper_trade'].apply(
-                    lambda x: '📝 Paper' if x else '💰 Live'
-                )
-                outcomes_df['Confidence'] = outcomes_df['predicted_confidence'].apply(
-                    lambda x: f"{x*100:.1f}%" if x else 'N/A'
-                )
-                outcomes_df['P&L'] = outcomes_df['pnl_percent'].apply(
-                    lambda x: f"{x:+.2f}%" if x else 'N/A'
-                )
-
-                display_df = outcomes_df[[
-                    'entry_time', 'symbol', 'interval', 'predicted_direction',
-                    'Confidence', 'P&L', 'Result', 'Type', 'regime'
-                ]].rename(columns={
-                    'entry_time': 'Time',
-                    'symbol': 'Symbol',
-                    'interval': 'Timeframe',
-                    'predicted_direction': 'Direction',
-                    'regime': 'Regime'
-                })
-
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-                # Summary stats
-                total_trades = len(outcomes_df)
-                wins = outcomes_df['was_correct'].sum()
-                win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-                paper_trades = outcomes_df['is_paper_trade'].sum()
-
-                st.markdown(f"""
-                **Summary:** {total_trades} trades | {wins} wins ({win_rate:.1f}% win rate) |
-                {paper_trades} paper / {total_trades - paper_trades} live
-                """)
-            else:
-                st.info("No AI learning trades recorded yet. Start the analysis engine to generate trades.")
-        else:
-            st.warning("Database not initialized")
-    except Exception as e:
-        st.error(f"Error loading trade outcomes: {e}")
 
 
 # =============================================================================
@@ -3467,11 +3420,35 @@ def render_chart_with_trades(symbol: str, timeframe: str, historical_data: pd.Da
 
 
 def page_paper_trading():
-    """Paper trading page with AI training visualization."""
-    st.markdown("### 📊 AI Training & Paper Trading")
+    """Paper trading page with AI training visualization, portfolio, and performance."""
+    st.markdown("### 📊 Trading Center")
 
     paper_trader = st.session_state.paper_trader
 
+    # Create tabs for Trading, Portfolio, Performance
+    tab_trading, tab_portfolio, tab_performance = st.tabs(["🤖 AI Trading", "💼 Portfolio", "📈 Performance"])
+
+    # =========================================================================
+    # TAB: AI TRADING
+    # =========================================================================
+    with tab_trading:
+        _render_ai_trading_tab(paper_trader)
+
+    # =========================================================================
+    # TAB: PORTFOLIO
+    # =========================================================================
+    with tab_portfolio:
+        _render_portfolio_tab(paper_trader)
+
+    # =========================================================================
+    # TAB: PERFORMANCE
+    # =========================================================================
+    with tab_performance:
+        _render_performance_tab(paper_trader)
+
+
+def _render_ai_trading_tab(paper_trader):
+    """Render the AI Trading tab content."""
     # Settings row
     col_settings1, col_settings2 = st.columns([1, 1])
 
@@ -3550,6 +3527,43 @@ def page_paper_trading():
             # Unique strategies used
             strategies_used = ai_trades['strategy_name'].dropna().nunique()
             st.metric("Strategies Used", strategies_used)
+
+        # Performance Learning Stats (if available)
+        if st.session_state.get('performance_learner'):
+            try:
+                perf_stats = st.session_state.performance_learner.get_stats()
+                st.markdown("##### 📊 Performance Learning")
+
+                col_p1, col_p2, col_p3, col_p4, col_p5 = st.columns(5)
+
+                with col_p1:
+                    consec_wins = perf_stats.get('consecutive_wins', 0)
+                    max_wins = perf_stats.get('max_consecutive_wins', 0)
+                    st.metric("Consec. Wins", consec_wins, delta=f"max: {max_wins}")
+
+                with col_p2:
+                    consec_losses = perf_stats.get('consecutive_losses', 0)
+                    max_losses = perf_stats.get('max_consecutive_losses', 0)
+                    delta_color = "inverse" if consec_losses > 0 else "normal"
+                    st.metric("Consec. Losses", consec_losses, delta=f"max: {max_losses}", delta_color=delta_color)
+
+                with col_p3:
+                    retrains = perf_stats.get('retrains_triggered', 0)
+                    last_reason = perf_stats.get('last_retrain_reason', '-')
+                    st.metric("Retrains", retrains, delta=last_reason if retrains > 0 else None)
+
+                with col_p4:
+                    reinforcements = perf_stats.get('reinforcements_applied', 0)
+                    st.metric("Reinforcements", reinforcements)
+
+                with col_p5:
+                    is_retraining = perf_stats.get('is_retraining', False)
+                    action = st.session_state.performance_learner.get_recommended_action()
+                    status_icon = "🔄" if is_retraining else "✅"
+                    st.metric("Status", f"{status_icon} {action}")
+
+            except Exception as e:
+                logger.debug(f"Could not load performance learning stats: {e}")
 
         # Show trade table
         st.markdown("##### Recent Trades (with TP/SL)")
@@ -3695,198 +3709,144 @@ def page_paper_trading():
                     st.error(f"Order error: {e}")
 
 
-# =============================================================================
-# PAGE: BACKTESTING
-# =============================================================================
+def _render_portfolio_tab(paper_trader):
+    """Render the Portfolio tab content."""
+    if paper_trader is None:
+        st.warning("Paper trading not initialized")
+        return
 
-def page_backtesting():
-    """Backtesting page."""
-    st.markdown("### Backtesting")
-
-    # Parameters
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        lookback_days = st.number_input("Lookback (days)", min_value=7, max_value=365, value=30)
-
-    with col2:
-        initial_capital = st.number_input("Initial Capital", min_value=1000, value=10000, step=1000)
-
-    with col3:
-        strategy = st.selectbox("Strategy", ["LSTM Ensemble", "Momentum", "Mean Reversion"])
-
-    if st.button("Run Backtest", type="primary"):
-        with st.spinner("Running backtest..."):
-            # Fetch historical data
-            data = fetch_market_data(st.session_state.symbol, '1h', limit=lookback_days * 24)
-
-            if not data['success']:
-                error_msg = data.get('error', 'Unknown error')
-                if 'waiting for data' in error_msg.lower() or 'connecting' in error_msg.lower():
-                    st.info(f"🔄 Loading historical data... {error_msg}")
-                else:
-                    st.warning(f"⚠️ {error_msg}")
-                return
-
-            df = data['df']
-
-            # Simple backtest simulation
-            equity = [initial_capital]
-            trades = []
-            position = 0
-            entry_price = 0
-
-            for i in range(50, len(df)):
-                # Simple RSI strategy
-                rsi = calculate_rsi(df['close'].iloc[:i].values)
-                price = df['close'].iloc[i]
-
-                if position == 0 and rsi < 30:  # Buy signal
-                    position = equity[-1] * 0.95 / price
-                    entry_price = price
-                elif position > 0 and rsi > 70:  # Sell signal
-                    pnl = position * (price - entry_price)
-                    equity.append(equity[-1] + pnl)
-                    trades.append({
-                        'entry_price': entry_price,
-                        'exit_price': price,
-                        'pnl': pnl,
-                        'pnl_percent': (price - entry_price) / entry_price * 100
-                    })
-                    position = 0
-                else:
-                    equity.append(equity[-1])
-
-            # Calculate metrics
-            equity_series = pd.Series(equity, index=df['datetime'].iloc[50:50+len(equity)])
-
-            if st.session_state.metrics_calculator:
-                metrics = st.session_state.metrics_calculator.calculate(equity_series, trades)
-
-            # Display results
-            st.markdown("#### Backtest Results")
-
-            cols = st.columns(4)
-            with cols[0]:
-                render_metric_card("Total Return", f"{metrics.total_return:.2%}")
-            with cols[1]:
-                render_metric_card("Sharpe Ratio", f"{metrics.sharpe_ratio:.2f}")
-            with cols[2]:
-                render_metric_card("Max Drawdown", f"{metrics.max_drawdown:.2%}")
-            with cols[3]:
-                render_metric_card("Win Rate", f"{metrics.win_rate:.1%}")
-
-            # Equity curve
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=equity_series.index,
-                y=equity_series.values,
-                mode='lines',
-                name='Equity',
-                line=dict(color='#667eea', width=2)
-            ))
-            fig.update_layout(
-                title="Equity Curve",
-                xaxis_title="Date",
-                yaxis_title="Equity ($)",
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-
-# =============================================================================
-# PAGE: RISK MANAGEMENT
-# =============================================================================
-
-def page_risk_management():
-    """Risk management page."""
-    st.markdown("### Risk Management")
-
-    paper_trader = st.session_state.paper_trader
-    config = load_config()
-    risk_config = config.get('risk', {})
-
-    # Risk limits
-    st.markdown("#### Risk Limits")
-
+    # Portfolio metrics
     cols = st.columns(4)
 
     with cols[0]:
-        max_dd = risk_config.get('max_drawdown_percent', 20)
-        render_metric_card("Max Drawdown Limit", f"{max_dd}%")
+        render_metric_card("Total Value", f"${paper_trader.get_account_value():,.2f}")
 
     with cols[1]:
-        daily_limit = risk_config.get('daily_loss_limit', 0.05) * 100
-        render_metric_card("Daily Loss Limit", f"{daily_limit}%")
+        render_metric_card("Cash", f"${paper_trader.cash:,.2f}")
 
     with cols[2]:
-        max_pos = risk_config.get('max_position_percent', 0.25) * 100
-        render_metric_card("Max Position Size", f"{max_pos}%")
+        pnl = paper_trader.get_account_value() - paper_trader.initial_cash
+        pnl_pct = (pnl / paper_trader.initial_cash) * 100
+        card_class = "positive" if pnl >= 0 else "negative"
+        render_metric_card("P&L", f"${pnl:,.2f}", f"{pnl_pct:+.2f}%", card_class)
 
     with cols[3]:
-        sector_exp = risk_config.get('max_sector_exposure', 0.40) * 100
-        render_metric_card("Max Sector Exposure", f"{sector_exp}%")
+        positions = paper_trader.get_positions()
+        render_metric_card("Positions", str(len(positions)))
 
     st.markdown("---")
 
-    # Current risk status
-    st.markdown("#### Current Risk Status")
+    # Positions table
+    st.markdown("#### Open Positions")
 
-    if paper_trader:
-        pnl = paper_trader.get_account_value() - paper_trader.initial_cash
-        pnl_pct = (pnl / paper_trader.initial_cash) * 100
+    if positions:
+        pos_data = []
+        for pos in positions:
+            pos_data.append({
+                'Symbol': pos.symbol,
+                'Side': pos.side.value,
+                'Quantity': f"{pos.quantity:.6f}",
+                'Entry Price': f"${pos.entry_price:,.2f}",
+                'Current Price': f"${pos.current_price:,.2f}",
+                'P&L': f"${pos.unrealized_pnl:,.2f}",
+                'P&L %': f"{pos.unrealized_pnl_percent:.2f}%"
+            })
+        st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions")
 
-        # Risk gauge
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=abs(min(0, pnl_pct)),
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Current Drawdown"},
-            gauge={
-                'axis': {'range': [0, max_dd]},
-                'bar': {'color': "darkblue"},
-                'steps': [
-                    {'range': [0, max_dd * 0.5], 'color': "lightgreen"},
-                    {'range': [max_dd * 0.5, max_dd * 0.8], 'color': "yellow"},
-                    {'range': [max_dd * 0.8, max_dd], 'color': "red"}
-                ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': max_dd
-                }
-            }
-        ))
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
+    # Trade history
+    st.markdown("#### Trade History")
 
-    # Circuit breaker status
-    st.markdown("#### Circuit Breaker")
+    trades = paper_trader.get_trades()
+    if trades:
+        trade_data = []
+        for t in trades[-20:]:  # Last 20 trades
+            side_str = t.side.value if hasattr(t.side, 'value') else str(t.side)
+            trade_data.append({
+                'Time': t.timestamp.strftime('%Y-%m-%d %H:%M'),
+                'Symbol': t.symbol,
+                'Side': side_str.upper(),
+                'Quantity': f"{t.quantity:.6f}",
+                'Price': f"${t.price:,.2f}",
+                'P&L': f"${t.realized_pnl:,.2f}" if t.realized_pnl else "-"
+            })
+        st.dataframe(pd.DataFrame(trade_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No trades yet")
 
-    validator = st.session_state.order_validator
-    if validator:
-        if validator.circuit_breaker_active:
-            st.error(f"Circuit Breaker ACTIVE: {validator.circuit_breaker_reason}")
-            if st.button("Deactivate Circuit Breaker"):
-                validator.deactivate_circuit_breaker()
-                st.rerun()
+    # Show continuous learning trade outcomes from database
+    st.markdown("---")
+    st.markdown("#### AI Learning Trades (from Database)")
+
+    try:
+        db = st.session_state.db
+        if db:
+            with db.connection() as conn:
+                outcomes_df = pd.read_sql_query('''
+                    SELECT
+                        entry_time,
+                        symbol,
+                        interval,
+                        predicted_direction,
+                        predicted_confidence,
+                        entry_price,
+                        exit_price,
+                        was_correct,
+                        pnl_percent,
+                        regime,
+                        is_paper_trade
+                    FROM trade_outcomes
+                    ORDER BY entry_time DESC
+                    LIMIT 50
+                ''', conn)
+
+            if len(outcomes_df) > 0:
+                outcomes_df['Result'] = outcomes_df['was_correct'].apply(
+                    lambda x: '✅ Win' if x else '❌ Loss'
+                )
+                outcomes_df['Type'] = outcomes_df['is_paper_trade'].apply(
+                    lambda x: '📝 Paper' if x else '💰 Live'
+                )
+                outcomes_df['Confidence'] = outcomes_df['predicted_confidence'].apply(
+                    lambda x: f"{x*100:.1f}%" if x else 'N/A'
+                )
+                outcomes_df['P&L'] = outcomes_df['pnl_percent'].apply(
+                    lambda x: f"{x:+.2f}%" if x else 'N/A'
+                )
+
+                display_df = outcomes_df[[
+                    'entry_time', 'symbol', 'interval', 'predicted_direction',
+                    'Confidence', 'P&L', 'Result', 'Type', 'regime'
+                ]].rename(columns={
+                    'entry_time': 'Time',
+                    'symbol': 'Symbol',
+                    'interval': 'Timeframe',
+                    'predicted_direction': 'Direction',
+                    'regime': 'Regime'
+                })
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                total_trades = len(outcomes_df)
+                wins = outcomes_df['was_correct'].sum()
+                win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+                paper_trades = outcomes_df['is_paper_trade'].sum()
+
+                st.markdown(f"""
+                **Summary:** {total_trades} trades | {wins} wins ({win_rate:.1f}% win rate) |
+                {paper_trades} paper / {total_trades - paper_trades} live
+                """)
+            else:
+                st.info("No AI learning trades recorded yet. Start the analysis engine to generate trades.")
         else:
-            st.success("Circuit Breaker: Inactive")
-            if st.button("Activate Circuit Breaker"):
-                validator.activate_circuit_breaker("Manual activation")
-                st.rerun()
+            st.warning("Database not initialized")
+    except Exception as e:
+        st.error(f"Error loading trade outcomes: {e}")
 
 
-# =============================================================================
-# PAGE: PERFORMANCE
-# =============================================================================
-
-def page_performance():
-    """Performance metrics page."""
-    st.markdown("### Performance Analytics")
-
-    paper_trader = st.session_state.paper_trader
-
+def _render_performance_tab(paper_trader):
+    """Render the Performance tab content."""
     if paper_trader is None:
         st.warning("Paper trading not initialized")
         return
@@ -3898,7 +3858,7 @@ def page_performance():
         return
 
     # Build equity curve
-    equity = [paper_trader.initial_capital]
+    equity = [paper_trader.initial_cash]
     for t in trades:
         if t.realized_pnl:
             equity.append(equity[-1] + t.realized_pnl)
@@ -3912,7 +3872,6 @@ def page_performance():
     if st.session_state.metrics_calculator:
         metrics = st.session_state.metrics_calculator.calculate(equity_series, trade_dicts)
 
-        # Display metrics
         st.markdown("#### Key Metrics")
 
         cols = st.columns(5)
@@ -3961,204 +3920,34 @@ def page_performance():
         )
         st.plotly_chart(fig, use_container_width=True)
 
-
-# =============================================================================
-# PAGE: NEWS & SENTIMENT
-# =============================================================================
-
-def page_news_sentiment():
-    """News & Sentiment analysis page."""
-    st.markdown("### News & Sentiment Analysis")
-
-    db = st.session_state.db
-    news_collector = st.session_state.news_collector
-
-    if not AI_AVAILABLE or db is None:
-        st.warning("News features not available")
-        return
-
-    # News collector status
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        if news_collector and hasattr(news_collector, '_running') and news_collector._running:
-            status = "🟢 Active"
-            status_class = "positive"
-        else:
-            status = "🔴 Inactive"
-            status_class = "negative"
-        render_metric_card("News Collector", status, "", status_class)
-
-    with col2:
-        # Count articles in database
-        try:
-            articles = db.get_news_articles(limit=1000)
-            article_count = len(articles)
-            render_metric_card("Total Articles", str(article_count))
-        except Exception as e:
-            logger.error(f"Failed to fetch articles: {e}")
-            render_metric_card("Total Articles", "0")
-            article_count = 0
-
-    with col3:
-        # Get recent articles (last 24h)
-        try:
-            since = int((datetime.utcnow() - timedelta(hours=24)).timestamp())
-            recent = db.get_news_articles(since_timestamp=since, limit=1000)
-            render_metric_card("24h Articles", str(len(recent)))
-        except Exception as e:
-            logger.error(f"Failed to fetch recent articles: {e}")
-            render_metric_card("24h Articles", "0")
-
+    # Risk management section (merged from Risk page)
     st.markdown("---")
+    st.markdown("#### Risk Status")
 
-    if article_count == 0:
-        st.info("""
-        **No news articles found in database.**
+    config = load_config()
+    risk_config = config.get('risk', {})
 
-        News collection requires:
-        1. API keys set in `.env` file (`NEWSAPI_KEY`, `ALPHAVANTAGE_KEY`)
-        2. News collection enabled in `config.yaml`
-        3. Analysis engine running (`python run_analysis.py`)
+    cols = st.columns(4)
 
-        Once configured, news will be collected automatically every 30 minutes.
-        """)
-        return
+    with cols[0]:
+        max_dd = risk_config.get('max_drawdown_percent', 20)
+        render_metric_card("Max DD Limit", f"{max_dd}%")
 
-    # Recent articles
-    st.markdown("### Recent Articles")
+    with cols[1]:
+        daily_limit = risk_config.get('daily_loss_limit', 0.05) * 100
+        render_metric_card("Daily Loss Limit", f"{daily_limit}%")
 
-    try:
-        # Get recent articles
-        articles = db.get_news_articles(
-            symbol=st.session_state.symbol.split('/')[0],
-            limit=20
-        )
+    with cols[2]:
+        max_pos = risk_config.get('max_position_percent', 0.25) * 100
+        render_metric_card("Max Position", f"{max_pos}%")
 
-        if not articles:
-            st.info(f"No articles found for {st.session_state.symbol}")
+    with cols[3]:
+        # Circuit breaker status
+        validator = st.session_state.order_validator
+        if validator and validator.circuit_breaker_active:
+            render_metric_card("Circuit Breaker", "🔴 ACTIVE", "", "negative")
         else:
-            for article in articles[:10]:  # Show top 10
-                # Determine sentiment color
-                sentiment = article.get('sentiment_score', 0)
-                if sentiment > 0.2:
-                    sentiment_color = "#28a745"  # Green (bullish)
-                    sentiment_label = "📈 Bullish"
-                elif sentiment < -0.2:
-                    sentiment_color = "#dc3545"  # Red (bearish)
-                    sentiment_label = "📉 Bearish"
-                else:
-                    sentiment_color = "#6c757d"  # Gray (neutral)
-                    sentiment_label = "➖ Neutral"
-
-                # Format timestamp
-                try:
-                    dt = datetime.fromisoformat(article['datetime'])
-                    time_str = dt.strftime('%Y-%m-%d %H:%M')
-                except (ValueError, KeyError, TypeError) as e:
-                    logger.debug(f"Invalid datetime format: {e}")
-                    time_str = "Unknown"
-
-                # Render article card
-                st.markdown(f"""
-                <div style="background: white; border-radius: 8px; padding: 1rem; margin-bottom: 0.5rem; border-left: 4px solid {sentiment_color};">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                        <span style="color: {sentiment_color}; font-weight: 600;">{sentiment_label}</span>
-                        <span style="color: #6c757d; font-size: 0.85rem;">{article['source']} • {time_str}</span>
-                    </div>
-                    <div style="font-weight: 600; margin-bottom: 0.3rem;">{article['title']}</div>
-                    <div style="color: #6c757d; font-size: 0.9rem;">{article.get('description', '')[:200]}...</div>
-                    {f'<div style="margin-top: 0.5rem;"><a href="{article["url"]}" target="_blank" style="color: #667eea; text-decoration: none;">Read more →</a></div>' if article.get('url') else ''}
-                </div>
-                """, unsafe_allow_html=True)
-
-    except Exception as e:
-        st.error(f"Error loading articles: {e}")
-
-    st.markdown("---")
-
-    # Sentiment trend chart
-    st.markdown("### Sentiment Trend")
-
-    try:
-        # Get sentiment features for recent candles
-        data = fetch_market_data(st.session_state.symbol, limit=48)  # Last 48 hours
-        if data['success'] and not data['df'].empty:
-            df = data['df']
-
-            sentiment_data = []
-            for _, row in df.iterrows():
-                timestamp = int(row.get('timestamp', 0))
-                if timestamp:
-                    features = db.get_sentiment_features(timestamp)
-                    if features:
-                        sentiment_data.append({
-                            'datetime': row['datetime'],
-                            'sentiment_1h': features.get('sentiment_1h', 0),
-                            'sentiment_6h': features.get('sentiment_6h', 0),
-                            'news_volume': features.get('news_volume_1h', 0)
-                        })
-
-            if sentiment_data:
-                df_sentiment = pd.DataFrame(sentiment_data)
-
-                # Create chart
-                fig = make_subplots(
-                    rows=2, cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.1,
-                    row_heights=[0.7, 0.3]
-                )
-
-                # Sentiment line
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_sentiment['datetime'],
-                        y=df_sentiment['sentiment_1h'],
-                        mode='lines',
-                        name='1H Sentiment',
-                        line=dict(color='#667eea', width=2)
-                    ),
-                    row=1, col=1
-                )
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_sentiment['datetime'],
-                        y=df_sentiment['sentiment_6h'],
-                        mode='lines',
-                        name='6H Sentiment',
-                        line=dict(color='#764ba2', width=2, dash='dash')
-                    ),
-                    row=1, col=1
-                )
-
-                # News volume
-                fig.add_trace(
-                    go.Bar(
-                        x=df_sentiment['datetime'],
-                        y=df_sentiment['news_volume'],
-                        name='News Volume',
-                        marker_color='#667eea',
-                        opacity=0.5
-                    ),
-                    row=2, col=1
-                )
-
-                fig.update_layout(
-                    title="Sentiment & News Volume",
-                    height=500,
-                    showlegend=True
-                )
-
-                fig.update_yaxes(title_text="Sentiment", row=1, col=1)
-                fig.update_yaxes(title_text="Articles", row=2, col=1)
-
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No sentiment data available yet. Wait for news collection to populate features.")
-    except Exception as e:
-        st.error(f"Error loading sentiment trend: {e}")
+            render_metric_card("Circuit Breaker", "🟢 OK", "", "positive")
 
 
 # =============================================================================
@@ -4171,7 +3960,7 @@ def page_settings():
 
     config = load_config()
 
-    tabs = st.tabs(["Trading", "Risk", "Notifications", "System"])
+    tabs = st.tabs(["Trading", "Risk", "Learning", "Notifications", "System"])
 
     with tabs[0]:  # Trading
         st.markdown("#### Trading Settings")
@@ -4250,7 +4039,121 @@ def page_settings():
             max_pos = st.slider("Max Position Size %", 5, 50, int(config.get('risk', {}).get('max_position_percent', 0.25) * 100))
             sector_exp = st.slider("Max Sector Exposure %", 10, 80, int(config.get('risk', {}).get('max_sector_exposure', 0.40) * 100))
 
-    with tabs[2]:  # Notifications
+    with tabs[2]:  # Learning
+        st.markdown("#### Continuous Learning Settings")
+
+        # Get current learning config from session state or config
+        perf_config = st.session_state.get('perf_learning_config', {})
+        cl_config = config.get('continuous_learning', {}).get('performance_learning', {})
+
+        st.markdown("##### Per-Candle Learning")
+        st.caption("Learn from every trade: reinforce wins, retrain on losses")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            perf_enabled = st.checkbox(
+                "Enable Performance Learning",
+                value=perf_config.get('enabled', cl_config.get('enabled', True)),
+                help="Enable per-candle learning based on trade outcomes"
+            )
+            loss_retrain = st.checkbox(
+                "Retrain on Loss",
+                value=perf_config.get('loss_retrain', cl_config.get('loss_retrain', True)),
+                help="Trigger retraining when trades result in losses"
+            )
+            reinforce_wins = st.checkbox(
+                "Reinforce on Win",
+                value=perf_config.get('reinforce_wins', cl_config.get('reinforce_wins', True)),
+                help="Apply reinforcement learning for winning trades"
+            )
+
+        with col2:
+            consecutive_loss = st.slider(
+                "Consecutive Loss Threshold",
+                min_value=2, max_value=10,
+                value=perf_config.get('consecutive_loss_threshold', cl_config.get('consecutive_loss_threshold', 3)),
+                help="Trigger FULL retrain after N consecutive losses"
+            )
+            win_rate_threshold = st.slider(
+                "Win Rate Threshold %",
+                min_value=30, max_value=60,
+                value=int(perf_config.get('win_rate_threshold', cl_config.get('win_rate_threshold', 0.45)) * 100),
+                help="Trigger MEDIUM retrain if win rate drops below this"
+            )
+
+        st.markdown("##### Retraining Epochs")
+        st.caption("Number of training epochs for each retrain level")
+
+        col3, col4, col5 = st.columns(3)
+
+        with col3:
+            light_epochs = st.number_input(
+                "Light (minor loss)",
+                min_value=10, max_value=100,
+                value=perf_config.get('light_epochs', cl_config.get('light_epochs', 30)),
+                help="Quick update for single losses"
+            )
+        with col4:
+            medium_epochs = st.number_input(
+                "Medium (win rate drop)",
+                min_value=30, max_value=150,
+                value=perf_config.get('medium_epochs', cl_config.get('medium_epochs', 50)),
+                help="Standard retrain for declining performance"
+            )
+        with col5:
+            full_epochs = st.number_input(
+                "Full (consecutive losses)",
+                min_value=50, max_value=200,
+                value=perf_config.get('full_epochs', cl_config.get('full_epochs', 100)),
+                help="Complete retrain for major issues"
+            )
+
+        # Update session state
+        st.session_state.perf_learning_config = {
+            'enabled': perf_enabled,
+            'loss_retrain': loss_retrain,
+            'reinforce_wins': reinforce_wins,
+            'consecutive_loss_threshold': consecutive_loss,
+            'win_rate_threshold': win_rate_threshold / 100,
+            'light_epochs': light_epochs,
+            'medium_epochs': medium_epochs,
+            'full_epochs': full_epochs,
+        }
+
+        # Show current performance learner status
+        st.markdown("---")
+        st.markdown("##### Learning Status")
+
+        if st.session_state.get('performance_learner'):
+            try:
+                stats = st.session_state.performance_learner.get_stats()
+                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+
+                with col_s1:
+                    st.metric("Win Rate", f"{stats.get('overall_win_rate', 0):.1%}")
+                with col_s2:
+                    st.metric("Retrains", stats.get('retrains_triggered', 0))
+                with col_s3:
+                    st.metric("Reinforcements", stats.get('reinforcements_applied', 0))
+                with col_s4:
+                    is_retraining = stats.get('is_retraining', False)
+                    st.metric("Status", "🔄 Retraining" if is_retraining else "✅ Ready")
+
+                # Show streak info
+                consec_wins = stats.get('consecutive_wins', 0)
+                consec_losses = stats.get('consecutive_losses', 0)
+                if consec_wins > 0:
+                    st.success(f"🔥 {consec_wins} consecutive wins!")
+                elif consec_losses > 0:
+                    st.warning(f"⚠️ {consec_losses} consecutive losses")
+
+            except Exception as e:
+                st.info("Performance learner stats unavailable")
+        else:
+            st.info("Performance learner not initialized. Start trading to enable.")
+
+    with tabs[3]:  # Notifications
         st.markdown("#### Notification Settings")
 
         desktop = st.checkbox("Desktop Notifications", value=config.get('notifications', {}).get('desktop', {}).get('enabled', True))
@@ -4261,7 +4164,7 @@ def page_settings():
             bot_token = st.text_input("Bot Token", type="password")
             chat_id = st.text_input("Chat ID")
 
-    with tabs[3]:  # System
+    with tabs[4]:  # System
         st.markdown("#### System Settings")
 
         auto_refresh = st.checkbox("Auto Refresh", value=True)
@@ -4332,6 +4235,21 @@ def page_settings():
             updated_config['notifications']['telegram'] = {}
         updated_config['notifications']['telegram']['enabled'] = telegram
 
+        # Update continuous learning / performance learning section
+        if 'continuous_learning' not in updated_config:
+            updated_config['continuous_learning'] = {}
+        perf_cfg = st.session_state.get('perf_learning_config', {})
+        updated_config['continuous_learning']['performance_learning'] = {
+            'enabled': perf_cfg.get('enabled', True),
+            'loss_retrain': perf_cfg.get('loss_retrain', True),
+            'reinforce_wins': perf_cfg.get('reinforce_wins', True),
+            'consecutive_loss_threshold': perf_cfg.get('consecutive_loss_threshold', 3),
+            'win_rate_threshold': perf_cfg.get('win_rate_threshold', 0.45),
+            'light_epochs': perf_cfg.get('light_epochs', 30),
+            'medium_epochs': perf_cfg.get('medium_epochs', 50),
+            'full_epochs': perf_cfg.get('full_epochs', 100),
+        }
+
         # Save to config.yaml
         try:
             with open(CONFIG_PATH, 'w') as f:
@@ -4369,15 +4287,11 @@ def main():
         # Page selection (dynamic based on market mode)
         market_mode = st.session_state.get('market_mode', 'crypto')
 
-        # Base pages for all modes
+        # Streamlined navigation - consolidated pages
+        # Trading Center includes: AI Trading, Portfolio, Performance tabs
         pages = {
             "📊 Dashboard": "Dashboard",
-            "💼 Portfolio": "Portfolio",
-            "📝 Paper Trade": "Paper Trading",
-            "📈 Backtest": "Backtesting",
-            "🛡️ Risk": "Risk Management",
-            "📉 Performance": "Performance",
-            "📰 News & Sentiment": "News & Sentiment",
+            "📝 Trading Center": "Paper Trading",
             "⚙️ Settings": "Settings"
         }
 
@@ -4386,12 +4300,7 @@ def main():
             pages = {
                 "📊 Dashboard": "Dashboard",
                 "💱 Forex Markets": "Forex Markets",
-                "💼 Portfolio": "Portfolio",
-                "📝 Paper Trade": "Paper Trading",
-                "📈 Backtest": "Backtesting",
-                "🛡️ Risk": "Risk Management",
-                "📉 Performance": "Performance",
-                "📰 News & Sentiment": "News & Sentiment",
+                "📝 Trading Center": "Paper Trading",
                 "⚙️ Settings": "Settings"
             }
 
@@ -4427,16 +4336,11 @@ def main():
         if st.button("🔄 Refresh Now"):
             st.rerun()
 
-    # Render selected page
+    # Render selected page (streamlined navigation)
     page_functions = {
         "Dashboard": page_dashboard,
         "Forex Markets": page_forex_markets,
-        "Portfolio": page_portfolio,
-        "Paper Trading": page_paper_trading,
-        "Backtesting": page_backtesting,
-        "Risk Management": page_risk_management,
-        "Performance": page_performance,
-        "News & Sentiment": page_news_sentiment,
+        "Paper Trading": page_paper_trading,  # Now includes Portfolio + Performance tabs
         "Settings": page_settings,
     }
 

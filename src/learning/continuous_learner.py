@@ -179,6 +179,23 @@ class ContinuousLearningSystem:
         # Get enabled intervals
         self.enabled_intervals = self._get_enabled_intervals()
 
+        # Initialize PerformanceBasedLearner for per-candle learning
+        try:
+            from src.learning.performance_learner import create_performance_learner
+
+            perf_config = self.cl_config.get('performance_learning', {})
+            self.performance_learner = create_performance_learner(
+                predictor=predictor,
+                database=database,
+                timeframes=perf_config.get('timeframes', self.enabled_intervals or ['15m', '1h']),
+                loss_retrain=perf_config.get('loss_retrain', True),
+                reinforce_wins=perf_config.get('reinforce_wins', True)
+            )
+            logger.info("PerformanceBasedLearner initialized for per-candle learning")
+        except Exception as e:
+            logger.warning(f"PerformanceBasedLearner initialization failed: {e}. Per-candle learning disabled.")
+            self.performance_learner = None
+
         logger.info(
             f"ContinuousLearningSystem initialized: "
             f"intervals={self.enabled_intervals}, "
@@ -284,6 +301,7 @@ class ContinuousLearningSystem:
             # 8. EXECUTE TRADE (only if signal exists AND strategy approves)
             executed = False
             signal_id = None
+            perf_signal_id = None
             strategy_approved = best_strategy is not None and best_strategy.get('is_recommended', False)
 
             if aggregated.direction != 'NEUTRAL':
@@ -292,14 +310,35 @@ class ContinuousLearningSystem:
                 should_execute = (mode == 'LEARNING') or (mode == 'TRADING' and strategy_approved)
 
                 if should_execute:
+                    # Generate perf_signal_id BEFORE executing trade to store it with the signal
+                    entry_price = candle.close if hasattr(candle, 'close') else None
+                    if self.performance_learner and entry_price:
+                        perf_signal_id = f"perf_{symbol}_{interval}_{int(datetime.utcnow().timestamp() * 1000)}"
+
                     signal_id = self._execute_trade(
                         brokerage=brokerage,
                         symbol=symbol,
                         prediction=aggregated,
                         is_paper=(mode == 'LEARNING'),
-                        strategy_name=best_strategy.get('strategy_name') if best_strategy else None
+                        strategy_name=best_strategy.get('strategy_name') if best_strategy else None,
+                        perf_signal_id=perf_signal_id,
+                        entry_price=entry_price
                     )
                     executed = True
+
+                    # Track prediction in PerformanceBasedLearner (AFTER trade executed)
+                    if self.performance_learner and perf_signal_id and entry_price:
+                        try:
+                            self.performance_learner.on_prediction_made(
+                                signal_id=perf_signal_id,
+                                symbol=symbol,
+                                interval=interval,
+                                direction=aggregated.direction,
+                                confidence=aggregated.confidence,
+                                entry_price=entry_price
+                            )
+                        except Exception as e:
+                            logger.warning(f"PerformanceBasedLearner.on_prediction_made failed: {e}")
 
                     strategy_info = f" [Strategy: {best_strategy['strategy_name']}]" if best_strategy else ""
                     logger.info(
@@ -320,11 +359,21 @@ class ContinuousLearningSystem:
                         f"(best: {best_strategy.get('strategy_name', 'None') if best_strategy else 'None'})"
                     )
 
-            # 8. STORE LATEST PREDICTION (for opposite signal detection)
+            # 9. STORE LATEST PREDICTION (for opposite signal detection)
             with self._predictions_lock:
                 self._latest_predictions[symbol] = aggregated
 
-            # 9. CHECK FOR COMPLETED TRADES
+            # Periodic cleanup of stale predictions (every 100 candles)
+            if self.performance_learner:
+                with self._stats_lock:
+                    candles_processed = self._stats['candles_processed']
+                if candles_processed % 100 == 0:
+                    try:
+                        self.performance_learner.cleanup_stale_predictions(max_age_minutes=60)
+                    except Exception as e:
+                        logger.debug(f"Performance learner cleanup failed: {e}")
+
+            # 10. CHECK FOR COMPLETED TRADES
             self._check_completed_trades(symbol, interval, candle)
 
             # Record prediction
@@ -625,7 +674,9 @@ class ContinuousLearningSystem:
         symbol: str,
         prediction: AggregatedSignal,
         is_paper: bool,
-        strategy_name: str = None
+        strategy_name: str = None,
+        perf_signal_id: str = None,
+        entry_price: float = None
     ) -> Optional[int]:
         """
         Execute trade via brokerage.
@@ -636,12 +687,14 @@ class ContinuousLearningSystem:
             prediction: Aggregated prediction
             is_paper: Whether this is a paper trade
             strategy_name: Name of the strategy being used
+            perf_signal_id: Performance learner signal ID for tracking
+            entry_price: Entry price for the trade
 
         Returns:
             Signal ID or None
         """
         try:
-            # Save signal to database
+            # Save signal to database with perf_signal_id for later retrieval
             signal_data = {
                 'timestamp': int(prediction.timestamp.timestamp()),
                 'datetime': prediction.timestamp.isoformat(),
@@ -650,7 +703,9 @@ class ContinuousLearningSystem:
                 'confidence': prediction.confidence,
                 'regime': prediction.regime,
                 'is_paper': is_paper,
-                'metadata': prediction.to_dict()
+                'metadata': prediction.to_dict(),
+                'perf_signal_id': perf_signal_id,
+                'entry_price': entry_price
             }
 
             signal_id = self.database.save_signal(signal_data)
@@ -711,6 +766,32 @@ class ContinuousLearningSystem:
                         f"{'✓ WIN' if outcome['was_correct'] else '✗ LOSS'} "
                         f"({outcome['pnl_percent']:.2f}%)"
                     )
+
+                    # PERFORMANCE-BASED LEARNING: Process outcome for per-candle feedback
+                    if self.performance_learner:
+                        try:
+                            # Try to get perf_signal_id from stored prediction
+                            # Fall back to checking if signal has perf_signal_id stored
+                            perf_signal_id = pending.get('perf_signal_id')
+
+                            if perf_signal_id:
+                                # Derive actual_direction from price movement (not PnL)
+                                actual_direction = 'UP' if candle.close > pending['entry_price'] else 'DOWN'
+
+                                perf_result = self.performance_learner.on_candle_closed(
+                                    signal_id=perf_signal_id,
+                                    exit_price=candle.close,
+                                    actual_direction=actual_direction
+                                )
+                                if 'action' in perf_result:
+                                    logger.info(
+                                        f"[{symbol}] PerformanceLearner action: {perf_result.get('action', 'none')} "
+                                        f"outcome={perf_result.get('outcome', {}).get('was_correct', 'N/A')}"
+                                    )
+                            else:
+                                logger.debug(f"No perf_signal_id for signal {pending['id']}, skipping perf learning")
+                        except Exception as e:
+                            logger.warning(f"PerformanceBasedLearner.on_candle_closed failed: {e}")
 
                     # Trigger retraining if needed
                     if outcome['should_retrain']:
@@ -1033,11 +1114,26 @@ class ContinuousLearningSystem:
                 )
             }
 
+        # Add PerformanceBasedLearner stats
+        if self.performance_learner:
+            try:
+                stats['performance_learner_stats'] = self.performance_learner.get_stats()
+            except Exception as e:
+                logger.debug(f"Failed to get performance_learner stats: {e}")
+
         return stats
 
     def stop(self):
         """Stop continuous learning system and wait for retraining threads."""
         logger.info("Stopping ContinuousLearningSystem...")
+
+        # Shutdown PerformanceBasedLearner first (waits for retraining to complete)
+        if self.performance_learner:
+            try:
+                self.performance_learner.shutdown()
+                logger.info("PerformanceBasedLearner shut down")
+            except Exception as e:
+                logger.warning(f"Error shutting down PerformanceBasedLearner: {e}")
 
         # Wait for active retraining threads
         with self._threads_lock:

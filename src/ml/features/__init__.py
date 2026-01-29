@@ -10,10 +10,34 @@ Comprehensive feature engineering for trading:
 5. Volume features
 6. Volatility features
 
-Research shows feature engineering is often more important than model choice.
-SHAP-based feature selection helps identify the most predictive features.
+NEW: Adaptive Feature Selection
+- Research shows top 10-15 features outperform using all features
+- Different indicators work better in different market regimes
+- SHAP-based feature importance for interpretability
 """
 
 from .engineer import FeatureEngineer
+from .selector import (
+    AdaptiveFeatureSelector,
+    MarketRegime,
+    IndicatorRanking,
+    FeatureSelectionResult,
+    get_features_for_regime,
+    get_standard_features,
+    STANDARD_FEATURE_SETS,
+    REGIME_INDICATOR_EFFECTIVENESS,
+    INDICATOR_CATEGORIES
+)
 
-__all__ = ['FeatureEngineer']
+__all__ = [
+    'FeatureEngineer',
+    'AdaptiveFeatureSelector',
+    'MarketRegime',
+    'IndicatorRanking',
+    'FeatureSelectionResult',
+    'get_features_for_regime',
+    'get_standard_features',
+    'STANDARD_FEATURE_SETS',
+    'REGIME_INDICATOR_EFFECTIVENESS',
+    'INDICATOR_CATEGORIES'
+]

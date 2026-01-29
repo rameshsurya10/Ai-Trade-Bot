@@ -93,7 +93,10 @@
       "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/pip list:*)",
       "Bash(./venv/bin/python:*)",
       "Bash(timeout 8 ./venv/bin/streamlit run:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --oneline -20)",
+      "WebFetch(domain:in.tradingview.com)",
+      "Bash(pip3 install:*)"
     ]
   }
 }

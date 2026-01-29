@@ -21,7 +21,7 @@ import json
 import threading
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from src.core.database import Database
 
@@ -526,13 +526,6 @@ class PredictionValidator:
 
             return stats
 
-    def reset_streak(self, symbol: str, timeframe: str):
-        """Manually reset streak (for testing or admin purposes)."""
-        key = (symbol, timeframe)
-        with self._lock:
-            self._current_streak[key] = 0
-        logger.warning(f"Streak manually reset for {symbol} {timeframe}")
-
     def _get_candle_interval_ms(self, timeframe: str) -> int:
         """
         Convert timeframe string to milliseconds.
@@ -642,180 +635,6 @@ class PredictionValidator:
         else:
             needed = int(required_candles * self.min_data_years - actual_candles)
             return False, f"❌ Need {needed:,} more candles ({years_of_data:.1f}/{self.min_data_years} years)"
-
-    def analyze_mistakes(self, symbol: str = None, timeframe: str = None, limit: int = 50) -> Dict:
-        """
-        Analyze wrong predictions to identify patterns and generate recommendations.
-
-        This is the learning engine that helps the system improve over time.
-
-        Args:
-            symbol: Optional filter by symbol
-            timeframe: Optional filter by timeframe
-            limit: Maximum number of wrong predictions to analyze
-
-        Returns:
-            Dict with analysis results and recommendations
-        """
-        # Build query
-        query = """
-            SELECT * FROM prediction_history
-            WHERE is_correct = 0
-        """
-        params = []
-
-        if symbol:
-            query += " AND symbol = ?"
-            params.append(symbol)
-
-        if timeframe:
-            query += " AND timeframe = ?"
-            params.append(timeframe)
-
-        query += " ORDER BY timestamp DESC LIMIT ?"
-        params.append(limit)
-
-        # Get wrong predictions
-        wrong_predictions = self.db.query(query, tuple(params))
-
-        if not wrong_predictions:
-            return {
-                'total_mistakes': 0,
-                'recommendations': ["Not enough data - need at least one wrong prediction"],
-                'patterns': {}
-            }
-
-        # Analyze patterns
-        mistakes_by_regime = {}
-        mistakes_by_direction = {}
-        low_confidence_mistakes = []
-        low_rules_mistakes = []
-
-        for pred in wrong_predictions:
-            # Parse market context
-            try:
-                context = json.loads(pred['market_context'])
-            except:
-                context = {}
-
-            regime = context.get('regime', 'UNKNOWN')
-            volatility = context.get('volatility', 0)
-
-            # Group by regime
-            if regime not in mistakes_by_regime:
-                mistakes_by_regime[regime] = []
-            mistakes_by_regime[regime].append(pred)
-
-            # Group by direction
-            direction = pred['predicted_direction']
-            if direction not in mistakes_by_direction:
-                mistakes_by_direction[direction] = []
-            mistakes_by_direction[direction].append(pred)
-
-            # Track low confidence mistakes
-            if pred['confidence'] < 0.65:
-                low_confidence_mistakes.append(pred)
-
-            # Track low rules mistakes
-            if pred['rules_passed'] < 8:
-                low_rules_mistakes.append(pred)
-
-        # Generate recommendations
-        recommendations = []
-        total = len(wrong_predictions)
-
-        # Regime-based recommendations
-        if 'CHOPPY' in mistakes_by_regime and len(mistakes_by_regime['CHOPPY']) > total * 0.4:
-            recommendations.append(
-                f"⚠️ {len(mistakes_by_regime['CHOPPY'])} mistakes ({len(mistakes_by_regime['CHOPPY'])/total*100:.0f}%) "
-                f"in CHOPPY markets - AVOID trading when market regime is CHOPPY"
-            )
-
-        if 'VOLATILE' in mistakes_by_regime and len(mistakes_by_regime['VOLATILE']) > total * 0.3:
-            recommendations.append(
-                f"⚠️ {len(mistakes_by_regime['VOLATILE'])} mistakes ({len(mistakes_by_regime['VOLATILE'])/total*100:.0f}%) "
-                f"in VOLATILE markets - Increase entropy weight or avoid VOLATILE regime"
-            )
-
-        # Confidence-based recommendations
-        if len(low_confidence_mistakes) > total * 0.5:
-            recommendations.append(
-                f"⚠️ {len(low_confidence_mistakes)} mistakes ({len(low_confidence_mistakes)/total*100:.0f}%) "
-                f"with low confidence (<65%) - ONLY trade when confidence > 70%"
-            )
-
-        # Rules-based recommendations
-        if len(low_rules_mistakes) > total * 0.6:
-            recommendations.append(
-                f"⚠️ {len(low_rules_mistakes)} mistakes ({len(low_rules_mistakes)/total*100:.0f}%) "
-                f"with <8 rules passed - REQUIRE minimum 8/10 rules before trading"
-            )
-
-        # Direction-based recommendations
-        for direction, mistakes in mistakes_by_direction.items():
-            if len(mistakes) > total * 0.6:
-                recommendations.append(
-                    f"⚠️ {len(mistakes)} mistakes ({len(mistakes)/total*100:.0f}%) "
-                    f"on {direction} signals - Review {direction} algorithm weights"
-                )
-
-        # General recommendations
-        if not recommendations:
-            recommendations.append("✅ No clear patterns found - keep current settings")
-        else:
-            recommendations.insert(0, f"📊 Analyzed {total} wrong predictions:")
-
-        return {
-            'total_mistakes': total,
-            'recommendations': recommendations,
-            'patterns': {
-                'by_regime': {k: len(v) for k, v in mistakes_by_regime.items()},
-                'by_direction': {k: len(v) for k, v in mistakes_by_direction.items()},
-                'low_confidence': len(low_confidence_mistakes),
-                'low_rules': len(low_rules_mistakes)
-            }
-        }
-
-    def get_learning_insights(self, symbol: str, timeframe: str) -> str:
-        """
-        Generate human-readable learning insights for a symbol/timeframe.
-
-        Args:
-            symbol: Trading pair
-            timeframe: Timeframe
-
-        Returns:
-            Formatted string with insights
-        """
-        analysis = self.analyze_mistakes(symbol, timeframe, limit=30)
-
-        if analysis['total_mistakes'] == 0:
-            return "No mistakes yet - need more trading history to generate insights."
-
-        lines = [f"\n📚 Learning Insights for {symbol} {timeframe}"]
-        lines.append("=" * 60)
-        lines.append("")
-
-        for rec in analysis['recommendations']:
-            lines.append(rec)
-
-        lines.append("")
-        lines.append("Mistake Patterns:")
-
-        patterns = analysis['patterns']
-        if patterns['by_regime']:
-            lines.append("  By Market Regime:")
-            for regime, count in sorted(patterns['by_regime'].items(), key=lambda x: -x[1]):
-                pct = (count / analysis['total_mistakes']) * 100
-                lines.append(f"    {regime}: {count} ({pct:.0f}%)")
-
-        if patterns['by_direction']:
-            lines.append("  By Signal Direction:")
-            for direction, count in sorted(patterns['by_direction'].items(), key=lambda x: -x[1]):
-                pct = (count / analysis['total_mistakes']) * 100
-                lines.append(f"    {direction}: {count} ({pct:.0f}%)")
-
-        return "\n".join(lines)
 
     def get_pending_predictions_from_db(self) -> List[Dict]:
         """
