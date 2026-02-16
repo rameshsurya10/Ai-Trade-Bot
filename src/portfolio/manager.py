@@ -501,11 +501,15 @@ class PortfolioManager:
         # Take minimum of all constraints
         position_size = min(risk_based_size, max_based_size, bp_based_size)
 
-        # Round to reasonable increment (whole shares for stocks, 4 decimals for crypto)
-        if entry_price > 1:
-            position_size = int(position_size)  # Whole shares
+        # Round to reasonable precision
+        # Crypto pairs (symbol contains '/') use 6 decimal precision
+        # Stocks use whole shares
+        if '/' in symbol:
+            position_size = round(position_size, 6)
+        elif entry_price > 1:
+            position_size = int(position_size)
         else:
-            position_size = round(position_size, 4)  # Crypto precision
+            position_size = round(position_size, 4)
 
         logger.debug(
             f"Position size for {symbol}: {position_size} "

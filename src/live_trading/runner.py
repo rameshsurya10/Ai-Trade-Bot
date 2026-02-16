@@ -211,6 +211,9 @@ class LiveTradingRunner:
         self._active_orders: Dict[str, Order] = {}
         self._signal_history: deque = deque(maxlen=1000)  # Bounded to prevent memory leak
 
+        # Deduplication: track recently processed candle keys to prevent double-processing
+        self._processed_candles: set = set()
+
         # Thread safety for callbacks
         self._callback_lock = threading.Lock()
 
@@ -301,6 +304,9 @@ class LiveTradingRunner:
             # Connect to brokerage
             if not self._brokerage.connect():
                 raise ConnectionError("Failed to connect to brokerage")
+
+            # Historical replay: fast-learn from past data before going live
+            self._historical_replay()
 
             # Start data streams
             self._start_streams()
@@ -411,7 +417,7 @@ class LiveTradingRunner:
         logger.info("Database initialized")
 
         # News Collector (if enabled)
-        news_config = self.config.raw.get('news', {}) if hasattr(self.config.data, 'data') else {}
+        news_config = self.config.raw.get('news', {})
         if news_config.get('enabled', False):
             try:
                 self._news_collector = NewsCollector(
@@ -507,7 +513,7 @@ class LiveTradingRunner:
             raise RuntimeError("Database required for model training")
 
         # Get training config - MANDATORY settings
-        auto_train_config = self.config.raw.get('auto_training', {}) if hasattr(self.config.data, 'data') else {}
+        auto_train_config = self.config.raw.get('auto_training', {})
         min_candles = auto_train_config.get('min_candles', 1000)
         training_candles = auto_train_config.get('training_candles', 5000)
 
@@ -659,9 +665,21 @@ class LiveTradingRunner:
                 criterion = torch.nn.BCELoss()
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
+                # LR scheduler: halve LR when val accuracy plateaus
+                scheduler_config = auto_train_config.get('scheduler', {})
+                scheduler = None
+                if scheduler_config.get('enabled', False):
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer,
+                        mode='max',
+                        factor=scheduler_config.get('factor', 0.5),
+                        patience=scheduler_config.get('patience', 5),
+                        min_lr=scheduler_config.get('min_lr', 1e-5)
+                    )
+
                 best_val_acc = 0
                 best_state = None
-                patience = 10
+                patience = auto_train_config.get('patience', 15)
                 patience_counter = 0
 
                 logger.info(f"[{symbol}] Training for up to {max_epochs} epochs...")
@@ -693,6 +711,10 @@ class LiveTradingRunner:
 
                     val_acc = correct / total if total > 0 else 0
 
+                    # Step LR scheduler based on validation accuracy
+                    if scheduler is not None:
+                        scheduler.step(val_acc)
+
                     # Track best model
                     if val_acc > best_val_acc:
                         best_val_acc = val_acc
@@ -701,12 +723,14 @@ class LiveTradingRunner:
                     else:
                         patience_counter += 1
 
-                    # Log progress
+                    # Log progress with confidence estimate
                     if (epoch + 1) % 10 == 0:
                         avg_loss = epoch_loss / len(train_loader)
+                        current_lr = optimizer.param_groups[0]['lr']
                         logger.info(
                             f"[{symbol}] Epoch {epoch+1}/{max_epochs} - "
-                            f"Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%}"
+                            f"Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%} - "
+                            f"LR: {current_lr:.6f}"
                         )
 
                     # Early stopping
@@ -810,6 +834,184 @@ class LiveTradingRunner:
 
         logger.info("=" * 70)
 
+    def _historical_replay(self):
+        """
+        Replay historical candles through the learning system for fast warmup.
+
+        Called AFTER model training but BEFORE live streaming starts.
+        Feeds historical candles through learning_bridge.on_candle_close()
+        so the system learns from past trades instead of starting from zero.
+        """
+        replay_config = self.config.raw.get('continuous_learning', {}).get('historical_replay', {})
+
+        if not replay_config.get('enabled', True):
+            logger.info("Historical replay disabled in config")
+            return
+
+        if not self._learning_bridge:
+            logger.warning("Learning bridge not initialized, skipping historical replay")
+            return
+
+        replay_days = replay_config.get('days', 30)
+        replay_interval = replay_config.get('interval', '15m')
+        batch_log_interval = replay_config.get('log_every', 100)
+
+        # Clean stale pending signals from previous sessions
+        # These cause bogus P&L calculations when evaluated against current prices
+        try:
+            stale_count = self._database.close_stale_signals(max_age_hours=48)
+            if stale_count > 0:
+                logger.info(f"Pre-replay cleanup: expired {stale_count} stale pending signals")
+        except Exception as e:
+            logger.warning(f"Failed to clean stale signals: {e}")
+
+        # Suppress trade execution and retraining during replay
+        # Replay only runs predictions + online updates for warmup
+        learning_sys = getattr(self._learning_bridge, 'learning_system', None)
+        if learning_sys:
+            learning_sys.replay_mode = True
+            logger.info("Replay mode ON — trades and retraining suppressed (predictions + online updates active)")
+
+        # Calculate expected candle count
+        interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}
+        minutes_per_candle = interval_minutes.get(replay_interval, 15)
+        expected_candles = (replay_days * 24 * 60) // minutes_per_candle
+
+        logger.info("=" * 70)
+        logger.info(f"HISTORICAL REPLAY - Learning from {replay_days} days of {replay_interval} candles")
+        logger.info(f"Expected candles: ~{expected_candles}")
+        logger.info("=" * 70)
+
+        for symbol in self._symbols.keys():
+            try:
+                # Step 1: Fetch historical candles from database
+                candles_df = self._database.get_candles(
+                    symbol=symbol,
+                    interval=replay_interval,
+                    limit=min(expected_candles + 100, 100000)
+                )
+
+                if candles_df is None or len(candles_df) < 50:
+                    db_count = len(candles_df) if candles_df is not None else 0
+                    logger.warning(
+                        f"[{symbol}] Insufficient data in database ({db_count} candles). "
+                        f"Fetching from exchange..."
+                    )
+                    # Fall back to exchange fetch
+                    if self._provider is None:
+                        self._provider = UnifiedDataProvider.get_instance(self._config_path)
+                    ts = self._symbols[symbol]
+                    candles_df = self._provider.fetch_historical(
+                        symbol=symbol,
+                        exchange=ts.exchange,
+                        interval=replay_interval,
+                        limit=min(expected_candles, 1000)
+                    )
+                    if candles_df is not None and not candles_df.empty:
+                        self._database.save_candles(
+                            candles_df, symbol=symbol, interval=replay_interval
+                        )
+
+                if candles_df is None or len(candles_df) < 50:
+                    logger.warning(f"[{symbol}] Still insufficient data, skipping replay")
+                    continue
+
+                # Fix timestamps stored as bytes in SQLite
+                if len(candles_df) > 0 and isinstance(candles_df['timestamp'].iloc[0], bytes):
+                    candles_df['timestamp'] = candles_df['timestamp'].apply(
+                        lambda b: int.from_bytes(b, 'little') if isinstance(b, bytes) else int(b)
+                    )
+
+                # Sort by timestamp ascending for proper replay order
+                candles_df = candles_df.sort_values('timestamp').reset_index(drop=True)
+
+                logger.info(f"[{symbol}] Replaying {len(candles_df)} historical candles...")
+
+                # Step 2: Iterate through candles and feed to learning system
+                replay_count = 0
+                error_count = 0
+                start_time = time.time()
+
+                for idx in range(len(candles_df)):
+                    try:
+                        row = candles_df.iloc[idx]
+
+                        # Create Candle object from DataFrame row
+                        ts_val = int(row['timestamp'])
+                        candle = Candle(
+                            timestamp=ts_val,
+                            datetime=row['datetime'] if isinstance(row.get('datetime'), datetime)
+                                     else datetime.fromtimestamp(ts_val / 1000 if ts_val > 1e12 else ts_val),
+                            open=float(row['open']),
+                            high=float(row['high']),
+                            low=float(row['low']),
+                            close=float(row['close']),
+                            volume=float(row['volume']),
+                            symbol=symbol,
+                            interval=replay_interval,
+                            is_closed=True
+                        )
+
+                        # Feed to learning bridge (synchronous)
+                        result = self._learning_bridge.on_candle_close(
+                            symbol=symbol,
+                            interval=replay_interval,
+                            candle=candle
+                        )
+
+                        replay_count += 1
+
+                        # Log progress
+                        if replay_count % batch_log_interval == 0:
+                            elapsed = time.time() - start_time
+                            rate = replay_count / elapsed if elapsed > 0 else 0
+                            logger.info(
+                                f"[{symbol}] Replay progress: {replay_count}/{len(candles_df)} "
+                                f"({replay_count / len(candles_df) * 100:.1f}%) "
+                                f"@ {rate:.0f} candles/sec"
+                            )
+
+                    except Exception as e:
+                        error_count += 1
+                        if error_count <= 5:
+                            logger.warning(f"[{symbol}] Replay error at candle {idx}: {e}")
+                        elif error_count == 6:
+                            logger.warning(f"[{symbol}] Suppressing further replay errors...")
+                        continue
+
+                elapsed = time.time() - start_time
+                rate = replay_count / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"[{symbol}] Historical replay complete: "
+                    f"{replay_count} candles in {elapsed:.1f}s "
+                    f"({rate:.0f} candles/sec, {error_count} errors)"
+                )
+
+                # Log learning stats after replay
+                try:
+                    stats = self._learning_bridge.get_stats()
+                    logger.info(
+                        f"[{symbol}] Post-replay stats: "
+                        f"predictions={stats.get('predictions_made', 0)}, "
+                        f"trades={stats.get('trades_closed', 0)}, "
+                        f"wins={stats.get('wins', 0)}, "
+                        f"losses={stats.get('losses', 0)}"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.error(f"[{symbol}] Historical replay failed: {e}", exc_info=True)
+
+        # Restore retraining after replay
+        if learning_sys:
+            learning_sys.replay_mode = False
+            logger.info("Replay mode OFF — retraining re-enabled for live trading")
+
+        logger.info("=" * 70)
+        logger.info("HISTORICAL REPLAY COMPLETE")
+        logger.info("=" * 70)
+
     def _start_streams(self):
         """Start unified data provider for all symbols."""
         try:
@@ -876,14 +1078,20 @@ class LiveTradingRunner:
             logger.info(f"Unsubscribed from {symbol}")
 
     def _initialize_buffer(self, symbol: str, ts: TradingSymbol):
-        """Load historical data into buffer."""
+        """Load historical data into buffer for the specific symbol."""
         try:
-            data_service = DataService()
-            # Get last 200 candles for analysis
-            df = data_service.get_candles(limit=200)
+            interval = ts.interval or self.config.data.interval or '1h'
+            df = self._database.get_candles(
+                symbol=symbol,
+                interval=interval,
+                limit=200
+            )
             if df is not None and len(df) > 0:
                 self._data_buffers[symbol] = df
-                logger.info(f"Loaded {len(df)} candles for {symbol}")
+                logger.info(f"Loaded {len(df)} candles for {symbol} @ {interval}")
+            else:
+                logger.warning(f"No historical data for {symbol} @ {interval}")
+                self._data_buffers[symbol] = pd.DataFrame()
         except Exception as e:
             logger.warning(f"Could not load history for {symbol}: {e}")
             self._data_buffers[symbol] = pd.DataFrame()
@@ -935,6 +1143,15 @@ class LiveTradingRunner:
         if not candle.is_closed:
             return  # Only process closed candles
 
+        # Deduplication: skip if this exact candle was already processed
+        candle_key = (symbol, candle.interval, candle.timestamp)
+        if candle_key in self._processed_candles:
+            return
+        self._processed_candles.add(candle_key)
+        if len(self._processed_candles) > 500:
+            self._processed_candles.clear()
+            self._processed_candles.add(candle_key)
+
         # Initialize candle buffer if needed
         if symbol not in self._candle_buffers:
             self._candle_buffers[symbol] = deque(maxlen=self._buffer_max_size)
@@ -966,10 +1183,10 @@ class LiveTradingRunner:
 
         if self._learning_bridge:
             try:
-                # Get the interval for this candle (extract from candle object or symbol config)
+                # Get the interval from the candle itself (set by provider)
                 ts = self._symbols.get(symbol)
                 if ts:
-                    interval = ts.interval
+                    interval = candle.interval or ts.interval
 
                     # Trigger continuous learning system
                     result = self._learning_bridge.on_candle_close(
@@ -1129,6 +1346,13 @@ class LiveTradingRunner:
     def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
         try:
+            # Spot trading: SELL signals close existing positions only
+            if not signal.is_buy:
+                has_position = self._portfolio.has_position(signal.symbol)
+                if not has_position:
+                    # No position to sell in spot trading — skip
+                    return
+
             # Check if we can open position
             can_open, reason = self._portfolio.can_open_position(signal.symbol)
             if not can_open and signal.is_buy:

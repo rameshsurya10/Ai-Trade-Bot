@@ -227,17 +227,17 @@ class OutcomeTracker:
                 importance=2.0 if not was_correct else 1.0  # Prioritize losses
             )
 
-        # Check if retraining needed (only for live trades)
+        # Check if retraining needed
+        # Paper trades in LEARNING mode still need retraining to improve the model
         should_retrain = False
         trigger_reason = None
 
-        if not is_paper_trade:
-            should_retrain, trigger_reason = self.check_retraining_triggers(
-                symbol=symbol,
-                interval=interval,
-                was_correct=was_correct,
-                confidence=confidence
-            )
+        should_retrain, trigger_reason = self.check_retraining_triggers(
+            symbol=symbol,
+            interval=interval,
+            was_correct=was_correct,
+            confidence=confidence
+        )
 
         return {
             'was_correct': was_correct,

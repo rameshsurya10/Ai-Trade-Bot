@@ -16,13 +16,14 @@ Usage:
     python run_trading.py
 """
 
-from src.live_trading.runner import LiveTradingRunner, TradingMode
 import logging
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+from src.live_trading.runner import LiveTradingRunner, TradingMode
 
 def main():
     print("="*70)

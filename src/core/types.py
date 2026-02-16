@@ -37,6 +37,7 @@ class Candle:
     volume: float
     symbol: str = ""
     interval: str = ""
+    is_closed: bool = True  # Candles from on_candle_closed are always closed
 
     @property
     def is_bullish(self) -> bool:

@@ -96,7 +96,20 @@
       "Bash(bash:*)",
       "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --oneline -20)",
       "WebFetch(domain:in.tradingview.com)",
-      "Bash(pip3 install:*)"
+      "Bash(pip3 install:*)",
+      "Bash(xargs:*)",
+      "Bash(then source venv/bin/activate)",
+      "Bash(else echo \"No venv found, using system python\")",
+      "Bash(source:*)",
+      "Bash(PYTHONUNBUFFERED=1 stdbuf -oL -eL python:*)",
+      "Bash(# Check for virtual environments or conda ls -d /home/development1/Desktop/Ai-Trade-Bot/venv || ls -d /home/development1/Desktop/Ai-Trade-Bot/.venv || ls -d /home/development1/Desktop/Ai-Trade-Bot/env ; find /home/development1 -maxdepth 4 -name \"\"streamlit\"\" -type f)",
+      "Bash(conda env list:*)",
+      "Bash(systemctl:*)",
+      "Bash(loginctl enable-linger:*)",
+      "Bash(sort:*)",
+      "Bash(truncate:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/python3:*)",
+      "Bash(pip3 list:*)"
     ]
   }
 }

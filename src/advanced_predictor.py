@@ -15,8 +15,10 @@ All algorithms include numerical stability safeguards (epsilon checks).
 """
 
 import logging
+import threading
 import numpy as np
 import pandas as pd
+import torch
 from typing import Dict, List, Optional, Tuple, NamedTuple
 from dataclasses import dataclass, field
 from scipy.fft import fft, fftfreq
@@ -92,6 +94,9 @@ class PredictionResult:
 
     # Meta
     ensemble_weights: Dict[str, float] = field(default_factory=dict)
+
+    # LSTM input probability (for backward compatibility)
+    lstm_probability: float = 0.5  # Input LSTM probability passed to predict()
 
 
 # =============================================================================
@@ -699,14 +704,35 @@ class AdvancedPredictor:
         'monte_carlo': 0.05
     }
 
-    def __init__(self, weights: Optional[Dict[str, float]] = None, prediction_validator=None):
+    def __init__(self, weights: Optional[Dict[str, float]] = None, prediction_validator=None, config: Optional[Dict] = None):
         """
         Args:
             weights: Custom algorithm weights (must sum to 1.0)
             prediction_validator: PredictionValidator instance for streak tracking
+            config: Full application config dict for calibration settings
         """
         self.weights = weights or self.DEFAULT_WEIGHTS.copy()
         self.prediction_validator = prediction_validator
+        self.config = config or {}
+
+        # Confidence calibration from config
+        pred_config = self.config.get('prediction', {})
+        self.confidence_floor = pred_config.get('confidence_floor', 0.52)
+        self.confidence_ceiling = pred_config.get('confidence_ceiling', 0.72)
+        self.regime_penalties = pred_config.get('regime_penalties', {
+            'TRENDING': 1.0,
+            'NORMAL': 1.0,
+            'CHOPPY': 0.85,
+            'VOLATILE': 0.80,
+        })
+
+        if self.confidence_floor >= self.confidence_ceiling:
+            logger.warning(
+                f"confidence_floor ({self.confidence_floor}) >= ceiling ({self.confidence_ceiling}), "
+                f"using defaults (0.52, 0.72)"
+            )
+            self.confidence_floor = 0.52
+            self.confidence_ceiling = 0.72
 
         # Normalize weights
         total = sum(self.weights.values())
@@ -720,14 +746,150 @@ class AdvancedPredictor:
         self.markov = MarkovChain()
         self.monte_carlo = MonteCarlo()
 
+        # Model manager reference for online learning (injected externally)
+        self._model_manager = None
+        self._online_lock = threading.Lock()
+
+    @property
+    def model_manager(self):
+        """Public accessor for continuous learner compatibility."""
+        return self._model_manager
+
+    def set_model_manager(self, model_manager) -> None:
+        """
+        Inject model manager reference so online_update() can access LSTM models.
+
+        Args:
+            model_manager: ModelManager instance that holds per-symbol LSTM models.
+        """
+        self._model_manager = model_manager
+
+    def online_update(
+        self,
+        df: pd.DataFrame,
+        symbol: str = None,
+        interval: str = None,
+        learning_rate: float = 0.0001,
+        actual_outcome: int = None
+    ) -> None:
+        """
+        Perform online learning update on the LSTM model for a given symbol.
+
+        Called by ContinuousLearningSystem after confirmed trade outcomes.
+        Performs a single SGD gradient step on the neural network.
+
+        Args:
+            df: DataFrame with recent OHLCV data
+            symbol: Trading pair (e.g., "BTC/USDT")
+            interval: Timeframe (for logging)
+            learning_rate: Learning rate for the SGD step
+            actual_outcome: 1 if price went up, 0 if down
+        """
+        if self._model_manager is None:
+            logger.debug("No model manager set, skipping online update")
+            return
+
+        if actual_outcome is None:
+            logger.debug("No actual_outcome provided, skipping online update")
+            return
+
+        if actual_outcome not in (0, 1, 0.0, 1.0):
+            logger.warning(f"Invalid actual_outcome: {actual_outcome}, must be 0 or 1")
+            return
+
+        if symbol is None:
+            logger.debug("No symbol provided, skipping online update")
+            return
+
+        model = self._model_manager.loaded_models.get(symbol)
+        if model is None:
+            logger.debug(f"No LSTM model loaded for {symbol}, skipping online update")
+            return
+
+        with self._online_lock:
+            try:
+                from src.analysis_engine import FeatureCalculator
+
+                feature_columns = FeatureCalculator.get_feature_columns()
+                config = self._model_manager.model_configs.get(symbol, {})
+                feature_means = config.get('feature_means')
+                feature_stds = config.get('feature_stds')
+                sequence_length = config.get('sequence_length', 60)
+
+                # Calculate features from raw OHLCV (static method, no instantiation needed)
+                df_features = FeatureCalculator.calculate_all(df)
+
+                if len(df_features) < sequence_length:
+                    return
+
+                features = df_features[feature_columns].iloc[-sequence_length:].values
+
+                # Normalize features
+                if feature_means is not None:
+                    features = (features - feature_means) / (feature_stds + 1e-8)
+                else:
+                    features = (features - np.nanmean(features, axis=0)) / (np.nanstd(features, axis=0) + 1e-8)
+
+                features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
+
+                # Validate features aren't degenerate
+                if np.all(features == 0):
+                    logger.debug(f"All-zero features for {symbol}, skipping online update")
+                    return
+
+                # Single SGD step on the LSTM
+                model.train()
+                try:
+                    x = torch.FloatTensor(features).unsqueeze(0)
+                    y = torch.FloatTensor([float(actual_outcome)])
+
+                    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+                    criterion = torch.nn.BCELoss()
+
+                    optimizer.zero_grad()
+                    output = model(x).squeeze()
+                    if output.dim() == 0:
+                        output = output.unsqueeze(0)
+
+                    # Clamp output to prevent log(0) explosion in BCELoss
+                    output = output.clamp(0.01, 0.99)
+
+                    loss = criterion(output, y)
+
+                    # Skip update if loss is abnormally high (model diverging)
+                    if loss.item() > 2.0:
+                        logger.warning(
+                            f"Online update [{symbol}@{interval}]: "
+                            f"loss={loss.item():.4f} too high (>2.0), skipping to prevent divergence"
+                        )
+                        return
+
+                    loss.backward()
+
+                    # Gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                    logger.info(
+                        f"Online update [{symbol}@{interval}]: "
+                        f"outcome={actual_outcome}, pred={output.item():.4f}, loss={loss.item():.4f}"
+                    )
+                finally:
+                    model.eval()
+
+            except Exception as e:
+                logger.error(f"Online update failed for {symbol}: {e}")
+
     def predict(
         self,
         df: pd.DataFrame,
         symbol: str,
-        timeframe: str,
+        timeframe: str = None,
         lstm_probability: float = 0.5,
         atr: Optional[float] = None,
-        sentiment_features: Optional[Dict] = None
+        sentiment_features: Optional[Dict] = None,
+        interval: str = None,  # Alias for timeframe (backward compatibility)
+        **kwargs  # Accept extra params for forward compatibility
     ) -> PredictionResult:
         """
         Generate prediction using ensemble of algorithms.
@@ -739,10 +901,17 @@ class AdvancedPredictor:
             lstm_probability: Probability from LSTM model (0-1)
             atr: Average True Range for stop loss calculation
             sentiment_features: Optional sentiment data from news analysis
+            interval: Alias for timeframe (API compatibility)
 
         Returns:
             PredictionResult with comprehensive analysis
         """
+        # Handle interval as alias for timeframe
+        if timeframe is None and interval is not None:
+            timeframe = interval
+        if timeframe is None:
+            timeframe = "1h"  # Default
+
         # Extract price data
         prices = df['close'].values
         current_price = float(prices[-1])
@@ -801,36 +970,41 @@ class AdvancedPredictor:
         # LSTM contribution
         prob_scores.append(('lstm', lstm_probability))
 
-        # Fourier contribution
+        # Fourier contribution — wider range for stronger signals
         fourier_prob = 0.5
         if fourier_result['signal'] == 'BULLISH':
-            fourier_prob = 0.7
+            fourier_prob = 0.75
         elif fourier_result['signal'] == 'BEARISH':
-            fourier_prob = 0.3
+            fourier_prob = 0.25
         prob_scores.append(('fourier', fourier_prob))
 
-        # Kalman contribution
+        # Kalman contribution — wider range for stronger signals
         kalman_prob = 0.5
         if kalman_result['trend'] == 'UP':
-            kalman_prob = 0.65
+            kalman_prob = 0.70
         elif kalman_result['trend'] == 'DOWN':
-            kalman_prob = 0.35
+            kalman_prob = 0.30
         prob_scores.append(('kalman', kalman_prob))
 
         # Markov contribution
         markov_prob = markov_result['prob_up']
         prob_scores.append(('markov', markov_prob))
 
-        # Entropy contribution (regime-based adjustment)
+        # Entropy contribution — use in all regimes, not just TRENDING
+        entropy_val = entropy_result.get('entropy', 0.5)
         entropy_prob = 0.5
         if entropy_result['regime'] == 'TRENDING':
-            # In trending markets, go with momentum
-            entropy_prob = 0.6 if kalman_result['trend'] == 'UP' else 0.4
+            entropy_prob = 0.65 if kalman_result['trend'] == 'UP' else 0.35
+        elif entropy_result['regime'] in ('NORMAL', 'CHOPPY'):
+            # Low entropy = more predictable, lean with Kalman trend
+            if entropy_val < 0.5:
+                entropy_prob = 0.55 if kalman_result['trend'] == 'UP' else 0.45
+        # VOLATILE: keep at 0.5 (genuinely uncertain)
         prob_scores.append(('entropy', entropy_prob))
 
-        # Monte Carlo contribution (risk adjustment)
-        mc_prob = 0.5 + (monte_carlo_result['expected_return'] * 5)  # Scale expected return
-        mc_prob = max(0.3, min(0.7, mc_prob))
+        # Monte Carlo contribution — increase scaling for meaningful signal
+        mc_prob = 0.5 + (monte_carlo_result['expected_return'] * 20)  # Increased from 5x to 20x
+        mc_prob = max(0.2, min(0.8, mc_prob))
         prob_scores.append(('monte_carlo', mc_prob))
 
         # Sentiment contribution (if available)
@@ -853,20 +1027,27 @@ class AdvancedPredictor:
         )
         ensemble_prob = max(0.0, min(1.0, ensemble_prob))
 
-        # Determine direction and confidence
-        if ensemble_prob > 0.6:
+        # Determine direction and confidence using calibrated range mapping
+        # Maps realistic ensemble range [floor, ceiling] → [0%, 100%]
+        conf_range = self.confidence_ceiling - self.confidence_floor
+        if ensemble_prob > 0.55:
             direction = "BUY"
-            confidence = (ensemble_prob - 0.5) * 2
-        elif ensemble_prob < 0.4:
+            confidence = (ensemble_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
+        elif ensemble_prob < 0.45:
             direction = "SELL"
-            confidence = (0.5 - ensemble_prob) * 2
+            # Mirror: sell_prob = 1 - ensemble_prob, then same calibration
+            sell_prob = 1.0 - ensemble_prob
+            confidence = (sell_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
         else:
             direction = "NEUTRAL"
-            confidence = 1 - abs(ensemble_prob - 0.5) * 4
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
 
-        # Adjust confidence by regime
-        if entropy_result['regime'] in ['CHOPPY', 'VOLATILE']:
-            confidence *= 0.7  # Reduce confidence in choppy/volatile markets
+        # Apply per-regime penalty from config
+        regime = entropy_result.get('regime', 'NORMAL')
+        regime_multiplier = self.regime_penalties.get(regime, 1.0)
+        confidence *= regime_multiplier
+        confidence = max(0.0, min(1.0, confidence))
 
         # Calculate stop loss and take profit
         if direction == "BUY":
@@ -1059,7 +1240,10 @@ class AdvancedPredictor:
             rules_details=rules_details,
 
             # Meta
-            ensemble_weights=weights_with_sentiment.copy()
+            ensemble_weights=weights_with_sentiment.copy(),
+
+            # LSTM probability (input preserved for backward compatibility)
+            lstm_probability=lstm_probability
         )
 
 

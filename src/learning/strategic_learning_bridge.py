@@ -241,11 +241,15 @@ class StrategicLearningBridge:
 
             # 4. TRACK TRADE IF EXECUTED
             if result.get('executed') and result.get('signal_id'):
+                # Merge entry_price into prediction dict for trade tracking
+                prediction_dict = result['aggregated_signal']
+                if result.get('entry_price'):
+                    prediction_dict['entry_price'] = result['entry_price']
                 self._track_new_trade(
                     signal_id=result['signal_id'],
                     symbol=symbol,
                     interval=interval,
-                    prediction=result['aggregated_signal'],
+                    prediction=prediction_dict,
                     is_paper=(result['mode'] == 'LEARNING')
                 )
 

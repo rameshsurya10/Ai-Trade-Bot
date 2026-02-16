@@ -225,9 +225,10 @@ class StrategyAnalyzer:
         wins = trades['was_correct'].sum()
         win_rate = wins / total_trades if total_trades > 0 else 0.0
 
-        # Profit metrics
-        winning_trades = trades[trades['was_correct']]
-        losing_trades = trades[~trades['was_correct']]
+        # Profit metrics (convert to bool for masking since values may be int 0/1)
+        mask = trades['was_correct'].astype(bool)
+        winning_trades = trades[mask]
+        losing_trades = trades[~mask]
 
         avg_profit = winning_trades['pnl_percent'].mean() if len(winning_trades) > 0 else 0.0
         avg_loss = abs(losing_trades['pnl_percent'].mean()) if len(losing_trades) > 0 else 0.0

@@ -123,18 +123,32 @@ news:
     decay_rate: 0.1
     min_articles: 1
 currencies: null
+prediction:
+  confidence_floor: 0.52
+  confidence_ceiling: 0.72
+  regime_penalties:
+    TRENDING: 1.0
+    NORMAL: 1.0
+    CHOPPY: 0.85
+    VOLATILE: 0.80
 auto_training:
   enabled: true
-  min_accuracy_required: 0.58
-  target_accuracy: 0.65
-  max_epochs: 100
-  batch_size: 32
-  learning_rate: 0.001
+  min_accuracy_required: 0.62
+  target_accuracy: 0.72
+  max_epochs: 200
+  batch_size: 64
+  learning_rate: 0.0005
+  patience: 15
   min_candles: 1000
   training_candles: 5000
   min_trades_before_retrain: 50
   max_days_between_retrain: 30
   min_win_rate_threshold: 0.45
+  scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 5
+    min_lr: 0.00001
 continuous_learning:
   enabled: true
   confidence:
@@ -149,7 +163,7 @@ continuous_learning:
     drift_threshold: 0.7
     min_interval_hours: 1
     max_epochs: 50
-    target_confidence: 0.8
+    target_confidence: 0.65
     patience: 10
     recent_candles: 5000
     replay_mix_ratio: 0.3
@@ -163,12 +177,17 @@ continuous_learning:
     fisher_sample_size: 200
   online_learning:
     enabled: true
-    learning_rate: 0.0001
+    learning_rate: 0.0005
     update_frequency: 1
   exit_logic:
     stop_loss_pct: 2.0
     take_profit_pct: 4.0
     max_holding_hours: 24
+  historical_replay:
+    enabled: true
+    days: 30
+    interval: '15m'
+    log_every: 100
 algorithm_weights:
   fourier: 0.15
   kalman: 0.25

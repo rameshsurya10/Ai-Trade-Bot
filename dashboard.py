@@ -897,8 +897,10 @@ def initialize_components():
 
     # Advanced predictor (requires prediction validator for recording predictions)
     if st.session_state.advanced_predictor is None and AI_AVAILABLE:
+        config = load_config()
         st.session_state.advanced_predictor = AdvancedPredictor(
-            prediction_validator=st.session_state.prediction_validator
+            prediction_validator=st.session_state.prediction_validator,
+            config=config
         )
 
     # CONTINUOUS LEARNING: Initialize Strategic Learning Bridge
@@ -1151,6 +1153,610 @@ def format_number(value: float, prefix: str = '$') -> str:
         return f"{prefix}{value/1e3:.1f}K"
     else:
         return f"{prefix}{value:,.2f}"
+
+
+# =============================================================================
+# LEARNING PAGE HELPERS
+# =============================================================================
+
+def _render_db_learning_page():
+    """Render learning page from database when bridge isn't available."""
+    db_path = ROOT / "data" / "trading.db"
+    if not db_path.exists():
+        st.error("No database found. Run the trading bot first.")
+        return
+
+    conn = sqlite3.connect(str(db_path))
+
+    # --- Overview metrics from DB ---
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        count = pd.read_sql("SELECT COUNT(*) as c FROM trade_outcomes", conn).iloc[0]['c']
+        st.metric("Trade Outcomes", f"{count:,}")
+
+    with col2:
+        count = pd.read_sql("SELECT COUNT(*) as c FROM signals", conn).iloc[0]['c']
+        st.metric("Signals Generated", f"{count:,}")
+
+    with col3:
+        count = pd.read_sql("SELECT COUNT(*) as c FROM retraining_history", conn).iloc[0]['c']
+        st.metric("Retraining Runs", f"{count:,}")
+
+    with col4:
+        count = pd.read_sql("SELECT COUNT(*) as c FROM candles", conn).iloc[0]['c']
+        st.metric("Candles Stored", f"{count:,}")
+
+    st.markdown("---")
+
+    # --- Tabs ---
+    tab_outcomes, tab_signals, tab_retraining = st.tabs([
+        "Trade Outcomes", "Recent Signals", "Retraining History"
+    ])
+
+    with tab_outcomes:
+        try:
+            df = pd.read_sql("""
+                SELECT symbol, predicted_direction, was_correct, confidence,
+                       pnl_percent, timestamp
+                FROM trade_outcomes
+                ORDER BY timestamp DESC
+                LIMIT 200
+            """, conn)
+            if len(df) > 0:
+                # Win rate summary
+                if 'was_correct' in df.columns:
+                    wins = df['was_correct'].sum()
+                    total = len(df[df['was_correct'].notna()])
+                    win_rate = wins / total * 100 if total > 0 else 0
+                    st.metric("Recent Win Rate (last 200)", f"{win_rate:.1f}%")
+
+                # Show table
+                st.dataframe(df, use_container_width=True)
+
+                # PnL chart
+                if 'pnl_percent' in df.columns and df['pnl_percent'].notna().any():
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        y=df['pnl_percent'].cumsum(),
+                        mode='lines',
+                        name='Cumulative PnL %'
+                    ))
+                    fig.update_layout(title="Cumulative PnL %", height=300)
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No trade outcomes recorded yet")
+        except Exception as e:
+            st.warning(f"Could not load trade outcomes: {e}")
+
+    with tab_signals:
+        try:
+            df = pd.read_sql("""
+                SELECT symbol, signal_type, confidence, entry_price,
+                       actual_outcome, timestamp
+                FROM signals
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """, conn)
+            if len(df) > 0:
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("No signals recorded yet")
+        except Exception as e:
+            st.warning(f"Could not load signals: {e}")
+
+    with tab_retraining:
+        try:
+            df = pd.read_sql("""
+                SELECT symbol, interval, accuracy, confidence, loss,
+                       epochs, trigger_reason, timestamp
+                FROM retraining_history
+                ORDER BY timestamp DESC
+                LIMIT 50
+            """, conn)
+            if len(df) > 0:
+                st.dataframe(df, use_container_width=True)
+
+                # Accuracy over time chart
+                if 'accuracy' in df.columns and df['accuracy'].notna().any():
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=df['timestamp'],
+                        y=df['accuracy'],
+                        mode='lines+markers',
+                        name='Accuracy'
+                    ))
+                    fig.update_layout(title="Retraining Accuracy Over Time", height=300)
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No retraining history yet")
+        except Exception as e:
+            st.warning(f"Could not load retraining history: {e}")
+
+    conn.close()
+
+
+def _get_learning_systems() -> dict:
+    """Safely access all learning subsystems from session state."""
+    result = {
+        'available': False, 'learning_system': None, 'confidence_gate': None,
+        'state_manager': None, 'outcome_tracker': None, 'retraining_engine': None,
+        'performance_learner': None, 'db': None
+    }
+    bridge = st.session_state.get('learning_bridge')
+    if not bridge:
+        return result
+    ls = getattr(bridge, 'learning_system', None)
+    if not ls:
+        return result
+    result['available'] = True
+    result['learning_system'] = ls
+    result['confidence_gate'] = getattr(ls, 'confidence_gate', None)
+    result['state_manager'] = getattr(ls, 'state_manager', None)
+    result['outcome_tracker'] = getattr(ls, 'outcome_tracker', None)
+    result['retraining_engine'] = getattr(ls, 'retraining_engine', None)
+    result['performance_learner'] = (
+        getattr(ls, 'performance_learner', None)
+        or st.session_state.get('performance_learner')
+    )
+    result['db'] = st.session_state.get('db')
+    return result
+
+
+def render_learning_overview(systems: dict):
+    """Render learning system overview metric cards."""
+    try:
+        stats = systems['learning_system'].get_stats()
+        perf = systems['performance_learner']
+        action = perf.get_recommended_action() if perf else 'UNKNOWN'
+        action_class = {
+            'NORMAL_TRADING': 'positive', 'CAUTIOUS_TRADING': 'warning',
+            'REDUCE_POSITION_SIZE': 'negative', 'PAUSE_TRADING': 'negative'
+        }.get(action, '')
+        action_label = action.replace('_', ' ').title()
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        with c1:
+            render_metric_card("Candles Processed", str(stats.get('candles_processed', 0)))
+        with c2:
+            render_metric_card("Predictions Made", str(stats.get('predictions_made', 0)))
+        with c3:
+            paper = stats.get('paper_trades', 0)
+            live = stats.get('live_trades', 0)
+            render_metric_card("Trades Executed", str(stats.get('trades_executed', 0)),
+                               delta=f"Paper: {paper} | Live: {live}")
+        with c4:
+            render_metric_card("Retrainings", str(stats.get('retrainings_triggered', 0)))
+        with c5:
+            render_metric_card("Online Updates", str(stats.get('online_updates', 0)))
+        with c6:
+            render_metric_card("Action", action_label, card_class=action_class)
+    except Exception as e:
+        st.warning(f"Unable to load learning stats: {e}")
+
+
+def render_mode_status(systems: dict, tracked_symbols: list):
+    """Show LEARNING/TRADING mode per symbol."""
+    try:
+        state_mgr = systems['state_manager']
+        gate = systems['confidence_gate']
+        timeframe = st.session_state.get('timeframe', '1h')
+
+        if not state_mgr:
+            st.info("State manager not available.")
+            return
+
+        for symbol in tracked_symbols:
+            c1, c2, c3 = st.columns([2, 2, 3])
+            try:
+                mode = state_mgr.get_current_mode(symbol, timeframe)
+            except Exception:
+                mode = 'LEARNING'
+
+            mode_color = '#28a745' if mode == 'TRADING' else '#ffc107'
+            mode_bg = 'rgba(40,167,69,0.1)' if mode == 'TRADING' else 'rgba(255,193,7,0.1)'
+
+            with c1:
+                st.markdown(f"""<div style="padding:12px;border-radius:8px;border-left:4px solid {mode_color};
+                    background:{mode_bg};">
+                    <div style="font-size:0.85rem;color:#6c757d;">{html.escape(symbol)}</div>
+                    <div style="font-size:1.3rem;font-weight:700;color:{mode_color};">{html.escape(str(mode))}</div>
+                </div>""", unsafe_allow_html=True)
+
+            with c2:
+                try:
+                    duration = state_mgr.get_time_in_mode(symbol, timeframe)
+                    if duration:
+                        hours = int(duration.total_seconds() // 3600)
+                        mins = int((duration.total_seconds() % 3600) // 60)
+                        render_metric_card("Time in Mode", f"{hours}h {mins}m")
+                    else:
+                        render_metric_card("Time in Mode", "N/A")
+                except Exception:
+                    render_metric_card("Time in Mode", "N/A")
+
+            with c3:
+                trading_thresh = getattr(gate.config, 'trading_threshold', 0.80) if gate else 0.80
+                if gate and hasattr(gate, '_smoothed_confidence'):
+                    conf = gate._smoothed_confidence.get((symbol, timeframe))
+                    if conf is not None:
+                        gap = max(0, trading_thresh - conf)
+                        render_metric_card("Confidence", f"{conf:.1%}",
+                                           delta=f"Need +{gap:.1%} for TRADING" if mode == 'LEARNING' else "Above threshold",
+                                           card_class='positive' if conf >= trading_thresh else '')
+                    else:
+                        render_metric_card("Confidence", "No data")
+                else:
+                    render_metric_card("Confidence", "No data")
+
+        with st.expander("Mode Transition History"):
+            for symbol in tracked_symbols:
+                try:
+                    history = state_mgr.get_mode_history(symbol, timeframe, limit=10)
+                    if history:
+                        st.markdown(f"**{symbol}**")
+                        df = pd.DataFrame(history)
+                        display_cols = [c for c in ['entered_at', 'mode', 'confidence_score', 'reason'] if c in df.columns]
+                        if display_cols:
+                            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+                    else:
+                        st.caption(f"{symbol}: No transitions recorded yet.")
+                except Exception:
+                    st.caption(f"{symbol}: History unavailable.")
+
+    except Exception as e:
+        st.warning(f"Unable to load mode status: {e}")
+
+
+def render_confidence_timeline(systems: dict, tracked_symbols: list):
+    """Plotly confidence chart with 80% threshold line."""
+    try:
+        db = systems['db']
+        if not db:
+            st.info("Database not available. Start the trading system to enable confidence tracking.")
+            return
+        gate = systems['confidence_gate']
+        timeframe = st.session_state.get('timeframe', '1h')
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            sel_symbol = st.selectbox("Symbol", options=['ALL'] + tracked_symbols, key='conf_symbol')
+        with c2:
+            days = st.slider("Lookback Days", 1, 30, 7, key='conf_days')
+
+        symbols_to_plot = tracked_symbols if sel_symbol == 'ALL' else [sel_symbol]
+        fig = go.Figure()
+        has_data = False
+
+        colors = {'BTC/USDT': '#f7931a', 'ETH/USDT': '#627eea'}
+
+        for symbol in symbols_to_plot:
+            try:
+                df = db.get_confidence_trend(symbol, timeframe, days=days)
+                if df is not None and not df.empty:
+                    has_data = True
+                    color = colors.get(symbol, '#667eea')
+                    fig.add_trace(go.Scatter(
+                        x=df['timestamp'], y=df['confidence_score'],
+                        mode='lines+markers', name=f'{symbol}',
+                        line=dict(width=2, color=color),
+                        marker=dict(size=4),
+                        hovertemplate="<b>%{x}</b><br>Confidence: %{y:.1%}<extra>%{fullData.name}</extra>"
+                    ))
+            except Exception as e:
+                logging.debug(f"Failed to fetch confidence trend for {symbol}: {e}")
+
+        # Threshold lines - read from gate config
+        trading_thresh = getattr(gate.config, 'trading_threshold', 0.80) if gate else 0.80
+        hysteresis = getattr(gate.config, 'hysteresis', 0.05) if gate else 0.05
+        exit_thresh = trading_thresh - hysteresis
+
+        fig.add_hline(y=trading_thresh, line_dash="dash", line_color="#dc3545", line_width=2,
+                      annotation_text=f"{trading_thresh:.0%} Trading Threshold", annotation_position="top right",
+                      annotation_font_color="#dc3545")
+        fig.add_hline(y=exit_thresh, line_dash="dot", line_color="#ffc107", line_width=1,
+                      annotation_text=f"{exit_thresh:.0%} Exit Threshold", annotation_position="bottom right",
+                      annotation_font_color="#ffc107")
+
+        # Retraining markers
+        try:
+            for symbol in symbols_to_plot:
+                retrain_hist = db.get_retraining_history(symbol, timeframe, limit=20)
+                if retrain_hist:
+                    for r in retrain_hist[:10]:
+                        ts = r.get('triggered_at')
+                        if ts:
+                            fig.add_vline(x=ts, line_dash="dot", line_color="#667eea", line_width=1)
+        except Exception as e:
+            logging.debug(f"Failed to fetch retraining markers: {e}")
+
+        fig.update_layout(
+            title="Model Confidence Over Time",
+            xaxis_title="Time", yaxis_title="Confidence",
+            yaxis=dict(range=[0, 1], tickformat='.0%'),
+            height=420, template='plotly_white',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode='x unified'
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+        if not has_data:
+            st.info("No confidence data recorded yet. The system needs to run and save confidence scores over time.")
+
+        # Gate stats
+        if gate:
+            with st.expander("Confidence Gate Statistics"):
+                g_stats = gate.get_stats()
+                gc1, gc2, gc3, gc4 = st.columns(4)
+                with gc1:
+                    render_metric_card("To Trading", str(g_stats.get('transitions_to_trading', 0)), card_class='positive')
+                with gc2:
+                    render_metric_card("To Learning", str(g_stats.get('transitions_to_learning', 0)), card_class='warning')
+                with gc3:
+                    render_metric_card("Total Checks", str(g_stats.get('total_checks', 0)))
+                with gc4:
+                    render_metric_card("Regime Adjustments", str(g_stats.get('regime_adjustments', 0)))
+
+    except Exception as e:
+        st.warning(f"Unable to load confidence data: {e}")
+
+
+def render_trade_outcomes_timeline(systems: dict, tracked_symbols: list):
+    """Scatter plot of trade outcomes + cumulative P&L."""
+    try:
+        db = systems['db']
+        if not db:
+            st.info("Database not available. Start the trading system to enable trade outcome tracking.")
+            return
+        timeframe = st.session_state.get('timeframe', '1h')
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            sel_symbol = st.selectbox("Symbol", options=['ALL'] + tracked_symbols, key='outcomes_symbol')
+        with c2:
+            limit = st.slider("Recent Trades", 20, 200, 100, key='outcomes_limit')
+
+        # Fetch outcomes
+        all_outcomes = []
+        symbols = tracked_symbols if sel_symbol == 'ALL' else [sel_symbol]
+        for symbol in symbols:
+            try:
+                outcomes = db.get_recent_outcomes(symbol, timeframe, limit=limit)
+                if outcomes:
+                    all_outcomes.extend(outcomes)
+            except Exception as e:
+                logging.debug(f"Failed to fetch outcomes for {symbol}: {e}")
+
+        # Summary cards
+        try:
+            perf_stats = db.get_performance_stats()
+            sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
+            with sc1:
+                render_metric_card("Total Trades", str(perf_stats.get('resolved_trades', 0)))
+            with sc2:
+                wr = perf_stats.get('win_rate', 0)
+                render_metric_card("Win Rate", f"{wr:.1%}",
+                                   card_class='positive' if wr >= 0.5 else 'negative')
+            with sc3:
+                render_metric_card("Avg P&L", f"{perf_stats.get('avg_pnl', 0):.2f}%")
+            with sc4:
+                total_pnl = perf_stats.get('total_pnl', 0)
+                render_metric_card("Total P&L", f"{total_pnl:.2f}%",
+                                   card_class='positive' if total_pnl >= 0 else 'negative')
+            with sc5:
+                render_metric_card("Winners", str(perf_stats.get('winners', 0)), card_class='positive')
+            with sc6:
+                render_metric_card("Losers", str(perf_stats.get('losers', 0)), card_class='negative')
+        except Exception as e:
+            logging.debug(f"Failed to load performance stats: {e}")
+
+        if not all_outcomes:
+            st.info("No trade outcomes recorded yet. The system needs to place and close trades to show results here.")
+            return
+
+        outcomes_df = pd.DataFrame(all_outcomes)
+
+        # Build dual chart
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+            subplot_titles=('Trade Outcomes (Win/Loss)', 'Cumulative P&L (%)'),
+            row_heights=[0.55, 0.45]
+        )
+
+        # Top: scatter of individual trades
+        if 'pnl_percent' in outcomes_df.columns and 'entry_time' in outcomes_df.columns:
+            outcomes_df['pnl_percent'] = pd.to_numeric(outcomes_df['pnl_percent'], errors='coerce').fillna(0)
+            was_correct = outcomes_df.get('was_correct', pd.Series([0] * len(outcomes_df)))
+            colors = ['#28a745' if w else '#dc3545' for w in was_correct.astype(bool)]
+            sizes = [min(max(abs(p) * 3 + 6, 6), 25) for p in outcomes_df['pnl_percent']]
+
+            fig.add_trace(go.Scatter(
+                x=outcomes_df['entry_time'], y=outcomes_df['pnl_percent'],
+                mode='markers', name='Trades',
+                marker=dict(color=colors, size=sizes, line=dict(width=1, color='white'), opacity=0.8),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>P&L: %{y:.2f}%<br>"
+                    "Conf: %{customdata[1]:.1%}<br>Strategy: %{customdata[2]}<extra></extra>"
+                ),
+                customdata=list(zip(
+                    outcomes_df.get('predicted_direction', [''] * len(outcomes_df)),
+                    pd.to_numeric(outcomes_df.get('predicted_confidence', outcomes_df.get('confidence', 0)), errors='coerce').fillna(0),
+                    outcomes_df.get('strategy_name', [''] * len(outcomes_df)).fillna('AI Model')
+                ))
+            ), row=1, col=1)
+
+            fig.add_hline(y=0, line_dash="solid", line_color="#6c757d", line_width=1, row=1, col=1)
+
+            # Bottom: cumulative P&L
+            sorted_df = outcomes_df.sort_values('entry_time')
+            cum_pnl = sorted_df['pnl_percent'].cumsum()
+
+            fig.add_trace(go.Scatter(
+                x=sorted_df['entry_time'], y=cum_pnl,
+                mode='lines', name='Cumulative P&L',
+                fill='tozeroy', line=dict(color='#667eea', width=2),
+                fillcolor='rgba(102, 126, 234, 0.1)'
+            ), row=2, col=1)
+
+        fig.update_layout(
+            height=520, template='plotly_white', showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode='x unified'
+        )
+        fig.update_yaxes(title_text="P&L (%)", row=1, col=1)
+        fig.update_yaxes(title_text="Cumulative (%)", row=2, col=1)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Detail table
+        with st.expander("Recent Trades Detail"):
+            display_cols = ['entry_time', 'predicted_direction', 'entry_price', 'exit_price',
+                            'pnl_percent', 'was_correct', 'predicted_confidence', 'strategy_name', 'closed_by']
+            available_cols = [c for c in display_cols if c in outcomes_df.columns]
+            if available_cols:
+                detail = outcomes_df[available_cols].copy()
+                rename_map = {
+                    'entry_time': 'Time', 'predicted_direction': 'Dir',
+                    'entry_price': 'Entry', 'exit_price': 'Exit',
+                    'pnl_percent': 'P&L %', 'was_correct': 'Result',
+                    'predicted_confidence': 'Conf', 'strategy_name': 'Strategy',
+                    'closed_by': 'Closed By'
+                }
+                detail.rename(columns={k: v for k, v in rename_map.items() if k in detail.columns}, inplace=True)
+                if 'Result' in detail.columns:
+                    detail['Result'] = detail['Result'].apply(lambda x: 'WIN' if x else 'LOSS')
+                st.dataframe(detail.head(30), use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.warning(f"Unable to load trade outcomes: {e}")
+
+
+def render_retraining_history(systems: dict, tracked_symbols: list):
+    """Show retraining events with stats."""
+    try:
+        db = systems['db']
+        if not db:
+            st.info("Database not available. Start the trading system to enable retraining history.")
+            return
+        retrain_engine = systems['retraining_engine']
+        timeframe = st.session_state.get('timeframe', '1h')
+
+        # Stats cards
+        if retrain_engine:
+            try:
+                r_stats = retrain_engine.get_stats()
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                with rc1:
+                    render_metric_card("Total Retrainings", str(r_stats.get('retrainings_attempted', 0)))
+                with rc2:
+                    sr = r_stats.get('success_rate', 0)
+                    render_metric_card("Success Rate", f"{sr:.0%}",
+                                       card_class='positive' if sr >= 0.5 else 'negative')
+                with rc3:
+                    avg_dur = r_stats.get('avg_duration_seconds', 0)
+                    mins = int(avg_dur // 60)
+                    secs = int(avg_dur % 60)
+                    render_metric_card("Avg Duration", f"{mins}m {secs}s")
+                with rc4:
+                    ls_stats = systems['learning_system'].get_stats()
+                    render_metric_card("Active", str(ls_stats.get('active_retrainings', 0)))
+            except Exception:
+                pass
+
+        # History table
+        all_history = []
+        for symbol in tracked_symbols:
+            try:
+                hist = db.get_retraining_history(symbol, timeframe, limit=20)
+                if hist:
+                    all_history.extend(hist)
+            except Exception:
+                pass
+
+        if all_history:
+            df = pd.DataFrame(all_history)
+            display_cols = [c for c in ['triggered_at', 'symbol', 'trigger_reason', 'status',
+                                         'validation_accuracy', 'validation_confidence',
+                                         'duration_seconds'] if c in df.columns]
+            if display_cols:
+                detail = df[display_cols].copy()
+                rename_map = {
+                    'triggered_at': 'Time', 'symbol': 'Symbol', 'trigger_reason': 'Reason',
+                    'status': 'Status', 'validation_accuracy': 'Accuracy',
+                    'validation_confidence': 'Confidence', 'duration_seconds': 'Duration (s)'
+                }
+                detail.rename(columns={k: v for k, v in rename_map.items() if k in detail.columns}, inplace=True)
+                if 'Accuracy' in detail.columns:
+                    detail['Accuracy'] = pd.to_numeric(detail['Accuracy'], errors='coerce').apply(
+                        lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                if 'Confidence' in detail.columns:
+                    detail['Confidence'] = pd.to_numeric(detail['Confidence'], errors='coerce').apply(
+                        lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                st.dataframe(detail.head(20), use_container_width=True, hide_index=True)
+        else:
+            st.info("No retraining events recorded yet.")
+
+    except Exception as e:
+        st.warning(f"Unable to load retraining history: {e}")
+
+
+# =============================================================================
+# PAGE: LEARNING
+# =============================================================================
+
+def page_learning():
+    """Learning Progress, Confidence Tracking & Trade Outcomes page."""
+    st.title("Learning Progress")
+    st.markdown("Real-time visibility into the continuous learning pipeline")
+
+    # Get learning subsystems
+    systems = _get_learning_systems()
+
+    if not systems['available']:
+        # Fallback: show database-based learning stats when bridge isn't available
+        st.info("Reading learning data from database (bot running separately)")
+        _render_db_learning_page()
+        return
+
+    # --- Section 1: Overview metric cards ---
+    render_learning_overview(systems)
+
+    st.markdown("---")
+
+    # --- Section 2: Per-symbol mode status ---
+    tracked_symbols = []
+    if systems.get('state_manager'):
+        try:
+            sm = systems['state_manager']
+            if hasattr(sm, '_mode_cache'):
+                tracked_symbols = list({k[0] for k in sm._mode_cache.keys()})
+        except Exception:
+            pass
+    # Fallback: get symbols from session state
+    if not tracked_symbols:
+        bridge = st.session_state.get('learning_bridge')
+        if bridge and hasattr(bridge, 'symbols'):
+            tracked_symbols = list(bridge.symbols)
+
+    render_mode_status(systems, tracked_symbols)
+
+    st.markdown("---")
+
+    # --- Section 3: Tabbed detail views ---
+    tab_confidence, tab_outcomes, tab_retraining = st.tabs([
+        "Confidence Tracking",
+        "Trade Outcomes",
+        "Retraining History"
+    ])
+
+    with tab_confidence:
+        render_confidence_timeline(systems, tracked_symbols)
+
+    with tab_outcomes:
+        render_trade_outcomes_timeline(systems, tracked_symbols)
+
+    with tab_retraining:
+        render_retraining_history(systems, tracked_symbols)
 
 
 # =============================================================================
@@ -4292,6 +4898,7 @@ def main():
         pages = {
             "📊 Dashboard": "Dashboard",
             "📝 Trading Center": "Paper Trading",
+            "📈 Learning": "Learning",
             "⚙️ Settings": "Settings"
         }
 
@@ -4301,6 +4908,7 @@ def main():
                 "📊 Dashboard": "Dashboard",
                 "💱 Forex Markets": "Forex Markets",
                 "📝 Trading Center": "Paper Trading",
+                "📈 Learning": "Learning",
                 "⚙️ Settings": "Settings"
             }
 
@@ -4341,6 +4949,7 @@ def main():
         "Dashboard": page_dashboard,
         "Forex Markets": page_forex_markets,
         "Paper Trading": page_paper_trading,  # Now includes Portfolio + Performance tabs
+        "Learning": page_learning,
         "Settings": page_settings,
     }
 

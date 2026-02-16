@@ -79,9 +79,11 @@ class RetrainingEngine:
         # Get replay buffers from continual learner if available
         if hasattr(continual_learner, 'replay_buffers'):
             self.replay_buffers = continual_learner.replay_buffers
+        elif hasattr(continual_learner, 'replay_buffer'):
+            self.replay_buffers = {'default': continual_learner.replay_buffer}
         else:
             self.replay_buffers = {}
-            logger.warning("ContinualLearner has no replay_buffers attribute")
+            logger.debug("No replay buffers available (mathematical predictor - expected)")
 
         # Retraining parameters (from config)
         retrain_config = self.config.get('continuous_learning', {}).get('retraining', {})
@@ -507,35 +509,83 @@ class RetrainingEngine:
             f"Prepared {len(X)} training samples with {X.shape[1]} features from real market data"
         )
 
-        # 5. Mix with experience replay buffer if available
-        key = (symbol, interval)
-        if key in self.replay_buffers and len(self.replay_buffers[key]) > 0:
-            replay_size = int(len(X) * replay_ratio)
+        # 5. Create sequences for LSTM (2D → 3D)
+        # LSTM expects (batch, sequence_length, features), not (batch, features)
+        seq_len = self._get_sequence_length(interval)
+        X_seq, y_seq = self._create_sequences(X, y, seq_len)
 
-            try:
-                X_replay, y_replay = self.replay_buffers[key].sample(replay_size)
+        if len(X_seq) < self.min_samples:
+            raise ValueError(
+                f"After sequencing (seq_len={seq_len}), only {len(X_seq)} samples remain. "
+                f"Need at least {self.min_samples}. Try increasing recent_candles."
+            )
 
-                X = np.vstack([X, X_replay])
-                y = np.concatenate([y, y_replay])
+        logger.info(
+            f"Created {len(X_seq)} sequences of length {seq_len} "
+            f"(shape: {X_seq.shape}) for LSTM training"
+        )
 
-                logger.info(
-                    f"Mixed {replay_size} replay samples with {len(X) - replay_size} recent samples. "
-                    f"Total: {len(X)} samples"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to sample from replay buffer: {e}. Continuing without replay.")
+        # 7. Train/validation split
+        split_idx = int(len(X_seq) * (1 - self.validation_split))
 
-        # 6. Train/validation split
-        split_idx = int(len(X) * (1 - self.validation_split))
-
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
+        X_train, X_val = X_seq[:split_idx], X_seq[split_idx:]
+        y_train, y_val = y_seq[:split_idx], y_seq[split_idx:]
 
         logger.info(
             f"Training data prepared: {len(X_train)} train samples, {len(X_val)} validation samples"
         )
 
         return X_train, y_train, X_val, y_val
+
+    def _get_sequence_length(self, interval: str) -> int:
+        """
+        Get sequence length for a given interval from config.
+
+        Falls back to model.sequence_length, then default 60.
+        """
+        # Check interval-specific config first
+        intervals = self.config.get('timeframes', {}).get('intervals', [])
+        for interval_config in intervals:
+            if interval_config.get('interval') == interval:
+                seq_len = interval_config.get('sequence_length')
+                if seq_len is not None:
+                    return seq_len
+
+        # Fallback to global model config
+        return self.config.get('model', {}).get('sequence_length', 60)
+
+    def _create_sequences(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sequence_length: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create sliding-window sequences from 2D feature matrix.
+
+        Transforms:
+            X: (n_samples, n_features) → (n_samples - seq_len, seq_len, n_features)
+            y: (n_samples,) → (n_samples - seq_len,)
+
+        Each sequence X_seq[i] = X[i:i+seq_len] with label y_seq[i] = y[i+seq_len-1]
+        (the label at the end of the window).
+        """
+        n_samples = len(X)
+        if n_samples <= sequence_length:
+            raise ValueError(
+                f"Not enough samples ({n_samples}) for sequence_length={sequence_length}"
+            )
+
+        n_sequences = n_samples - sequence_length
+        X_seq = np.empty((n_sequences, sequence_length, X.shape[1]), dtype=np.float32)
+        y_seq = np.empty(n_sequences, dtype=np.float32)
+
+        for i in range(n_sequences):
+            X_seq[i] = X[i:i + sequence_length]
+            # Label = "did price go up after the last candle in this window?"
+            y_seq[i] = y[i + sequence_length - 1]
+
+        return X_seq, y_seq
 
     def _create_data_loader(
         self,
@@ -601,6 +651,12 @@ class RetrainingEngine:
         total = 0
         confidences = []
 
+        # Confidence calibration params (outside loop for performance)
+        pred_config = self.config.get('prediction', {})
+        floor = pred_config.get('confidence_floor', 0.52)
+        ceiling = pred_config.get('confidence_ceiling', 0.72)
+        conf_range = ceiling - floor
+
         with torch.no_grad():
             for inputs, targets in val_loader:
                 outputs = model(inputs).squeeze()
@@ -613,8 +669,9 @@ class RetrainingEngine:
                 correct += (predictions == targets).sum().item()
                 total += len(targets)
 
-                # Confidence (distance from 0.5)
-                conf = torch.abs(outputs - 0.5) * 2  # Scale to 0-1
+                # Confidence using calibrated range mapping (aligned with AdvancedPredictor)
+                conf = (torch.abs(outputs - 0.5) + 0.5 - floor) / conf_range if conf_range > 0 else torch.abs(outputs - 0.5) * 2
+                conf = torch.clamp(conf, 0.0, 1.0)
                 confidences.extend(conf.tolist())
 
         accuracy = correct / max(total, 1)

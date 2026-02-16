@@ -651,12 +651,14 @@ class Database:
     # SIGNAL OPERATIONS
     # =========================================================================
 
-    def save_signal(self, signal: Signal) -> int:
+    def save_signal(self, signal: Signal, symbol: str = None, interval: str = None) -> int:
         """
         Save signal to database.
 
         Args:
             signal: Signal to save
+            symbol: Trading pair (e.g. 'BTC/USDT')
+            interval: Timeframe (e.g. '15m', '1h')
 
         Returns:
             Signal ID
@@ -675,9 +677,9 @@ class Database:
             cursor.execute('''
                 INSERT INTO signals
                 (timestamp, datetime, signal_type, strength, confidence, price,
-                 stop_loss, take_profit, atr, actual_outcome, outcome_price,
-                 outcome_timestamp, pnl_percent)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stop_loss, take_profit, atr, symbol, interval,
+                 actual_outcome, outcome_price, outcome_timestamp, pnl_percent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 ts_int,
                 ts_str,
@@ -688,6 +690,8 @@ class Database:
                 signal.stop_loss,
                 signal.take_profit,
                 signal.atr,
+                symbol,
+                interval,
                 signal.actual_outcome,
                 signal.outcome_price,
                 signal.outcome_timestamp.isoformat() if signal.outcome_timestamp else None,
@@ -774,17 +778,43 @@ class Database:
 
             return signals
 
-    def get_pending_signals(self) -> List[Signal]:
-        """Get signals that haven't been resolved yet."""
+    def get_pending_signals(self, symbol: str = None, max_age_hours: int = 48) -> List[Signal]:
+        """
+        Get signals that haven't been resolved yet.
+
+        Args:
+            symbol: Optional symbol to filter by (e.g., "BTC/USDT")
+                   If None, returns all pending signals.
+            max_age_hours: Maximum signal age in hours (default 48h).
+                          Prevents stale signals from previous sessions.
+
+        Returns:
+            List of pending Signal objects
+        """
+        cutoff_ms = int((datetime.utcnow() - timedelta(hours=max_age_hours)).timestamp() * 1000)
+
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT id, datetime, signal_type, strength, confidence, price,
-                       stop_loss, take_profit, atr
-                FROM signals
-                WHERE actual_outcome IS NULL OR actual_outcome = 'PENDING'
-                ORDER BY timestamp DESC
-            ''')
+
+            if symbol:
+                cursor.execute('''
+                    SELECT id, datetime, signal_type, strength, confidence, price,
+                           stop_loss, take_profit, atr
+                    FROM signals
+                    WHERE (actual_outcome IS NULL OR actual_outcome = 'PENDING')
+                      AND symbol = ?
+                      AND timestamp > ?
+                    ORDER BY timestamp DESC
+                ''', (symbol, cutoff_ms))
+            else:
+                cursor.execute('''
+                    SELECT id, datetime, signal_type, strength, confidence, price,
+                           stop_loss, take_profit, atr
+                    FROM signals
+                    WHERE (actual_outcome IS NULL OR actual_outcome = 'PENDING')
+                      AND timestamp > ?
+                    ORDER BY timestamp DESC
+                ''', (cutoff_ms,))
 
             signals = []
             for row in cursor.fetchall():
@@ -806,6 +836,58 @@ class Database:
                     logger.debug(f"Error parsing signal: {e}")
 
             return signals
+
+    def close_signal(self, signal_id: int, outcome: str, exit_price: float = None, pnl_percent: float = None):
+        """
+        Mark a signal as closed with its outcome.
+
+        Args:
+            signal_id: Signal ID to close
+            outcome: 'WIN', 'LOSS', or 'EXPIRED'
+            exit_price: Exit price (optional)
+            pnl_percent: PnL percentage (optional)
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE signals
+                SET actual_outcome = ?,
+                    outcome_price = ?,
+                    pnl_percent = ?,
+                    outcome_timestamp = ?
+                WHERE id = ?
+            ''', (outcome, exit_price, pnl_percent, datetime.utcnow().isoformat(), signal_id))
+            conn.commit()
+
+    def close_stale_signals(self, max_age_hours: int = 48) -> int:
+        """
+        Close all pending signals older than max_age_hours.
+
+        Marks them as 'EXPIRED' to prevent stale evaluations.
+
+        Args:
+            max_age_hours: Maximum age before expiry (default 48h)
+
+        Returns:
+            Number of signals closed
+        """
+        cutoff_ms = int((datetime.utcnow() - timedelta(hours=max_age_hours)).timestamp() * 1000)
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE signals
+                SET actual_outcome = 'EXPIRED'
+                WHERE (actual_outcome IS NULL OR actual_outcome = 'PENDING')
+                  AND timestamp <= ?
+            ''', (cutoff_ms,))
+            count = cursor.rowcount
+            conn.commit()
+
+            if count > 0:
+                logger.info(f"Closed {count} stale pending signals (older than {max_age_hours}h)")
+
+            return count
 
     def get_signal_count(self) -> int:
         """Get total number of signals."""

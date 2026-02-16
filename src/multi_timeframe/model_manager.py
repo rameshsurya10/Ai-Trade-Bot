@@ -109,8 +109,8 @@ class MultiTimeframeModelManager:
         # Sanitize symbol for filename
         safe_symbol = symbol.replace("/", "_").replace("-", "_")
 
-        # Format: {symbol}_{interval}_model.pt
-        filename = f"{safe_symbol}_{interval}_model.pt"
+        # Format: model_{symbol}_{interval}.pt (matches MultiCurrencySystem convention)
+        filename = f"model_{safe_symbol}_{interval}.pt"
 
         return self.models_dir / filename
 
@@ -153,8 +153,18 @@ class MultiTimeframeModelManager:
             model_path = self.get_model_path(symbol, interval)
 
             if not model_path.exists():
-                logger.warning(f"No model found for {symbol} @ {interval} at {model_path}")
-                return None
+                # Fallback to 1h model if interval-specific model doesn't exist
+                if interval != '1h':
+                    fallback_path = self.get_model_path(symbol, '1h')
+                    if fallback_path.exists():
+                        logger.info(f"No {interval} model for {symbol}, falling back to 1h model")
+                        model_path = fallback_path
+                    else:
+                        logger.warning(f"No model found for {symbol} @ {interval} or 1h")
+                        return None
+                else:
+                    logger.warning(f"No model found for {symbol} @ {interval} at {model_path}")
+                    return None
 
             try:
                 # Load checkpoint

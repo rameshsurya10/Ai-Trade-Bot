@@ -39,8 +39,8 @@ class ConfidenceGateConfig:
             self.regime_thresholds = {
                 'TRENDING': -0.05,  # Easier: 75% threshold
                 'NORMAL': 0.0,      # Standard: 80% threshold
-                'CHOPPY': 0.05,     # Harder: 85% threshold
-                'VOLATILE': 0.10    # Much harder: 90% threshold
+                'CHOPPY': 0.0,      # Standard: 80% (penalty already in predictor)
+                'VOLATILE': 0.0     # Standard: 80% (penalty already in predictor)
             }
 
 

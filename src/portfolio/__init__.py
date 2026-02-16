@@ -39,14 +39,11 @@ from .risk import (
     RiskModel,
     MaximumDrawdownRisk,
     MaximumPositionSizeRisk,
-    SectorExposureRisk,
 )
 from .sizing import (
     PositionSizer,
     EqualWeightSizer,
-    RiskParitySizer,
     KellyCriterionSizer,
-    VolatilityTargetSizer,
 )
 
 __all__ = [
@@ -60,11 +57,8 @@ __all__ = [
     'RiskModel',
     'MaximumDrawdownRisk',
     'MaximumPositionSizeRisk',
-    'SectorExposureRisk',
     # Sizing
     'PositionSizer',
     'EqualWeightSizer',
-    'RiskParitySizer',
     'KellyCriterionSizer',
-    'VolatilityTargetSizer',
 ]

@@ -17,7 +17,7 @@ Modules:
 
 Usage:
 ------
-    from src import DataService, AnalysisEngine, SignalService
+    from src import DataService, AnalysisEngine
     from src.core import Config, Database, MetricsCalculator
     from src.advanced_predictor import AdvancedPredictor
     from src.live_trading import LiveTradingRunner
@@ -36,7 +36,6 @@ __author__ = "AI Trade Bot"
 
 # Core services (non-torch)
 from .data_service import DataService
-from .signal_service import SignalService
 from .notifier import Notifier
 
 # Torch-dependent imports (optional)
@@ -88,7 +87,6 @@ __all__ = [
     "AnalysisEngine",
     "FeatureCalculator",
     "LSTMModel",
-    "SignalService",
     "Notifier",
 
     # Advanced Predictor

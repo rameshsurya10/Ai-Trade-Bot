@@ -99,21 +99,21 @@ class ModelManager:
         self.loaded_models: Dict[str, LSTMModel] = {}
         self.model_configs: Dict[str, dict] = {}
 
-    def get_model_path(self, symbol: str) -> Path:
+    def get_model_path(self, symbol: str, interval: str = "1h") -> Path:
         """Get path for currency-specific model."""
         safe_symbol = symbol.replace("/", "_").replace("-", "_")
-        return self.models_dir / f"model_{safe_symbol}.pt"
+        return self.models_dir / f"model_{safe_symbol}_{interval}.pt"
 
-    def load_model(self, symbol: str, config: dict) -> Optional[LSTMModel]:
+    def load_model(self, symbol: str, config: dict, interval: str = "1h") -> Optional[LSTMModel]:
         """Load model for specific currency."""
-        model_path = self.get_model_path(symbol)
+        model_path = self.get_model_path(symbol, interval)
 
         if not model_path.exists():
             logger.warning(f"No model found for {symbol} at {model_path}")
             return None
 
         try:
-            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
             feature_columns = FeatureCalculator.get_feature_columns()
             input_size = len(feature_columns)
@@ -143,9 +143,10 @@ class ModelManager:
             return None
 
     def save_model(self, symbol: str, model: LSTMModel, config: dict,
-                   feature_means: np.ndarray, feature_stds: np.ndarray):
+                   feature_means: np.ndarray, feature_stds: np.ndarray,
+                   interval: str = "1h"):
         """Save model for specific currency."""
-        model_path = self.get_model_path(symbol)
+        model_path = self.get_model_path(symbol, interval)
 
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -410,7 +411,8 @@ class MultiCurrencySystem:
         # Initialize components
         self.model_manager = ModelManager(self.config.get('model', {}).get('models_dir', 'models'))
         self.auto_trainer = AutoTrainer(self.model_manager, self.config.get('model', {}))
-        self.advanced_predictor = AdvancedPredictor()
+        self.advanced_predictor = AdvancedPredictor(config=self.config)
+        self.advanced_predictor.set_model_manager(self.model_manager)
 
         # Currency configurations
         self.currencies: Dict[str, CurrencyConfig] = {}
@@ -457,14 +459,14 @@ class MultiCurrencySystem:
             symbol=symbol,
             exchange=exchange,
             interval=interval,
-            model_path=str(self.model_manager.get_model_path(symbol))
+            model_path=str(self.model_manager.get_model_path(symbol, interval))
         )
         self.currencies[symbol] = currency_config
         self.performance[symbol] = PerformanceStats(symbol=symbol)
 
-        # Try to load existing model
+        # Try to load existing model (pass interval for correct path)
         model_config = self.config.get('model', {})
-        self.model_manager.load_model(symbol, model_config)
+        self.model_manager.load_model(symbol, model_config, interval=interval)
 
         logger.info(f"Added currency: {symbol} on {exchange}")
 
@@ -549,7 +551,7 @@ class MultiCurrencySystem:
 
             # Get LSTM model prediction
             model = self.model_manager.get_model(symbol)
-            lstm_prob = None
+            lstm_prob = 0.5  # Default if no LSTM model
 
             if model is not None:
                 try:
@@ -579,7 +581,9 @@ class MultiCurrencySystem:
 
             # Get advanced mathematical prediction
             atr = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
-            advanced_result = self.advanced_predictor.predict(df, lstm_prob, atr)
+            advanced_result = self.advanced_predictor.predict(
+                df=df, symbol=symbol, lstm_probability=lstm_prob, atr=atr
+            )
 
             # Build result
             current_price = df['close'].iloc[-1]

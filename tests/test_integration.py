@@ -194,14 +194,10 @@ class TestPortfolioComponents:
         """Test position sizers can be imported."""
         from src.portfolio.sizing import (
             EqualWeightSizer,
-            RiskParitySizer,
             KellyCriterionSizer,
-            VolatilityTargetSizer
         )
         assert EqualWeightSizer is not None
-        assert RiskParitySizer is not None
         assert KellyCriterionSizer is not None
-        assert VolatilityTargetSizer is not None
 
     def test_equal_weight_sizer(self):
         """Test equal weight position sizing."""

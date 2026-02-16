@@ -383,6 +383,92 @@ class PaperBrokerage(BaseBrokerage):
 
             return True
 
+    # ========== Learning System Integration ==========
+
+    def execute_signal(
+        self,
+        symbol: str,
+        signal: str,
+        confidence: float,
+        signal_id: str = None
+    ) -> bool:
+        """
+        Execute a trading signal from the continuous learning system.
+
+        This is the bridge between the learning system and paper trading.
+        It creates and executes a market order based on the prediction signal.
+
+        Args:
+            symbol: Trading pair (e.g., "BTC/USDT")
+            signal: Direction ("UP" or "DOWN")
+            confidence: Prediction confidence (0.0 to 1.0)
+            signal_id: Signal ID for tracking
+
+        Returns:
+            True if order was executed
+        """
+        current_price = self._prices.get(symbol, 0)
+        if current_price <= 0:
+            logger.warning(f"[Paper] Cannot execute signal for {symbol}: no price data")
+            return False
+
+        # Determine order side
+        if signal == 'UP':
+            side = OrderSide.BUY
+        elif signal == 'DOWN':
+            # Only sell if we have a position
+            pos = self._positions.get(symbol)
+            if not pos or pos.quantity <= 0:
+                logger.debug(f"[Paper] Skipping DOWN signal for {symbol}: no position to sell")
+                return False
+            side = OrderSide.SELL
+        else:
+            return False
+
+        # Calculate position size (risk 2% of portfolio per trade)
+        risk_pct = 0.02
+        portfolio_value = self.cash + sum(
+            p.quantity * self._prices.get(s, 0)
+            for s, p in self._positions.items()
+        )
+
+        if side == OrderSide.BUY:
+            trade_value = portfolio_value * risk_pct * confidence
+            quantity = trade_value / current_price
+            # Crypto precision
+            if '/' in symbol:
+                quantity = round(quantity, 6)
+            else:
+                quantity = max(1, int(quantity))
+        else:
+            # Sell entire position
+            quantity = self._positions[symbol].quantity
+
+        if quantity <= 0:
+            return False
+
+        # Create and place order
+        order = Order(
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=quantity
+        )
+
+        if signal_id:
+            order.tag = signal_id
+
+        ticket = self.place_order(order)
+
+        if order.status == OrderStatus.FILLED:
+            logger.info(
+                f"[Paper] Signal executed: {side.name} {quantity:.6f} {symbol} "
+                f"@ {current_price:.2f} (conf: {confidence:.1%}, id: {signal_id})"
+            )
+            return True
+
+        return False
+
     # ========== Price Updates ==========
 
     def update_price(self, symbol: str, price: float) -> None:

@@ -281,16 +281,21 @@ class SignalAggregator:
         else:
             avg_confidence = 0.0
 
-        # Determine final direction
-        if abs(weighted_score) < 0.1:  # Nearly neutral
+        # Determine final direction and confidence
+        # weighted_score sign determines direction
+        # avg_confidence is the actual confidence level
+        # agreement_ratio measures how aligned the timeframes are (0-1)
+        if abs(weighted_score) < 0.01:  # Nearly neutral
             direction = 'NEUTRAL'
             confidence = avg_confidence
-        elif weighted_score > 0:
-            direction = 'BUY'
-            confidence = avg_confidence * abs(weighted_score)  # Scale by agreement
         else:
-            direction = 'SELL'
-            confidence = avg_confidence * abs(weighted_score)
+            direction = 'BUY' if weighted_score > 0 else 'SELL'
+            # Agreement: ratio of net directional strength to total confidence
+            # 1.0 = all timeframes agree, 0.0 = perfectly split
+            agreement_ratio = abs(weighted_score) / (confidence_sum + 1e-10) if confidence_sum > 0 else 0.0
+            agreement_ratio = min(agreement_ratio, 1.0)
+            # Confidence = avg confidence scaled by agreement (floor 50% to avoid crushing)
+            confidence = avg_confidence * max(agreement_ratio, 0.5)
 
         # Cap confidence at 1.0
         confidence = min(confidence, 1.0)
