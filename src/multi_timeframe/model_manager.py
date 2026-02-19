@@ -6,7 +6,7 @@ Manages LSTM models per (symbol, interval) combination for continuous learning.
 
 Key Features:
 - Load/save models per (symbol, interval)
-- Model naming: models/BTC_USDT_1h_model.pt
+- Model naming: models/model_BTC_USDT_1h.pt
 - Caching for fast access
 - Thread-safe operations
 - Model versioning support
@@ -52,8 +52,8 @@ class MultiTimeframeModelManager:
     Thread-safe with RLock for concurrent access.
 
     Model Path Pattern:
-        models/{symbol}_{interval}_model.pt
-        Example: models/BTC_USDT_1h_model.pt
+        models/model_{symbol}_{interval}.pt
+        Example: models/model_BTC_USDT_1h.pt
 
     Cache Structure:
         {(symbol, interval): LSTMModel}
@@ -104,7 +104,7 @@ class MultiTimeframeModelManager:
 
         Example:
             >>> manager.get_model_path("BTC/USDT", "1h")
-            Path("models/BTC_USDT_1h_model.pt")
+            Path("models/model_BTC_USDT_1h.pt")
         """
         # Sanitize symbol for filename
         safe_symbol = symbol.replace("/", "_").replace("-", "_")
@@ -319,17 +319,15 @@ class MultiTimeframeModelManager:
     def get_all_intervals(self, symbol: str) -> list:
         """Get all intervals that have models for a symbol."""
         intervals = []
+        safe_symbol = symbol.replace("/", "_").replace("-", "_")
 
-        for file in self.models_dir.glob(f"*_model.pt"):
-            # Parse filename: {symbol}_{interval}_model.pt
-            parts = file.stem.split('_')
-            if len(parts) >= 2:
-                # Reconstruct symbol
-                file_symbol = "_".join(parts[:-2]).replace("_", "/")
-                file_interval = parts[-2]
-
-                if file_symbol == symbol or file_symbol.replace("/", "_") == symbol.replace("/", "_"):
-                    intervals.append(file_interval)
+        for file in self.models_dir.glob(f"model_{safe_symbol}_*.pt"):
+            # Parse filename: model_{symbol}_{interval}.pt
+            stem = file.stem  # e.g. "model_BTC_USDT_1h"
+            # Remove "model_" prefix, then remove the symbol prefix to get interval
+            suffix = stem[len(f"model_{safe_symbol}_"):]
+            if suffix:
+                intervals.append(suffix)
 
         return sorted(set(intervals))
 
@@ -401,12 +399,19 @@ class MultiTimeframeModelManager:
         """
         models = []
 
-        for file in self.models_dir.glob("*_model.pt"):
-            # Parse filename: {symbol}_{interval}_model.pt
-            parts = file.stem.split('_')
-            if len(parts) >= 2:
-                symbol = "_".join(parts[:-2]).replace("_", "/")
-                interval = parts[-2]
+        for file in self.models_dir.glob("model_*.pt"):
+            # Parse filename: model_{symbol}_{interval}.pt
+            stem = file.stem  # e.g. "model_BTC_USDT_1h"
+            if not stem.startswith("model_"):
+                continue
+
+            remainder = stem[len("model_"):]  # e.g. "BTC_USDT_1h"
+            # The interval is the last segment; symbol parts are everything before
+            parts = remainder.rsplit('_', 1)
+            if len(parts) == 2:
+                raw_symbol = parts[0]  # e.g. "BTC_USDT"
+                interval = parts[1]    # e.g. "1h"
+                symbol = raw_symbol.replace("_", "/")
 
                 models.append({
                     'symbol': symbol,

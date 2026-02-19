@@ -16,7 +16,7 @@ Integration:
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -82,6 +82,8 @@ class AggregatedSignal:
     regime: str = "NORMAL"
     metadata: dict = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -95,7 +97,9 @@ class AggregatedSignal:
             'method': self.method,
             'regime': self.regime,
             'metadata': self.metadata,
-            'timestamp': self.timestamp.isoformat()
+            'timestamp': self.timestamp.isoformat(),
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
         }
 
 

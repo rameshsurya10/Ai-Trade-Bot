@@ -134,6 +134,27 @@ class BrokerageConfig:
 
 
 @dataclass
+class MT5Config:
+    """
+    MetaTrader 5 settings.
+
+    SECURITY: MT5 credentials should be set via environment variables:
+        MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_TERMINAL_PATH
+    """
+    enabled: bool = False
+    demo: bool = True
+    terminal_path: str = ""
+    server: str = ""
+    bridge_host: str = "localhost"
+    bridge_port: int = 5555
+    poll_interval_ms: int = 2000
+    tick_poll_interval_ms: int = 500
+    magic_number: int = 234000
+    pairs: Optional[list] = None
+    intervals: Optional[list] = None
+
+
+@dataclass
 class BacktestConfig:
     """Backtesting settings."""
     # Capital
@@ -169,6 +190,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     brokerage: BrokerageConfig = field(default_factory=BrokerageConfig)
+    mt5: MT5Config = field(default_factory=MT5Config)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
 
     # Raw config dict for backwards compatibility
@@ -235,6 +257,9 @@ class Config:
 
         if 'brokerage' in data:
             config.brokerage = BrokerageConfig(**data['brokerage'])
+
+        if 'mt5' in data:
+            config.mt5 = MT5Config(**data['mt5'])
 
         if 'backtest' in data:
             config.backtest = BacktestConfig(**data['backtest'])
@@ -363,6 +388,14 @@ class Config:
         elif self.brokerage.type == "binance":
             from src.brokerages.binance import BinanceBrokerage
             return BinanceBrokerage(testnet=self.brokerage.paper_mode)
+
+        elif self.brokerage.type == "mt5":
+            from src.brokerages.mt5 import MT5Brokerage
+            return MT5Brokerage(
+                demo=self.mt5.demo,
+                terminal_path=self.mt5.terminal_path,
+                magic_number=self.mt5.magic_number,
+            )
 
         else:
             raise ValueError(f"Unknown brokerage type: {self.brokerage.type}")

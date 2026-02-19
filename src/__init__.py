@@ -35,7 +35,11 @@ __version__ = "3.0.0"
 __author__ = "AI Trade Bot"
 
 # Core services (non-torch)
-from .data_service import DataService
+try:
+    from .data_service import DataService
+except ImportError:
+    DataService = None
+
 from .notifier import Notifier
 
 # Torch-dependent imports (optional)

@@ -172,6 +172,10 @@ class StrategicLearningBridge:
         self._current_modes: Dict[str, str] = {}  # symbol -> 'LEARNING' or 'TRADING'
         self._mode_transitions: deque = deque(maxlen=1000)  # Bounded to prevent memory leak
 
+        # Recover any PENDING signals from a previous session so they can be
+        # closed/evaluated by _check_and_close_trades() on the next candle.
+        self._recover_open_trades_from_db()
+
         logger.info(
             "Strategic Learning Bridge initialized\n"
             f"  Paper brokerage: {paper_brokerage.__class__.__name__}\n"
@@ -279,6 +283,69 @@ class StrategicLearningBridge:
                 'executed': False
             }
 
+    def _recover_open_trades_from_db(self):
+        """
+        Reload PENDING signals from DB into _open_trades on startup.
+
+        Without this, trades opened before a process restart are orphaned:
+        _open_trades is empty so _check_and_close_trades never evaluates them.
+        Queries the DB directly to get symbol + interval columns (not in get_pending_signals()).
+        """
+        try:
+            from datetime import timedelta
+            cutoff = datetime.utcnow() - timedelta(hours=48)
+            cutoff_ms = int(cutoff.timestamp() * 1000)
+
+            recovered = 0
+            with self.database.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, datetime, signal_type, confidence, price,
+                           stop_loss, take_profit, symbol, interval
+                    FROM signals
+                    WHERE (actual_outcome IS NULL OR actual_outcome = 'PENDING')
+                      AND timestamp > ?
+                    ORDER BY timestamp DESC
+                ''', (cutoff_ms,))
+                rows = cursor.fetchall()
+
+            for row in rows:
+                sig_id = row['id']
+                if sig_id in self._open_trades:
+                    continue
+
+                symbol = row['symbol'] or 'UNKNOWN'
+                interval = row['interval'] or '1h'
+                direction = row['signal_type'] if row['signal_type'] in ('BUY', 'SELL') else 'BUY'
+
+                try:
+                    entry_time = datetime.fromisoformat(row['datetime'])
+                except Exception:
+                    entry_time = datetime.utcnow()
+
+                trade = TradeRecord(
+                    signal_id=sig_id,
+                    symbol=symbol,
+                    interval=interval,
+                    entry_price=row['price'] or 0.0,
+                    entry_time=entry_time,
+                    direction=direction,
+                    confidence=row['confidence'] or 0.0,
+                    stop_loss=row['stop_loss'] or 0.0,
+                    take_profit=row['take_profit'] or 0.0,
+                    features=None,
+                    regime='NORMAL',
+                    is_paper=True
+                )
+                with self._trades_lock:
+                    self._open_trades[sig_id] = trade
+                recovered += 1
+
+            if recovered:
+                logger.info(f"Recovered {recovered} pending trades from DB into open_trades")
+        except Exception as e:
+            logger.warning(f"Failed to recover open trades from DB: {e}")
+
     def _track_new_trade(
         self,
         signal_id: int,
@@ -302,8 +369,8 @@ class StrategicLearningBridge:
             direction = prediction.get('direction', 'BUY')
             confidence = prediction.get('confidence', 0.5)
             entry_price = prediction.get('entry_price', 0.0)
-            stop_loss = prediction.get('stop_loss', 0.0)
-            take_profit = prediction.get('take_profit', 0.0)
+            stop_loss = prediction.get('stop_loss') or 0.0
+            take_profit = prediction.get('take_profit') or 0.0
             regime = prediction.get('regime', 'NORMAL')
 
             # Create trade record
@@ -388,20 +455,34 @@ class StrategicLearningBridge:
                     should_close = False
                     close_reason = None
 
+                    # Resolve effective SL/TP: use per-trade ATR-based levels when available,
+                    # fall back to config flat-percentage levels otherwise.
+                    if trade.stop_loss and trade.stop_loss > 0:
+                        # Price-based: convert absolute price level to % distance from entry
+                        if trade.direction == 'BUY':
+                            effective_sl_pct = ((trade.entry_price - trade.stop_loss) / trade.entry_price) * 100
+                            effective_tp_pct = ((trade.take_profit - trade.entry_price) / trade.entry_price) * 100
+                        else:
+                            effective_sl_pct = ((trade.stop_loss - trade.entry_price) / trade.entry_price) * 100
+                            effective_tp_pct = ((trade.entry_price - trade.take_profit) / trade.entry_price) * 100
+                    else:
+                        effective_sl_pct = stop_loss_pct
+                        effective_tp_pct = take_profit_pct
+
                     # 1. STOP-LOSS CHECK
-                    if pnl_pct <= -stop_loss_pct:
+                    if pnl_pct <= -effective_sl_pct:
                         should_close = True
                         close_reason = "stop_loss"
                         logger.info(
-                            f"[{symbol}] 🛑 Stop-loss hit: {pnl_pct:.2f}% ≤ -{stop_loss_pct:.2f}%"
+                            f"[{symbol}] Stop-loss hit: {pnl_pct:.2f}% <= -{effective_sl_pct:.2f}%"
                         )
 
                     # 2. TAKE-PROFIT CHECK
-                    elif pnl_pct >= take_profit_pct:
+                    elif pnl_pct >= effective_tp_pct:
                         should_close = True
                         close_reason = "take_profit"
                         logger.info(
-                            f"[{symbol}] ✅ Take-profit hit: {pnl_pct:.2f}% ≥ {take_profit_pct:.2f}%"
+                            f"[{symbol}] Take-profit hit: {pnl_pct:.2f}% >= {effective_tp_pct:.2f}%"
                         )
 
                     # 3. MAX HOLDING PERIOD CHECK
@@ -481,10 +562,23 @@ class StrategicLearningBridge:
                 if outcome.get('should_retrain'):
                     self._stats['retrainings_triggered'] += 1
 
+            # Mark signal as closed in the signals table (WIN/LOSS/EXPIRED)
+            # This is the critical step that moves the signal out of PENDING state.
+            try:
+                outcome_label = 'WIN' if outcome['was_correct'] else 'LOSS'
+                self.database.close_signal(
+                    signal_id=trade.signal_id,
+                    outcome=outcome_label,
+                    exit_price=exit_price,
+                    pnl_percent=outcome['pnl_percent']
+                )
+            except Exception as db_err:
+                logger.error(f"Failed to close signal {trade.signal_id} in DB: {db_err}")
+
             # Log outcome
             logger.info(
                 f"[{trade.symbol}] Trade closed: "
-                f"{'✓ WIN' if outcome['was_correct'] else '✗ LOSS'} "
+                f"{'WIN' if outcome['was_correct'] else 'LOSS'} "
                 f"({outcome['pnl_percent']:+.2f}%) "
                 f"- Reason: {close_reason} "
                 f"{'[PAPER]' if trade.is_paper else '[LIVE]'}"

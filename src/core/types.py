@@ -70,6 +70,15 @@ class Candle:
 
 
 @dataclass
+class Tick:
+    """Real-time price tick from exchange."""
+    symbol: str
+    price: float
+    timestamp: int  # Unix timestamp in milliseconds
+    quantity: float = 0.0
+
+
+@dataclass
 class Prediction:
     """ML model prediction result."""
     timestamp: datetime

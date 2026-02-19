@@ -109,7 +109,28 @@
       "Bash(sort:*)",
       "Bash(truncate:*)",
       "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/python3:*)",
-      "Bash(pip3 list:*)"
+      "Bash(pip3 list:*)",
+      "Bash(done)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/.venv/bin/python:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(pytest:*)",
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/pytest:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(.venv/bin/pip list:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/venv/bin/ruff check:*)",
+      "Bash(pip3 show:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/src/data/capital_provider.py:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/tests/test_capital_provider.py:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/retrain_now.py:*)",
+      "Bash(/home/development1/Desktop/Ai-Trade-Bot/test_pipeline.py:*)",
+      "Bash(# Look for what happens AROUND the rejection - full context cat /proc/59830/fd/1)",
+      "Bash(venv/bin/ruff check:*)",
+      "Bash(# Kill old bot instance kill 59830 && sleep 2 && echo \"\"Killed\"\" || echo \"\"Already gone\"\" # Verify it''s dead ps aux)",
+      "Bash(timeout 15 strace:*)"
     ]
   }
 }

@@ -46,6 +46,9 @@ def __getattr__(name):
     elif name == "CapitalBrokerage":
         from .capital import CapitalBrokerage
         return CapitalBrokerage
+    elif name == "MT5Brokerage":
+        from .mt5 import MT5Brokerage
+        return MT5Brokerage
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -67,4 +70,5 @@ __all__ = [
     'AlpacaBrokerage',
     'BinanceBrokerage',
     'CapitalBrokerage',
+    'MT5Brokerage',
 ]

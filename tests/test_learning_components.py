@@ -117,8 +117,8 @@ def test_confidence_gate_regime_adjustment():
     regimes_and_results = [
         ('TRENDING', 0.76, True),   # Easier threshold (75%)
         ('NORMAL', 0.76, False),     # Standard threshold (80%)
-        ('CHOPPY', 0.84, False),     # Harder threshold (85%)
-        ('VOLATILE', 0.89, False),   # Much harder (90%)
+        ('CHOPPY', 0.84, True),     # Standard: 80% (penalty already in predictor)
+        ('VOLATILE', 0.84, True),   # Standard: 80% (penalty already in predictor)
     ]
 
     for regime, confidence, expected_can_trade in regimes_and_results:

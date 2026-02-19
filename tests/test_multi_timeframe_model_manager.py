@@ -44,9 +44,9 @@ def test_model_path_generation():
 
     # Test various symbols and intervals
     tests = [
-        ("BTC/USDT", "1h", "BTC_USDT_1h_model.pt"),
-        ("ETH/USDT", "4h", "ETH_USDT_4h_model.pt"),
-        ("BTC-USD", "1d", "BTC_USD_1d_model.pt"),
+        ("BTC/USDT", "1h", "model_BTC_USDT_1h.pt"),
+        ("ETH/USDT", "4h", "model_ETH_USDT_4h.pt"),
+        ("BTC-USD", "1d", "model_BTC_USD_1d.pt"),
     ]
 
     for symbol, interval, expected_name in tests:

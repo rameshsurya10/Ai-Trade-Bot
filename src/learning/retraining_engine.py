@@ -93,6 +93,7 @@ class RetrainingEngine:
         self.recent_candles = retrain_config.get('recent_candles', 5000)
         self.replay_mix_ratio = retrain_config.get('replay_mix_ratio', 0.3)
         self.min_samples = retrain_config.get('min_samples', 1000)
+        self.min_candles_for_features = retrain_config.get('min_candles_for_features', 100)
 
         # EWC parameters (from config)
         ewc_config = self.config.get('continuous_learning', {}).get('ewc', {})
@@ -445,10 +446,12 @@ class RetrainingEngine:
             limit=recent_candles + 100  # Fetch extra for indicator warmup
         )
 
-        if candles is None or len(candles) < 100:
+        # Use stored retrain_config instead of re-traversing config path
+        min_candles = getattr(self, 'min_candles_for_features', 100)
+        if candles is None or len(candles) < min_candles:
             raise ValueError(
                 f"Insufficient candle data: got {len(candles) if candles is not None else 0} candles, "
-                f"need at least 100 for feature calculation"
+                f"need at least {min_candles} for feature calculation"
             )
 
         # Convert to DataFrame if needed

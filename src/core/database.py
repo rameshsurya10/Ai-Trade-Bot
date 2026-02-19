@@ -603,15 +603,22 @@ class Database:
         interval = interval.strip()
 
         with self.connection() as conn:
+            # Use datetime TEXT column for ordering — timestamps are stored as
+            # little-endian BLOB which SQLite cannot natively cast to INTEGER.
+            # ISO datetime strings sort correctly as text.
             df = pd.read_sql_query('''
                 SELECT timestamp, datetime, open, high, low, close, volume
                 FROM candles
                 WHERE symbol = ? AND interval = ?
-                ORDER BY timestamp DESC
+                ORDER BY datetime DESC
                 LIMIT ?
             ''', conn, params=(symbol, interval, limit))
 
         if not df.empty:
+            # Convert BLOB timestamps to proper Python integers
+            df['timestamp'] = df['timestamp'].apply(
+                lambda v: int.from_bytes(v, 'little') if isinstance(v, bytes) else int(v)
+            )
             df = df.sort_values('timestamp').reset_index(drop=True)
             df['datetime'] = pd.to_datetime(df['datetime'])
 
@@ -634,17 +641,21 @@ class Database:
         """Get most recent candle."""
         with self.connection() as conn:
             cursor = conn.cursor()
+            # datetime TEXT column sorts correctly; timestamp is stored as BLOB
             cursor.execute('''
                 SELECT timestamp, datetime, open, high, low, close, volume
                 FROM candles
                 WHERE symbol = ? AND interval = ?
-                ORDER BY timestamp DESC
+                ORDER BY datetime DESC
                 LIMIT 1
             ''', (symbol, interval))
 
             row = cursor.fetchone()
             if row:
-                return dict(row)
+                d = dict(row)
+                if isinstance(d.get('timestamp'), bytes):
+                    d['timestamp'] = int.from_bytes(d['timestamp'], 'little')
+                return d
         return None
 
     # =========================================================================

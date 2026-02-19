@@ -64,11 +64,25 @@ class OutcomeTracker:
         self.config = config or {}
 
         # Retraining triggers (from config)
-        retrain_config = self.config.get('retraining', {})
+        # Note: self.config IS the retraining section (passed from continuous_learner)
+        retrain_config = self.config
         self.retrain_on_loss = retrain_config.get('on_loss', True)  # User requirement
         self.consecutive_loss_threshold = retrain_config.get('consecutive_loss_threshold', 3)
         self.win_rate_threshold = retrain_config.get('win_rate_threshold', 0.45)
         self.drift_threshold = retrain_config.get('drift_threshold', 0.7)
+
+        # Experience replay importance weights
+        self.replay_loss_importance = retrain_config.get('replay_loss_importance', 2.0)
+        self.replay_win_importance = retrain_config.get('replay_win_importance', 1.0)
+
+        # Win rate lookback for retraining trigger
+        self.win_rate_lookback = retrain_config.get('win_rate_lookback', 100)
+
+        # Drift detection params
+        self.drift_min_samples = retrain_config.get('drift_min_samples', 10)
+        self.drift_decay_factor = retrain_config.get('drift_decay_factor', 0.95)
+        self.drift_high_conf_threshold = retrain_config.get('drift_high_conf_threshold', 0.7)
+        self.drift_high_conf_weight = retrain_config.get('drift_high_conf_weight', 1.5)
 
         # Experience replay buffer (in-memory for fast access)
         self._replay_buffer: Dict[Tuple[str, str], List[dict]] = {}
@@ -224,7 +238,7 @@ class OutcomeTracker:
                 interval=interval,
                 features=features,
                 target=float(was_correct),
-                importance=2.0 if not was_correct else 1.0  # Prioritize losses
+                importance=self.replay_loss_importance if not was_correct else self.replay_win_importance
             )
 
         # Check if retraining needed
@@ -338,7 +352,7 @@ class OutcomeTracker:
             win_rate = self.db.get_win_rate(
                 symbol=symbol,
                 interval=interval,
-                limit=100
+                limit=self.win_rate_lookback
             )
 
             if win_rate < self.win_rate_threshold:
@@ -409,7 +423,7 @@ class OutcomeTracker:
                 self._drift_history[key] = self._drift_history[key][-self._drift_window_size:]
 
             # Need minimum samples for drift detection
-            if len(self._drift_history[key]) < 10:
+            if len(self._drift_history[key]) < self.drift_min_samples:
                 return (False, 0.0)
 
             # Calculate weighted accuracy (higher weight for recent samples)
@@ -419,12 +433,12 @@ class OutcomeTracker:
 
             for i, outcome in enumerate(history):
                 # Exponential decay weight (recent samples matter more)
-                weight = 1.0 * (0.95 ** (len(history) - i - 1))
+                weight = 1.0 * (self.drift_decay_factor ** (len(history) - i - 1))
 
                 # Extra weight for high-confidence predictions (validate confidence first)
                 outcome_confidence = outcome.get('confidence')
-                if outcome_confidence is not None and outcome_confidence >= 0.7:
-                    weight *= 1.5
+                if outcome_confidence is not None and outcome_confidence >= self.drift_high_conf_threshold:
+                    weight *= self.drift_high_conf_weight
 
                 total_weight += weight
                 if outcome['was_correct']:

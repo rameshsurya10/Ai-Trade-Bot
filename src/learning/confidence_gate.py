@@ -33,6 +33,11 @@ class ConfidenceGateConfig:
     # Regime-specific adjustments
     regime_thresholds: dict = None
 
+    # Configurable clamp/history values
+    min_threshold_clamp: float = 0.50
+    max_threshold_clamp: float = 0.95
+    max_history_size: int = 100
+
     def __post_init__(self):
         """Initialize regime thresholds if not provided."""
         if self.regime_thresholds is None:
@@ -242,7 +247,7 @@ class ConfidenceGate:
         adjusted = base_threshold + adjustment
 
         # Clamp to valid range
-        adjusted = max(0.5, min(0.95, adjusted))
+        adjusted = max(self.config.min_threshold_clamp, min(self.config.max_threshold_clamp, adjusted))
 
         return adjusted
 
@@ -308,8 +313,8 @@ class ConfidenceGate:
 
         self._mode_history.append(transition)
 
-        # Keep last 100 transitions
-        if len(self._mode_history) > 100:
+        # Keep last N transitions
+        if len(self._mode_history) > self.config.max_history_size:
             self._mode_history.pop(0)
 
         logger.info(
@@ -381,12 +386,18 @@ def create_confidence_gate(config: dict = None) -> ConfidenceGate:
     if config is None:
         return ConfidenceGate()
 
+    # Read gate-specific overrides from top-level confidence_gate section
+    gate_overrides = config.get('confidence_gate', {}) if isinstance(config, dict) else {}
+
     gate_config = ConfidenceGateConfig(
         trading_threshold=config.get('trading_threshold', 0.80),
         hysteresis=config.get('hysteresis', 0.05),
         smoothing_alpha=config.get('smoothing_alpha', 0.3),
         regime_adjustment=config.get('regime_adjustment', True),
-        regime_thresholds=config.get('regime_thresholds')
+        regime_thresholds=config.get('regime_thresholds'),
+        min_threshold_clamp=gate_overrides.get('min_threshold_clamp', 0.50),
+        max_threshold_clamp=gate_overrides.get('max_threshold_clamp', 0.95),
+        max_history_size=gate_overrides.get('max_history_size', 100)
     )
 
     return ConfidenceGate(gate_config)

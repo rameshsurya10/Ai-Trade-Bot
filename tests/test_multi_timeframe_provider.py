@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import time
 import logging
+from datetime import datetime
 from src.data.provider import UnifiedDataProvider, Candle
 
 logging.basicConfig(level=logging.INFO)
@@ -108,15 +109,16 @@ def test_candle_dataclass():
     logger.info("\nTest: Candle dataclass interval field")
 
     candle = Candle(
-        symbol='BTC/USDT',
         timestamp=1234567890,
+        datetime=datetime(2023, 1, 1),
         open=50000.0,
         high=51000.0,
         low=49000.0,
         close=50500.0,
         volume=100.0,
+        symbol='BTC/USDT',
+        interval='1h',
         is_closed=True,
-        interval='1h'
     )
 
     assert candle.interval == '1h', "Candle should have interval field"
@@ -124,16 +126,17 @@ def test_candle_dataclass():
 
     # Test default value
     candle2 = Candle(
-        symbol='ETH/USDT',
         timestamp=1234567890,
+        datetime=datetime(2023, 1, 1),
         open=3000.0,
         high=3100.0,
         low=2900.0,
         close=3050.0,
-        volume=50.0
+        volume=50.0,
+        symbol='ETH/USDT',
     )
 
-    assert candle2.interval == '1h', "Candle should have default interval"
+    assert candle2.interval == '', "Candle should have default empty interval"
     logger.info(f"✓ Candle has default interval: {candle2.interval}")
 
 

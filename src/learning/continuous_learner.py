@@ -22,6 +22,7 @@ Features:
 """
 
 import logging
+import math
 import threading
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -78,6 +79,13 @@ class ContinuousLearningSystem:
         self.cl_config = self.config.get('continuous_learning', {})
         self.timeframes_config = self.config.get('timeframes', {})
 
+        # Cache sequence lengths as dict for O(1) lookup (called multiple times per candle)
+        self._sequence_lengths = {
+            cfg['interval']: cfg.get('sequence_length', 60)
+            for cfg in self.timeframes_config.get('intervals', [])
+            if 'interval' in cfg
+        }
+
         # Initialize components
         self.signal_aggregator = SignalAggregator(
             config=self.timeframes_config
@@ -85,12 +93,16 @@ class ContinuousLearningSystem:
 
         # Create ConfidenceGateConfig from dict
         conf_dict = self.cl_config.get('confidence', {})
+        gate_cfg = self.config.get('confidence_gate', {})
         from src.learning.confidence_gate import ConfidenceGateConfig
         conf_config = ConfidenceGateConfig(
             trading_threshold=conf_dict.get('trading_threshold', 0.8),
             hysteresis=conf_dict.get('hysteresis', 0.05),
             smoothing_alpha=conf_dict.get('smoothing_alpha', 0.3),
-            regime_adjustment=conf_dict.get('regime_adjustment', True)
+            regime_adjustment=conf_dict.get('regime_adjustment', True),
+            min_threshold_clamp=gate_cfg.get('min_threshold_clamp', 0.50),
+            max_threshold_clamp=gate_cfg.get('max_threshold_clamp', 0.95),
+            max_history_size=gate_cfg.get('max_history_size', 100)
         )
 
         self.confidence_gate = ConfidenceGate(config=conf_config)
@@ -108,8 +120,8 @@ class ContinuousLearningSystem:
                 model=predictor.model,
                 ewc_lambda=ewc_config.get("lambda", 1000.0),
                 replay_buffer_size=self.cl_config.get("experience_replay", {}).get("buffer_size", 10000),
-                replay_batch_size=32,
-                drift_window=100
+                replay_batch_size=self.cl_config.get("experience_replay", {}).get("batch_size", 32),
+                drift_window=self.cl_config.get("drift_window", 100)
             )
         elif not continual_learner:
             logger.info("Predictor is not a neural network model, skipping continual learner")
@@ -162,6 +174,15 @@ class ContinuousLearningSystem:
         # Track last processed outcome per symbol/interval to avoid duplicate updates
         self._last_online_update_outcome_id: Dict[str, int] = {}
         self._outcome_tracking_lock = threading.Lock()
+
+        # Track previous candle close per (symbol, interval) for correct online learning target
+        # LSTM target = "next_close > current_close", so fallback needs previous close
+        self._prev_close: Dict[str, float] = {}
+
+        # Cooldown tracking: prevent duplicate signals per (symbol, interval)
+        # Key = "symbol_interval", value = datetime of last saved signal
+        self._last_signal_time: Dict[str, datetime] = {}
+        self._cooldown_lock = threading.Lock()  # Guards _last_signal_time (thread-safe read-check-write)
 
         # Strategy analyzer for strategy-based trade decisions
         db_path = self.config.get('database', {}).get('path', 'data/trading.db')
@@ -256,9 +277,17 @@ class ContinuousLearningSystem:
             # 3. AGGREGATE SIGNALS
             aggregated = self.signal_aggregator.aggregate(timeframe_signals)
 
+            # Extract SL/TP from primary interval's advanced_result (BUG 2 fix)
+            primary_interval = self._get_primary_interval()
+            primary_signal = timeframe_signals.get(primary_interval)
+            sl = None
+            tp = None
+            if primary_signal and primary_signal.advanced_result:
+                sl = getattr(primary_signal.advanced_result, 'stop_loss', None)
+                tp = getattr(primary_signal.advanced_result, 'take_profit', None)
+
             # 4. GET CURRENT MODE
             # Use highest weighted timeframe for mode determination
-            primary_interval = self._get_primary_interval()
             current_mode = self.state_manager.get_current_mode(
                 symbol=symbol,
                 interval=primary_interval
@@ -268,7 +297,9 @@ class ContinuousLearningSystem:
             can_trade_live, reason = self.confidence_gate.should_trade(
                 confidence=aggregated.confidence,
                 current_mode=current_mode,
-                regime=aggregated.regime
+                regime=aggregated.regime,
+                symbol=symbol,
+                interval=primary_interval
             )
 
             # 6. DETERMINE MODE AND BROKERAGE
@@ -350,7 +381,9 @@ class ContinuousLearningSystem:
                         is_paper=(mode == 'LEARNING'),
                         strategy_name=best_strategy.get('strategy_name') if best_strategy else None,
                         perf_signal_id=perf_signal_id,
-                        entry_price=entry_price
+                        entry_price=entry_price,
+                        stop_loss=sl,
+                        take_profit=tp
                     )
                     executed = True
 
@@ -395,14 +428,16 @@ class ContinuousLearningSystem:
             if self.performance_learner:
                 with self._stats_lock:
                     candles_processed = self._stats['candles_processed']
-                if candles_processed % 100 == 0:
+                if candles_processed % self.cl_config.get('stale_cleanup_interval', 100) == 0:
                     try:
-                        self.performance_learner.cleanup_stale_predictions(max_age_minutes=60)
+                        self.performance_learner.cleanup_stale_predictions(
+                            max_age_minutes=self.cl_config.get('prediction_max_age_minutes', 60)
+                        )
                     except Exception as e:
                         logger.debug(f"Performance learner cleanup failed: {e}")
 
-            # 10. CHECK FOR COMPLETED TRADES
-            self._check_completed_trades(symbol, interval, candle)
+            # Trade closing is handled by StrategicLearningBridge._check_and_close_trades()
+            # Calling _check_completed_trades() here would duplicate outcome recording.
 
             # Record prediction
             with self._stats_lock:
@@ -482,7 +517,7 @@ class ContinuousLearningSystem:
                             import torch
                             import numpy as np
 
-                            df_features = FeatureCalculator.calculate_all(df.copy())
+                            df_features = FeatureCalculator.calculate_all(df)
                             feature_cols = FeatureCalculator.get_feature_columns()
                             features = df_features[feature_cols].values
 
@@ -548,12 +583,8 @@ class ContinuousLearningSystem:
         return predictions
 
     def _get_sequence_length(self, interval: str) -> int:
-        """Get sequence length for interval from config."""
-        for interval_config in self.timeframes_config.get('intervals', []):
-            if interval_config['interval'] == interval:
-                return interval_config.get('sequence_length', 60)
-
-        return 60  # Default
+        """Get sequence length for interval from config (O(1) cached lookup)."""
+        return self._sequence_lengths.get(interval, 60)
 
     def _get_primary_interval(self) -> str:
         """Get highest weighted interval."""
@@ -749,7 +780,9 @@ class ContinuousLearningSystem:
         is_paper: bool,
         strategy_name: str = None,
         perf_signal_id: str = None,
-        entry_price: float = None
+        entry_price: float = None,
+        stop_loss: float = None,
+        take_profit: float = None
     ) -> Optional[int]:
         """
         Execute trade via brokerage.
@@ -787,8 +820,33 @@ class ContinuousLearningSystem:
                 strength=strength,
                 confidence=prediction.confidence,
                 price=entry_price or 0.0,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 actual_outcome='PENDING'
             )
+
+            # Cooldown guard: prevent duplicate signals within half the interval period.
+            # Thread-safe: entire check-and-update is atomic under _cooldown_lock.
+            _INTERVAL_MINUTES = {
+                '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+                '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
+                '12h': 720, '1d': 1440
+            }
+            _candle_minutes = _INTERVAL_MINUTES.get(interval, 60)
+            _cooldown_minutes = max(1, math.floor(_candle_minutes / 2))  # minimum 1 min
+            _cooldown_key = f"{symbol}_{interval}"
+            _now = datetime.utcnow()
+            with self._cooldown_lock:
+                _last = self._last_signal_time.get(_cooldown_key)
+                if _last is not None:
+                    _elapsed = (_now - _last).total_seconds() / 60
+                    if _elapsed < _cooldown_minutes:
+                        logger.debug(
+                            f"[{symbol} @ {interval}] Duplicate signal suppressed: "
+                            f"{_elapsed:.1f}m < cooldown {_cooldown_minutes}m"
+                        )
+                        return None
+                self._last_signal_time[_cooldown_key] = _now
 
             signal_id = self.database.save_signal(signal, symbol=symbol, interval=interval)
 
@@ -1127,6 +1185,45 @@ class ContinuousLearningSystem:
             ).get('recent_outcomes', [])
 
             if not recent_outcomes:
+                # Fallback: use price movement vs previous close for online learning
+                # This matches the LSTM training target: next_close > current_close
+                # Track previous close per (symbol, interval) to align targets
+                prev_close_key = f"{symbol}_{interval}"
+                if hasattr(candle, 'close') and candle.close != 0:
+                    prev_close = self._prev_close.get(prev_close_key)
+                    # Always update prev_close for next iteration
+                    self._prev_close[prev_close_key] = candle.close
+
+                    if prev_close is not None:
+                        # Require minimum move to filter noise
+                        price_change_pct = abs(candle.close - prev_close) / prev_close
+                        min_pct = self.cl_config.get('online_learning', {}).get('min_price_change_pct', 0.001)
+                        if price_change_pct < min_pct:
+                            return  # Skip noisy candles with <0.1% move
+                        # Target: did this candle close higher than previous close?
+                        # Matches training: y = 1 if next_close > current_close
+                        actual_outcome = 1 if candle.close > prev_close else 0
+
+                        if data and data.get('candles') is not None:
+                            df = data['candles']
+                        else:
+                            seq_length = self._get_sequence_length(interval)
+                            df = self.database.get_candles(
+                                symbol=symbol,
+                                interval=interval,
+                                limit=seq_length + 10
+                            )
+
+                        if df is not None and len(df) >= 10:
+                            self.predictor.online_update(
+                                df=df,
+                                symbol=symbol,
+                                interval=interval,
+                                learning_rate=online_config.get('learning_rate', 0.0001),
+                                actual_outcome=actual_outcome
+                            )
+                            with self._stats_lock:
+                                self._stats['online_updates'] = self._stats.get('online_updates', 0) + 1
                 return
 
             # Only update with confirmed outcomes that haven't been used yet

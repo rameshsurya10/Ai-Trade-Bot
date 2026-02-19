@@ -15,6 +15,7 @@ All algorithms include numerical stability safeguards (epsilon checks).
 """
 
 import logging
+import math
 import threading
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ import torch
 from typing import Dict, List, Optional, Tuple, NamedTuple
 from dataclasses import dataclass, field
 from scipy.fft import fft, fftfreq
+from src.analysis_engine import FeatureCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +113,22 @@ class FourierAnalyzer:
     in the current market cycle (near top/bottom).
     """
 
-    def __init__(self, n_harmonics: int = 5):
+    def __init__(self, n_harmonics: int = 5, config: Optional[Dict] = None):
         """
         Args:
             n_harmonics: Number of dominant frequencies to use
+            config: Full app config dict (reads prediction.fourier.*)
         """
-        self.n_harmonics = n_harmonics
+        cfg = (config or {}).get('prediction', {}).get('fourier', {})
+        self.n_harmonics = cfg.get('n_harmonics', n_harmonics)
+        self.min_samples = cfg.get('min_samples', 32)
+        self.phase_bullish_upper = cfg.get('phase_bullish_upper', 0.25)
+        self.phase_neutral_upper = cfg.get('phase_neutral_upper', 0.50)
+        self.phase_bearish_upper = cfg.get('phase_bearish_upper', 0.75)
+        self.prob_bullish = cfg.get('prob_bullish', 0.75)
+        self.prob_bearish = cfg.get('prob_bearish', 0.25)
+        self.prob_neutral = cfg.get('prob_neutral', 0.50)
+        self.default_period = cfg.get('default_period', 20.0)
 
     def analyze(self, prices: np.ndarray) -> Dict:
         """
@@ -128,7 +140,7 @@ class FourierAnalyzer:
         Returns:
             Dict with cycle analysis results
         """
-        if len(prices) < 32:
+        if len(prices) < self.min_samples:
             return self._default_result()
 
         try:
@@ -168,11 +180,11 @@ class FourierAnalyzer:
             cycle_phase = position_in_cycle
 
             # Signal based on phase
-            if cycle_phase < 0.25:
+            if cycle_phase < self.phase_bullish_upper:
                 signal = "BULLISH"  # Rising from trough
-            elif cycle_phase < 0.5:
+            elif cycle_phase < self.phase_neutral_upper:
                 signal = "NEUTRAL"  # Near peak
-            elif cycle_phase < 0.75:
+            elif cycle_phase < self.phase_bearish_upper:
                 signal = "BEARISH"  # Falling from peak
             else:
                 signal = "BULLISH"  # Near trough
@@ -199,7 +211,7 @@ class FourierAnalyzer:
     def _default_result(self) -> Dict:
         return {
             'signal': 'NEUTRAL',
-            'dominant_period': 20.0,
+            'dominant_period': self.default_period,
             'cycle_phase': 0.5,
             'dominant_frequencies': [],
             'power_spectrum': []
@@ -220,15 +232,23 @@ class KalmanFilter:
     def __init__(
         self,
         process_variance: float = 1e-5,
-        measurement_variance: float = 1e-2
+        measurement_variance: float = 1e-2,
+        config: Optional[Dict] = None
     ):
         """
         Args:
             process_variance: Q - process noise variance
             measurement_variance: R - measurement noise variance
+            config: Full app config dict (reads prediction.kalman.*)
         """
-        self.Q = process_variance
-        self.R = measurement_variance
+        cfg = (config or {}).get('prediction', {}).get('kalman', {})
+        self.Q = cfg.get('process_variance', process_variance)
+        self.R = cfg.get('measurement_variance', measurement_variance)
+        self.initial_error_covariance = cfg.get('initial_error_covariance', 1.0)
+        self.velocity_lookback = cfg.get('velocity_lookback', 10)
+        self.prob_up = cfg.get('prob_up', 0.70)
+        self.prob_down = cfg.get('prob_down', 0.30)
+        self.prob_sideways = cfg.get('prob_sideways', 0.50)
 
     def filter(self, prices: np.ndarray) -> Dict:
         """
@@ -248,7 +268,7 @@ class KalmanFilter:
 
             # Initialize state
             x_est = prices[0]  # Initial estimate
-            P = 1.0  # Initial error covariance
+            P = self.initial_error_covariance  # Initial error covariance
 
             filtered_prices = []
             velocities = []  # Price velocity (trend)
@@ -269,7 +289,7 @@ class KalmanFilter:
 
             # Calculate velocity (trend)
             velocity = np.diff(filtered_prices)
-            avg_velocity = np.mean(velocity[-10:]) if len(velocity) >= 10 else np.mean(velocity)
+            avg_velocity = np.mean(velocity[-self.velocity_lookback:]) if len(velocity) >= self.velocity_lookback else np.mean(velocity)
 
             # Determine trend
             if avg_velocity > EPSILON:
@@ -313,14 +333,25 @@ class EntropyAnalyzer:
     Low entropy = trending market
     """
 
-    def __init__(self, n_bins: int = 20, lookback: int = 50):
+    def __init__(self, n_bins: int = 10, lookback: int = 50, config: Optional[Dict] = None):
         """
         Args:
             n_bins: Number of bins for histogram
             lookback: Lookback period for entropy calculation
+            config: Full app config dict (reads prediction.entropy.*)
         """
-        self.n_bins = n_bins
-        self.lookback = lookback
+        cfg = (config or {}).get('prediction', {}).get('entropy', {})
+        self.n_bins = cfg.get('n_bins', n_bins)
+        self.lookback = cfg.get('lookback', lookback)
+        self.min_samples = cfg.get('min_samples', 10)
+        self.trending_threshold = cfg.get('trending_threshold', 0.55)
+        self.normal_threshold = cfg.get('normal_threshold', 0.75)
+        self.choppy_threshold = cfg.get('choppy_threshold', 0.88)
+        self.prob_trending_up = cfg.get('prob_trending_up', 0.65)
+        self.prob_trending_down = cfg.get('prob_trending_down', 0.35)
+        self.prob_normal_up = cfg.get('prob_normal_up', 0.55)
+        self.prob_normal_down = cfg.get('prob_normal_down', 0.45)
+        self.low_entropy_threshold = cfg.get('low_entropy_threshold', 0.5)
 
     def analyze(self, returns: np.ndarray) -> Dict:
         """
@@ -341,7 +372,7 @@ class EntropyAnalyzer:
 
             # Remove NaN/Inf
             recent_returns = recent_returns[np.isfinite(recent_returns)]
-            if len(recent_returns) < 10:
+            if len(recent_returns) < self.min_samples:
                 return self._default_result()
 
             # Calculate histogram (probability distribution)
@@ -362,11 +393,11 @@ class EntropyAnalyzer:
             normalized_entropy = entropy / (max_entropy + EPSILON)
 
             # Determine regime
-            if normalized_entropy < 0.3:
+            if normalized_entropy < self.trending_threshold:
                 regime = "TRENDING"
-            elif normalized_entropy < 0.6:
+            elif normalized_entropy < self.normal_threshold:
                 regime = "NORMAL"
-            elif normalized_entropy < 0.8:
+            elif normalized_entropy < self.choppy_threshold:
                 regime = "CHOPPY"
             else:
                 regime = "VOLATILE"
@@ -403,12 +434,18 @@ class MarkovChain:
     probability of transitions.
     """
 
-    def __init__(self, n_states: int = 3):
+    def __init__(self, n_states: int = 3, config: Optional[Dict] = None):
         """
         Args:
             n_states: Number of market states (3 = down/neutral/up)
+            config: Full app config dict (reads prediction.markov.*)
         """
-        self.n_states = n_states
+        cfg = (config or {}).get('prediction', {}).get('markov', {})
+        self.n_states = cfg.get('n_states', n_states)
+        self.min_samples = cfg.get('min_samples', 20)
+        self.damping = cfg.get('damping', 0.8)
+        self.percentile_lower = cfg.get('percentile_lower', 33)
+        self.percentile_upper = cfg.get('percentile_upper', 67)
         self.states = ['DOWN', 'NEUTRAL', 'UP']
 
     def analyze(self, returns: np.ndarray) -> Dict:
@@ -421,7 +458,7 @@ class MarkovChain:
         Returns:
             Dict with Markov analysis
         """
-        if len(returns) < 20:
+        if len(returns) < self.min_samples:
             return self._default_result()
 
         try:
@@ -436,17 +473,29 @@ class MarkovChain:
             current_state = self.states[current_state_idx]
 
             # Probability of going up from current state
-            prob_up = transition_matrix[current_state_idx, 2]  # UP state index
-            prob_down = transition_matrix[current_state_idx, 0]  # DOWN state index
+            raw_prob_up = transition_matrix[current_state_idx, 2]  # UP state index
+            raw_prob_down = transition_matrix[current_state_idx, 0]  # DOWN state index
+            # Dampen all three probabilities toward uniform (1/3) to prevent
+            # extreme values dominating ensemble while preserving probability axioms
+            raw_prob_neutral = transition_matrix[current_state_idx, 1]  # NEUTRAL state
+            damping = self.damping
+            uniform = 1.0 / 3.0
+            prob_up = uniform + (raw_prob_up - uniform) * damping
+            prob_down = uniform + (raw_prob_down - uniform) * damping
+            prob_neutral = uniform + (raw_prob_neutral - uniform) * damping
 
             # Steady state (long-term probabilities)
             steady_state = self._calculate_steady_state(transition_matrix)
+
+            # Binary ensemble probability (centered at 0.50)
+            ensemble_prob_val = prob_up / (prob_up + prob_down + 1e-10)
 
             return {
                 'current_state': current_state,
                 'prob_up': float(prob_up),
                 'prob_down': float(prob_down),
-                'prob_neutral': float(1 - prob_up - prob_down),
+                'prob_neutral': float(prob_neutral),
+                'ensemble_prob': float(ensemble_prob_val),
                 'transition_matrix': transition_matrix.tolist(),
                 'steady_state': steady_state.tolist()
             }
@@ -460,8 +509,8 @@ class MarkovChain:
         states = np.zeros(len(returns), dtype=int)
 
         # Use percentiles for thresholds
-        lower = np.percentile(returns, 33)
-        upper = np.percentile(returns, 67)
+        lower = np.percentile(returns, self.percentile_lower)
+        upper = np.percentile(returns, self.percentile_upper)
 
         states[returns < lower] = 0  # DOWN
         states[(returns >= lower) & (returns <= upper)] = 1  # NEUTRAL
@@ -472,15 +521,16 @@ class MarkovChain:
     def _build_transition_matrix(self, states: np.ndarray) -> np.ndarray:
         """Build transition probability matrix."""
         n = self.n_states
-        counts = np.zeros((n, n))
+        # Laplace smoothing: start with 1 to avoid extreme probabilities from sparse counts
+        counts = np.ones((n, n))
 
         for i in range(len(states) - 1):
             from_state = states[i]
             to_state = states[i + 1]
             counts[from_state, to_state] += 1
 
-        # Normalize rows (add epsilon to prevent division by zero)
-        row_sums = counts.sum(axis=1, keepdims=True) + EPSILON
+        # Normalize rows
+        row_sums = counts.sum(axis=1, keepdims=True)
         transition_matrix = counts / row_sums
 
         return transition_matrix
@@ -497,7 +547,7 @@ class MarkovChain:
             steady_state = steady_state / (steady_state.sum() + EPSILON)
 
             return steady_state
-        except:
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
             # Equal distribution fallback
             return np.ones(self.n_states) / self.n_states
 
@@ -507,6 +557,7 @@ class MarkovChain:
             'prob_up': 0.33,
             'prob_down': 0.33,
             'prob_neutral': 0.34,
+            'ensemble_prob': 0.50,
             'transition_matrix': [[0.33, 0.34, 0.33]] * 3,
             'steady_state': [0.33, 0.34, 0.33]
         }
@@ -526,19 +577,27 @@ class MonteCarlo:
 
     def __init__(
         self,
-        n_simulations: int = 10000,
-        time_horizon: int = 365,
-        default_volatility: float = 0.02
+        n_simulations: int = None,
+        time_horizon: int = None,
+        default_volatility: float = None,
+        config: Optional[Dict] = None
     ):
         """
         Args:
-            n_simulations: Number of simulation paths (10K is statistically robust)
-            time_horizon: Days to simulate forward (365 = 1 year)
-            default_volatility: Default daily volatility if calculation fails
+            n_simulations: Number of simulation paths (overrides config if provided)
+            time_horizon: Number of candle steps to simulate forward
+            default_volatility: Default per-candle volatility if calculation fails
+            config: Full app config dict (reads prediction.monte_carlo.*)
         """
-        self.n_simulations = n_simulations
-        self.time_horizon = time_horizon
-        self.default_volatility = default_volatility
+        cfg = (config or {}).get('prediction', {}).get('monte_carlo', {})
+        self.n_simulations = n_simulations if n_simulations is not None else cfg.get('n_simulations', 1000)
+        self.time_horizon = time_horizon if time_horizon is not None else cfg.get('time_horizon', 24)
+        self.default_volatility = default_volatility if default_volatility is not None else cfg.get('default_volatility', 0.02)
+        self.default_stop_loss_pct = cfg.get('default_stop_loss_pct', 0.02)
+        self.default_take_profit_pct = cfg.get('default_take_profit_pct', 0.03)
+        self.min_returns_samples = cfg.get('min_returns_samples', 10)
+        self.var_weight = cfg.get('var_weight', 0.5)
+        self.annualization_factor = cfg.get('annualization_factor', 252)
 
     def simulate(
         self,
@@ -562,13 +621,13 @@ class MonteCarlo:
         Returns:
             Dict with simulation results including probabilities and risk metrics
         """
-        if len(returns) < 20 or current_price <= 0:
+        if len(returns) < self.min_returns_samples or current_price <= 0:
             return self._default_result()
 
         try:
             # Calculate drift and volatility from historical data
             clean_returns = returns[np.isfinite(returns)]
-            if len(clean_returns) < 10:
+            if len(clean_returns) < self.min_returns_samples:
                 return self._default_result()
 
             drift = np.mean(clean_returns)
@@ -581,11 +640,11 @@ class MonteCarlo:
                 drift = 0.0
 
             # Annualize
-            drift_annual = drift * 252
-            vol_annual = volatility * np.sqrt(252)
+            drift_annual = drift * self.annualization_factor
+            vol_annual = volatility * np.sqrt(self.annualization_factor)
 
-            # Daily parameters
-            dt = 1 / 252
+            # Per-candle parameters (returns are per-candle, not per-year)
+            dt = 1.0
 
             # Price targets
             stop_loss_price = current_price * (1 - stop_loss_pct)
@@ -640,7 +699,7 @@ class MonteCarlo:
             var_pct = (current_price - var_5) / current_price
 
             # Risk score (0-1, higher = riskier)
-            risk_score = min(1.0, max(0.0, prob_stop_loss + var_pct * 0.5))
+            risk_score = min(1.0, max(0.0, prob_stop_loss + var_pct * self.var_weight))
 
             return {
                 'expected_return': float(expected_return),
@@ -668,7 +727,7 @@ class MonteCarlo:
             'var_5_pct': 0.05,
             'risk_score': 0.5,
             'volatility_daily': self.default_volatility,
-            'volatility_annual': self.default_volatility * np.sqrt(252),
+            'volatility_annual': self.default_volatility * np.sqrt(self.annualization_factor),
             'drift_annual': 0.0,
             'n_simulations': self.n_simulations
         }
@@ -734,21 +793,91 @@ class AdvancedPredictor:
             self.confidence_floor = 0.52
             self.confidence_ceiling = 0.72
 
+        # Buy/sell thresholds
+        self.buy_threshold = pred_config.get('buy_threshold', 0.52)
+        self.sell_threshold = pred_config.get('sell_threshold', 0.48)
+
+        # Ensemble config
+        ens_cfg = pred_config.get('ensemble', {})
+        self.sentiment_weight = ens_cfg.get('sentiment_weight', 0.05)
+        self.sentiment_1h_weight = ens_cfg.get('sentiment_1h_weight', 0.6)
+        self.sentiment_6h_weight = ens_cfg.get('sentiment_6h_weight', 0.4)
+        self.sentiment_clamp_min = ens_cfg.get('sentiment_clamp_min', 0.2)
+        self.sentiment_clamp_max = ens_cfg.get('sentiment_clamp_max', 0.8)
+        self.mc_scaling = ens_cfg.get('mc_scaling', 20)
+        self.mc_clamp_min = ens_cfg.get('mc_clamp_min', 0.2)
+        self.mc_clamp_max = ens_cfg.get('mc_clamp_max', 0.8)
+
+        # Dynamic probability config
+        fourier_cfg = pred_config.get('fourier', {})
+        self.fourier_dynamic = fourier_cfg.get('dynamic_prob', True)
+        self.fourier_amplitude = fourier_cfg.get('amplitude', 0.15)
+
+        kalman_cfg = pred_config.get('kalman', {})
+        self.kalman_dynamic = kalman_cfg.get('dynamic_prob', True)
+        self.kalman_sigmoid_sensitivity = kalman_cfg.get('sigmoid_sensitivity', 2.0)
+
+        entropy_cfg = pred_config.get('entropy', {})
+        self.entropy_dynamic = entropy_cfg.get('dynamic_prob', True)
+        self.entropy_certainty_scaling = entropy_cfg.get('certainty_scaling', 0.8)
+
+        self.symmetric_confidence = ens_cfg.get('symmetric_confidence', True)
+
+        # ATR config
+        atr_cfg = pred_config.get('atr', {})
+        self.atr_period = atr_cfg.get('period', 14)
+        self.atr_default_pct = atr_cfg.get('default_pct', 0.02)
+        self.atr_sl_multiplier = atr_cfg.get('sl_multiplier', 2)
+        self.atr_tp_multiplier = atr_cfg.get('tp_multiplier', 3)
+        self.atr_sl_pct_min = atr_cfg.get('sl_pct_min', 0.01)
+        self.atr_sl_pct_max = atr_cfg.get('sl_pct_max', 0.05)
+        self.atr_tp_pct_min = atr_cfg.get('tp_pct_min', 0.015)
+        self.atr_tp_pct_max = atr_cfg.get('tp_pct_max', 0.10)
+
+        # Kelly config
+        kelly_cfg = pred_config.get('kelly', {})
+        self.kelly_max_fraction = kelly_cfg.get('max_fraction', 0.25)
+
+        # Rules config
+        rules_cfg = pred_config.get('rules', {})
+        self.rule_cycle_buy_max_phase = rules_cfg.get('cycle_buy_max_phase', 0.7)
+        self.rule_cycle_sell_min_phase = rules_cfg.get('cycle_sell_min_phase', 0.3)
+        self.rule_markov_min_prob = rules_cfg.get('markov_min_prob', 0.55)
+        self.rule_mc_min_win_prob = rules_cfg.get('mc_min_win_prob', 0.50)
+        self.rule_min_risk_reward = rules_cfg.get('min_risk_reward', 1.5)
+        self.rule_max_daily_volatility = rules_cfg.get('max_daily_volatility', 0.05)
+        self.rule_min_confidence = rules_cfg.get('min_confidence', 0.60)
+        self.rule_min_kelly = rules_cfg.get('min_kelly', 0.01)
+
+        # Online update config
+        ou_cfg = pred_config.get('online_update', {})
+        self.ou_clamp_min = ou_cfg.get('output_clamp_min', 0.01)
+        self.ou_clamp_max = ou_cfg.get('output_clamp_max', 0.99)
+        self.ou_max_loss = ou_cfg.get('max_loss_threshold', 2.0)
+        self.ou_grad_clip = ou_cfg.get('grad_clip_max_norm', 1.0)
+
         # Normalize weights
         total = sum(self.weights.values())
         if abs(total - 1.0) > 0.01:
             self.weights = {k: v / total for k, v in self.weights.items()}
 
-        # Initialize analyzers
-        self.fourier = FourierAnalyzer()
-        self.kalman = KalmanFilter()
-        self.entropy = EntropyAnalyzer()
-        self.markov = MarkovChain()
-        self.monte_carlo = MonteCarlo()
+        # Initialize analyzers (pass config for configurable params)
+        self.fourier = FourierAnalyzer(config=self.config)
+        self.kalman = KalmanFilter(config=self.config)
+        self.entropy = EntropyAnalyzer(config=self.config)
+        self.markov = MarkovChain(config=self.config)
+        self.monte_carlo = MonteCarlo(config=self.config)
 
         # Model manager reference for online learning (injected externally)
         self._model_manager = None
         self._online_lock = threading.Lock()
+
+        # Cached optimizer/criterion for online updates (avoid re-allocation per call)
+        self._online_optimizer = None
+        self._online_criterion = torch.nn.BCELoss()
+        self._online_lr = None
+        self._online_model_symbol = None
+        self._online_param_id = None  # Track parameter tensor identity for retraining invalidation
 
     @property
     def model_manager(self):
@@ -808,8 +937,6 @@ class AdvancedPredictor:
 
         with self._online_lock:
             try:
-                from src.analysis_engine import FeatureCalculator
-
                 feature_columns = FeatureCalculator.get_feature_columns()
                 config = self._model_manager.model_configs.get(symbol, {})
                 feature_means = config.get('feature_means')
@@ -843,32 +970,42 @@ class AdvancedPredictor:
                     x = torch.FloatTensor(features).unsqueeze(0)
                     y = torch.FloatTensor([float(actual_outcome)])
 
-                    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-                    criterion = torch.nn.BCELoss()
+                    # Reuse cached optimizer (recreate if lr, model, or params change)
+                    # Track param tensor id to detect load_state_dict() after retraining
+                    param_id = id(next(model.parameters()))
+                    if (self._online_optimizer is None
+                            or self._online_lr != learning_rate
+                            or self._online_model_symbol != symbol
+                            or self._online_param_id != param_id):
+                        self._online_optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+                        self._online_lr = learning_rate
+                        self._online_model_symbol = symbol
+                        self._online_param_id = param_id
+                    criterion = self._online_criterion
 
-                    optimizer.zero_grad()
+                    self._online_optimizer.zero_grad()
                     output = model(x).squeeze()
                     if output.dim() == 0:
                         output = output.unsqueeze(0)
 
                     # Clamp output to prevent log(0) explosion in BCELoss
-                    output = output.clamp(0.01, 0.99)
+                    output = output.clamp(self.ou_clamp_min, self.ou_clamp_max)
 
                     loss = criterion(output, y)
 
                     # Skip update if loss is abnormally high (model diverging)
-                    if loss.item() > 2.0:
+                    if loss.item() > self.ou_max_loss:
                         logger.warning(
                             f"Online update [{symbol}@{interval}]: "
-                            f"loss={loss.item():.4f} too high (>2.0), skipping to prevent divergence"
+                            f"loss={loss.item():.4f} too high (>{self.ou_max_loss}), skipping to prevent divergence"
                         )
                         return
 
                     loss.backward()
 
                     # Gradient clipping for stability
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self.ou_grad_clip)
+                    self._online_optimizer.step()
 
                     logger.info(
                         f"Online update [{symbol}@{interval}]: "
@@ -922,13 +1059,13 @@ class AdvancedPredictor:
         # Calculate ATR if not provided
         if atr is None or np.isnan(atr):
             high_low = df['high'] - df['low']
-            if len(high_low) >= 14:
-                atr = float(high_low.rolling(14).mean().iloc[-1])
+            if len(high_low) >= self.atr_period:
+                atr = float(high_low.rolling(self.atr_period).mean().iloc[-1])
             else:
-                atr = current_price * 0.02  # Default 2%
+                atr = current_price * self.atr_default_pct
 
         if np.isnan(atr) or atr < EPSILON:
-            atr = current_price * 0.02
+            atr = current_price * self.atr_default_pct
 
         # Run all analyzers
         fourier_result = self.fourier.analyze(prices)
@@ -937,8 +1074,8 @@ class AdvancedPredictor:
         markov_result = self.markov.analyze(returns)
 
         # Monte Carlo with risk-adjusted stops
-        stop_loss_pct = min(0.05, max(0.01, atr / current_price * 2))
-        take_profit_pct = min(0.10, max(0.015, atr / current_price * 3))
+        stop_loss_pct = min(self.atr_sl_pct_max, max(self.atr_sl_pct_min, atr / current_price * self.atr_sl_multiplier))
+        take_profit_pct = min(self.atr_tp_pct_max, max(self.atr_tp_pct_min, atr / current_price * self.atr_tp_multiplier))
         monte_carlo_result = self.monte_carlo.simulate(
             current_price, returns, stop_loss_pct, take_profit_pct
         )
@@ -958,11 +1095,11 @@ class AdvancedPredictor:
             news_volume_1h = sentiment_features.get('news_volume_1h', 0)
 
             # Calculate weighted sentiment score
-            sentiment_score = (sentiment_1h * 0.6 + sentiment_6h * 0.4) if sentiment_1h is not None and sentiment_6h is not None else 0.0
+            sentiment_score = (sentiment_1h * self.sentiment_1h_weight + sentiment_6h * self.sentiment_6h_weight) if sentiment_1h is not None and sentiment_6h is not None else 0.0
 
             # Convert sentiment to probability (sentiment range -1 to 1, prob 0 to 1)
             sentiment_prob = 0.5 + (sentiment_score * 0.5)
-            sentiment_prob = max(0.2, min(0.8, sentiment_prob))  # Clamp to 0.2-0.8
+            sentiment_prob = max(self.sentiment_clamp_min, min(self.sentiment_clamp_max, sentiment_prob))
 
         # Calculate ensemble probability
         prob_scores = []
@@ -970,53 +1107,73 @@ class AdvancedPredictor:
         # LSTM contribution
         prob_scores.append(('lstm', lstm_probability))
 
-        # Fourier contribution — wider range for stronger signals
-        fourier_prob = 0.5
-        if fourier_result['signal'] == 'BULLISH':
-            fourier_prob = 0.75
-        elif fourier_result['signal'] == 'BEARISH':
-            fourier_prob = 0.25
+        # Fourier contribution — dynamic cosine on cycle phase
+        if self.fourier_dynamic:
+            cycle_phase = fourier_result.get('cycle_phase', 0.5)
+            if not fourier_result.get('dominant_frequencies'):
+                fourier_prob = 0.5
+            else:
+                fourier_prob = 0.5 + self.fourier_amplitude * math.cos(2 * math.pi * cycle_phase)
+                fourier_prob = max(0.05, min(0.95, fourier_prob))
+        else:
+            fourier_prob = self.fourier.prob_neutral
+            if fourier_result['signal'] == 'BULLISH':
+                fourier_prob = self.fourier.prob_bullish
+            elif fourier_result['signal'] == 'BEARISH':
+                fourier_prob = self.fourier.prob_bearish
         prob_scores.append(('fourier', fourier_prob))
 
-        # Kalman contribution — wider range for stronger signals
-        kalman_prob = 0.5
-        if kalman_result['trend'] == 'UP':
-            kalman_prob = 0.70
-        elif kalman_result['trend'] == 'DOWN':
-            kalman_prob = 0.30
+        # Kalman contribution — dynamic sigmoid on velocity
+        if self.kalman_dynamic:
+            velocity = kalman_result.get('velocity', 0.0)
+            norm_velocity = velocity / (atr + 1e-10) if atr > 0 else 0.0
+            exp_arg = max(-500, min(500, -self.kalman_sigmoid_sensitivity * norm_velocity))
+            kalman_prob = 1.0 / (1.0 + math.exp(exp_arg))
+            kalman_prob = max(0.05, min(0.95, kalman_prob))
+        else:
+            kalman_prob = self.kalman.prob_sideways
+            if kalman_result['trend'] == 'UP':
+                kalman_prob = self.kalman.prob_up
+            elif kalman_result['trend'] == 'DOWN':
+                kalman_prob = self.kalman.prob_down
         prob_scores.append(('kalman', kalman_prob))
 
         # Markov contribution
-        markov_prob = markov_result['prob_up']
+        markov_prob = markov_result.get('ensemble_prob', markov_result['prob_up'])
         prob_scores.append(('markov', markov_prob))
 
-        # Entropy contribution — use in all regimes, not just TRENDING
-        entropy_val = entropy_result.get('entropy', 0.5)
-        entropy_prob = 0.5
-        if entropy_result['regime'] == 'TRENDING':
-            entropy_prob = 0.65 if kalman_result['trend'] == 'UP' else 0.35
-        elif entropy_result['regime'] in ('NORMAL', 'CHOPPY'):
-            # Low entropy = more predictable, lean with Kalman trend
-            if entropy_val < 0.5:
-                entropy_prob = 0.55 if kalman_result['trend'] == 'UP' else 0.45
-        # VOLATILE: keep at 0.5 (genuinely uncertain)
+        # Entropy contribution — certainty-weighted scaling of Kalman
+        if self.entropy_dynamic:
+            normalized_entropy = entropy_result.get('normalized_entropy', 0.5)
+            certainty = max(0.0, 1.0 - normalized_entropy)
+            entropy_prob = 0.5 + (kalman_prob - 0.5) * certainty * self.entropy_certainty_scaling
+            entropy_prob = max(0.05, min(0.95, entropy_prob))
+        else:
+            entropy_val = entropy_result.get('entropy', 0.5)
+            entropy_prob = 0.5
+            if entropy_result['regime'] == 'TRENDING':
+                entropy_prob = self.entropy.prob_trending_up if kalman_result['trend'] == 'UP' else self.entropy.prob_trending_down
+            elif entropy_result['regime'] in ('NORMAL', 'CHOPPY'):
+                if entropy_val < self.entropy.low_entropy_threshold:
+                    entropy_prob = self.entropy.prob_normal_up if kalman_result['trend'] == 'UP' else self.entropy.prob_normal_down
         prob_scores.append(('entropy', entropy_prob))
 
         # Monte Carlo contribution — increase scaling for meaningful signal
-        mc_prob = 0.5 + (monte_carlo_result['expected_return'] * 20)  # Increased from 5x to 20x
-        mc_prob = max(0.2, min(0.8, mc_prob))
+        mc_prob = 0.5 + (monte_carlo_result['expected_return'] * self.mc_scaling)
+        mc_prob = max(self.mc_clamp_min, min(self.mc_clamp_max, mc_prob))
         prob_scores.append(('monte_carlo', mc_prob))
 
         # Sentiment contribution (if available)
         if sentiment_features:
             prob_scores.append(('sentiment', sentiment_prob))
-            # Adjust weights to include sentiment (5%)
+            # Adjust weights to include sentiment
             weights_with_sentiment = self.weights.copy()
-            weights_with_sentiment['sentiment'] = 0.05
+            weights_with_sentiment['sentiment'] = self.sentiment_weight
             # Normalize other weights
             total_other = sum(self.weights.values())
+            non_sentiment = 1.0 - self.sentiment_weight
             for key in self.weights:
-                weights_with_sentiment[key] = self.weights[key] * 0.95 / total_other
+                weights_with_sentiment[key] = self.weights[key] * non_sentiment / total_other
         else:
             weights_with_sentiment = self.weights
 
@@ -1027,20 +1184,31 @@ class AdvancedPredictor:
         )
         ensemble_prob = max(0.0, min(1.0, ensemble_prob))
 
-        # Determine direction and confidence using calibrated range mapping
-        # Maps realistic ensemble range [floor, ceiling] → [0%, 100%]
+        # Determine direction and confidence
         conf_range = self.confidence_ceiling - self.confidence_floor
-        if ensemble_prob > 0.55:
-            direction = "BUY"
-            confidence = (ensemble_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
-        elif ensemble_prob < 0.45:
-            direction = "SELL"
-            # Mirror: sell_prob = 1 - ensemble_prob, then same calibration
-            sell_prob = 1.0 - ensemble_prob
-            confidence = (sell_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
+        if self.symmetric_confidence:
+            # Symmetric: confidence = distance from 0.50, same for BUY and SELL
+            if ensemble_prob > self.buy_threshold:
+                direction = "BUY"
+                confidence = (ensemble_prob - 0.5) / conf_range if conf_range > 0 else 0.0
+            elif ensemble_prob < self.sell_threshold:
+                direction = "SELL"
+                confidence = (0.5 - ensemble_prob) / conf_range if conf_range > 0 else 0.0
+            else:
+                direction = "NEUTRAL"
+                confidence = 0.0
         else:
-            direction = "NEUTRAL"
-            confidence = 0.0
+            # Legacy: asymmetric mirror calculation
+            if ensemble_prob > self.buy_threshold:
+                direction = "BUY"
+                confidence = (ensemble_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
+            elif ensemble_prob < self.sell_threshold:
+                direction = "SELL"
+                sell_prob = 1.0 - ensemble_prob
+                confidence = (sell_prob - self.confidence_floor) / conf_range if conf_range > 0 else 0.0
+            else:
+                direction = "NEUTRAL"
+                confidence = 0.0
         confidence = max(0.0, min(1.0, confidence))
 
         # Apply per-regime penalty from config
@@ -1051,11 +1219,11 @@ class AdvancedPredictor:
 
         # Calculate stop loss and take profit
         if direction == "BUY":
-            stop_loss = current_price - (2 * atr)
-            take_profit = current_price + (3 * atr)
+            stop_loss = current_price - (self.atr_sl_multiplier * atr)
+            take_profit = current_price + (self.atr_tp_multiplier * atr)
         elif direction == "SELL":
-            stop_loss = current_price + (2 * atr)
-            take_profit = current_price - (3 * atr)
+            stop_loss = current_price + (self.atr_sl_multiplier * atr)
+            take_profit = current_price - (self.atr_tp_multiplier * atr)
         else:
             stop_loss = current_price - atr
             take_profit = current_price + atr
@@ -1071,7 +1239,7 @@ class AdvancedPredictor:
         # Position sizing using Kelly Criterion approximation
         win_prob = monte_carlo_result['prob_profit']
         kelly_fraction = (win_prob * (1 + risk_reward_ratio) - 1) / (risk_reward_ratio + EPSILON)
-        kelly_fraction = max(0.0, min(0.25, kelly_fraction))  # Cap at 25% max
+        kelly_fraction = max(0.0, min(self.kelly_max_fraction, kelly_fraction))
 
         # =================================================================
         # 8 OUT OF 10 RULE VALIDATION
@@ -1090,8 +1258,8 @@ class AdvancedPredictor:
         # Rule 2: Cycle Position (Fourier - not buying at top, not selling at bottom)
         cycle_phase = fourier_result['cycle_phase']
         cycle_ok = (
-            (direction == "BUY" and cycle_phase < 0.7) or
-            (direction == "SELL" and cycle_phase > 0.3) or
+            (direction == "BUY" and cycle_phase < self.rule_cycle_buy_max_phase) or
+            (direction == "SELL" and cycle_phase > self.rule_cycle_sell_min_phase) or
             direction == "NEUTRAL"
         )
         rules_details.append(("Cycle Position", cycle_ok,
@@ -1103,38 +1271,38 @@ class AdvancedPredictor:
         rules_details.append(("Market Regime", regime_ok,
             f"{regime}" if regime_ok else f"{regime} - too risky"))
 
-        # Rule 4: Markov Probability (>55% for direction)
+        # Rule 4: Markov Probability
         markov_ok = (
-            (direction == "BUY" and markov_result['prob_up'] > 0.55) or
-            (direction == "SELL" and markov_result['prob_down'] > 0.55) or
+            (direction == "BUY" and markov_result['prob_up'] > self.rule_markov_min_prob) or
+            (direction == "SELL" and markov_result['prob_down'] > self.rule_markov_min_prob) or
             direction == "NEUTRAL"
         )
         prob_used = markov_result['prob_up'] if direction == "BUY" else markov_result['prob_down']
         rules_details.append(("Markov Probability", markov_ok,
             f"{prob_used:.0%}" if markov_ok else f"Only {prob_used:.0%}"))
 
-        # Rule 5: Monte Carlo Win Rate (>50%)
-        mc_win_ok = monte_carlo_result['prob_profit'] > 0.50
+        # Rule 5: Monte Carlo Win Rate
+        mc_win_ok = monte_carlo_result['prob_profit'] > self.rule_mc_min_win_prob
         rules_details.append(("Win Probability", mc_win_ok,
             f"{monte_carlo_result['prob_profit']:.0%}" if mc_win_ok else f"Only {monte_carlo_result['prob_profit']:.0%}"))
 
-        # Rule 6: Risk/Reward Ratio (>1.5)
-        rr_ok = risk_reward_ratio >= 1.5
+        # Rule 6: Risk/Reward Ratio
+        rr_ok = risk_reward_ratio >= self.rule_min_risk_reward
         rules_details.append(("Risk/Reward", rr_ok,
             f"1:{risk_reward_ratio:.1f}" if rr_ok else f"1:{risk_reward_ratio:.1f} - too low"))
 
-        # Rule 7: Volatility Check (Daily vol < 5%)
-        vol_ok = monte_carlo_result['volatility_daily'] < 0.05
+        # Rule 7: Volatility Check
+        vol_ok = monte_carlo_result['volatility_daily'] < self.rule_max_daily_volatility
         rules_details.append(("Volatility", vol_ok,
             f"{monte_carlo_result['volatility_daily']*100:.1f}%" if vol_ok else f"{monte_carlo_result['volatility_daily']*100:.1f}% - too high"))
 
-        # Rule 8: Confidence Level (>60%)
-        conf_ok = confidence > 0.60
+        # Rule 8: Confidence Level
+        conf_ok = confidence > self.rule_min_confidence
         rules_details.append(("Confidence", conf_ok,
             f"{confidence*100:.0f}%" if conf_ok else f"Only {confidence*100:.0f}%"))
 
-        # Rule 9: Position Size Valid (Kelly > 1%)
-        kelly_ok = kelly_fraction > 0.01 or direction == "NEUTRAL"
+        # Rule 9: Position Size Valid
+        kelly_ok = kelly_fraction > self.rule_min_kelly or direction == "NEUTRAL"
         rules_details.append(("Position Size", kelly_ok,
             f"{kelly_fraction*100:.1f}%" if kelly_ok else "Too small"))
 

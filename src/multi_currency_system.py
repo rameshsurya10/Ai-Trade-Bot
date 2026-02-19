@@ -62,6 +62,13 @@ class PerformanceStats:
     last_retrain: Optional[datetime] = None
     win_rate: float = 0.0
 
+    # Configurable thresholds (set via from_config classmethod or defaults)
+    min_signals_for_retrain_check: int = 20
+    win_rate_retrain_threshold: float = 0.45
+    initial_retrain_after_signals: int = 100
+    days_between_retrains: int = 30
+    min_signals_for_periodic_retrain: int = 50
+
     def add_result(self, is_correct: bool, pnl_percent: float):
         """Record a prediction result."""
         self.total_signals += 1
@@ -73,14 +80,14 @@ class PerformanceStats:
     @property
     def needs_retrain(self) -> bool:
         """Check if model needs retraining based on performance."""
-        if self.total_signals < 20:
+        if self.total_signals < self.min_signals_for_retrain_check:
             return False  # Not enough data
-        if self.win_rate < 0.45:
+        if self.win_rate < self.win_rate_retrain_threshold:
             return True  # Performing below baseline
         if self.last_retrain is None:
-            return self.total_signals >= 100  # Initial retrain after 100 trades
+            return self.total_signals >= self.initial_retrain_after_signals
         days_since_retrain = (datetime.utcnow() - self.last_retrain).days
-        return days_since_retrain >= 30 and self.total_signals >= 50  # Monthly retrain
+        return days_since_retrain >= self.days_between_retrains and self.total_signals >= self.min_signals_for_periodic_retrain
 
 
 class ModelManager:
@@ -462,7 +469,15 @@ class MultiCurrencySystem:
             model_path=str(self.model_manager.get_model_path(symbol, interval))
         )
         self.currencies[symbol] = currency_config
-        self.performance[symbol] = PerformanceStats(symbol=symbol)
+        perf_cfg = self.config.get('performance_tracking', {})
+        self.performance[symbol] = PerformanceStats(
+            symbol=symbol,
+            min_signals_for_retrain_check=perf_cfg.get('min_signals_for_retrain_check', 20),
+            win_rate_retrain_threshold=perf_cfg.get('win_rate_retrain_threshold', 0.45),
+            initial_retrain_after_signals=perf_cfg.get('initial_retrain_after_signals', 100),
+            days_between_retrains=perf_cfg.get('days_between_retrains', 30),
+            min_signals_for_periodic_retrain=perf_cfg.get('min_signals_for_periodic_retrain', 50)
+        )
 
         # Try to load existing model (pass interval for correct path)
         model_config = self.config.get('model', {})

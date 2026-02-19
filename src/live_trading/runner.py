@@ -76,6 +76,7 @@ class TradingSymbol:
     enabled: bool = True
     last_signal_time: Optional[datetime] = None
     cooldown_minutes: int = 60
+    market_type: str = "crypto"  # "crypto" or "forex"
 
 
 @dataclass
@@ -193,9 +194,12 @@ class LiveTradingRunner:
         # CONTINUOUS LEARNING: Strategic Learning Bridge (initialized on start)
         self._learning_bridge: Optional[StrategicLearningBridge] = None
 
-        # Symbols and data provider
+        # Symbols and data providers
         self._symbols: Dict[str, TradingSymbol] = {}
         self._provider: Optional[UnifiedDataProvider] = None
+        self._mt5_provider = None  # MT5DataProvider (lazy import)
+        self._capital_provider = None  # CapitalDataProvider (lazy import)
+        self._forex_brokerage: Optional[BaseBrokerage] = None  # Separate brokerage for forex
         self._data_buffers: Dict[str, pd.DataFrame] = {}
 
         # Efficient candle storage using deque (O(1) append, avoids pd.concat fragmentation)
@@ -250,19 +254,23 @@ class LiveTradingRunner:
         Add a symbol to trade.
 
         Args:
-            symbol: Trading pair (e.g., "BTC/USD")
-            exchange: Exchange name
+            symbol: Trading pair (e.g., "BTC/USD", "EUR/USD")
+            exchange: Exchange name (e.g., "binance", "mt5")
             interval: Primary candle interval (optional, uses config if not specified)
             cooldown_minutes: Minutes between signals
         """
+        from src.core.market_context import detect_market_type
+        market_type = detect_market_type(symbol, exchange)
+
         ts = TradingSymbol(
             symbol=symbol,
             exchange=exchange,
             interval=interval,
-            cooldown_minutes=cooldown_minutes
+            cooldown_minutes=cooldown_minutes,
+            market_type=market_type.value,
         )
         self._symbols[symbol] = ts
-        logger.info(f"Added trading symbol: {symbol} on {exchange}")
+        logger.info(f"Added trading symbol: {symbol} on {exchange} (market: {market_type.value})")
 
     def remove_symbol(self, symbol: str):
         """Remove a trading symbol."""
@@ -351,19 +359,36 @@ class LiveTradingRunner:
             self._news_collector = None
             logger.info("News collector stopped")
 
-        # Stop data provider
+        # Stop data providers
         if self._provider:
             self._provider.stop()
             self._provider = None
+
+        if self._mt5_provider:
+            self._mt5_provider.stop()
+            self._mt5_provider.disconnect()
+            self._mt5_provider = None
+            logger.info("MT5 data provider stopped")
+
+        if self._capital_provider:
+            self._capital_provider.stop()
+            self._capital_provider.disconnect()
+            self._capital_provider = None
+            logger.info("Capital.com data provider stopped")
 
         # Wait for threads
         for thread in [self._main_thread, self._signal_thread, self._execution_thread]:
             if thread and thread.is_alive():
                 thread.join(timeout=5.0)
 
-        # Disconnect brokerage
+        # Disconnect brokerages
         if self._brokerage:
             self._brokerage.disconnect()
+
+        if self._forex_brokerage:
+            self._forex_brokerage.disconnect()
+            self._forex_brokerage = None
+            logger.info("Forex brokerage disconnected")
 
         # Cleanup prediction system
         if self._prediction_system:
@@ -445,9 +470,45 @@ class LiveTradingRunner:
         self._risk_manager.add_model(MaximumDrawdownRisk(max_drawdown_percent=20.0))
         self._risk_manager.add_model(MaximumPositionSizeRisk(max_position_percent=0.25))
 
-        # Brokerage
+        # Brokerage (primary - crypto)
         self._brokerage = self.config.get_brokerage()
         self._brokerage.on_order_event(self._handle_order_event)
+
+        # MT5 Forex Components (if enabled)
+        mt5_config = self.config.raw.get('mt5', {})
+        has_forex_symbols = any(
+            ts.market_type == "forex" for ts in self._symbols.values()
+        )
+        if mt5_config.get('enabled', False) and has_forex_symbols:
+            try:
+                from src.data.mt5_provider import MT5DataProvider
+                from src.brokerages.mt5 import MT5Brokerage
+
+                self._mt5_provider = MT5DataProvider(mt5_config)
+                self._forex_brokerage = MT5Brokerage(
+                    demo=mt5_config.get('demo', True),
+                    terminal_path=mt5_config.get('terminal_path', ''),
+                    magic_number=mt5_config.get('magic_number', 234000),
+                )
+                # Share MT5Worker for thread safety (MT5 API is not thread-safe)
+                if self._mt5_provider and hasattr(self._mt5_provider, '_worker'):
+                    self._forex_brokerage.set_worker(self._mt5_provider._worker)
+                logger.info("MT5 forex components initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize MT5 components: {e}. Forex trading disabled.")
+                self._mt5_provider = None
+                self._forex_brokerage = None
+
+        # Capital.com Forex Components (if enabled)
+        capital_config = self.config.raw.get('capital', {})
+        if capital_config.get('enabled', False) and has_forex_symbols:
+            try:
+                from src.data.capital_provider import CapitalDataProvider
+                self._capital_provider = CapitalDataProvider(capital_config)
+                logger.info("Capital.com forex components initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Capital.com: {e}. Capital.com forex disabled.")
+                self._capital_provider = None
 
         # Prediction System
         self._prediction_system = MultiCurrencySystem(self._config_path)
@@ -543,264 +604,288 @@ class LiveTradingRunner:
             self._models_ready[symbol] = False
             self._model_accuracies[symbol] = 0.0
 
+        # Determine which intervals to train for each symbol
+        timeframe_config = self.config.raw.get('timeframes', {})
+        training_intervals = []
+        interval_seq_lengths = {}
+
+        if timeframe_config.get('enabled', False):
+            for tf_config in timeframe_config.get('intervals', []):
+                if tf_config.get('enabled', True):
+                    interval = tf_config.get('interval')
+                    if interval:
+                        training_intervals.append(interval)
+                        interval_seq_lengths[interval] = tf_config.get(
+                            'sequence_length', self.config.model.sequence_length
+                        )
+
+        # Cache feature columns once (static, same for all symbols/intervals)
+        feature_columns = FeatureCalculator.get_feature_columns()
+
         for symbol, ts in self._symbols.items():
             if not ts.enabled:
                 continue
 
-            logger.info(f"\n{'='*60}")
-            logger.info(f"[{symbol}] MANDATORY TRAINING STARTING")
-            logger.info(f"{'='*60}")
+            # Fallback: if no multi-timeframe config, use symbol's primary interval
+            symbol_intervals = training_intervals if training_intervals else [ts.interval or '1h']
+            if not interval_seq_lengths:
+                interval_seq_lengths[symbol_intervals[0]] = self.config.model.sequence_length
 
-            # Get model path
-            safe_symbol = symbol.replace("/", "_").replace("-", "_")
-            model_path = models_dir / f"model_{safe_symbol}_{ts.interval}.pt"
+            for train_interval in symbol_intervals:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"[{symbol} @ {train_interval}] MANDATORY TRAINING STARTING")
+                logger.info(f"{'='*60}")
 
-            logger.info(f"[{symbol}] Fetching {training_candles} candles for training...")
+                # Get model path
+                safe_symbol = symbol.replace("/", "_").replace("-", "_")
+                model_path = models_dir / f"model_{safe_symbol}_{train_interval}.pt"
 
-            try:
-                # Fetch training data from database
-                candles_df = self._database.get_candles(
-                    symbol=symbol,
-                    interval=ts.interval,
-                    limit=training_candles + 100  # Extra for feature warmup
+                # Use per-interval sequence_length
+                sequence_length = interval_seq_lengths.get(
+                    train_interval, self.config.model.sequence_length
                 )
 
-                if candles_df is None or len(candles_df) < min_candles:
-                    logger.warning(
-                        f"[{symbol}] Insufficient data for training: "
-                        f"{len(candles_df) if candles_df is not None else 0} < {min_candles} candles. "
-                        f"Will train after more data is collected."
-                    )
-                    continue
+                logger.info(f"[{symbol} @ {train_interval}] Fetching {training_candles} candles (seq_len={sequence_length})...")
 
-                logger.info(f"[{symbol}] Fetched {len(candles_df)} candles for training")
-
-                # Calculate features
-                df_features = FeatureCalculator.calculate_all(candles_df)
-                feature_columns = FeatureCalculator.get_feature_columns()
-
-                # Extract and normalize features FIRST (before creating target)
-                features = df_features[feature_columns].values
-                closes = df_features['close'].values
-
-                # Normalize features
-                feature_means = np.nanmean(features, axis=0)
-                feature_stds = np.nanstd(features, axis=0)
-                features = (features - feature_means) / (feature_stds + 1e-8)
-                features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
-
-                # Create sequences using sliding window
-                sequence_length = self.config.model.sequence_length
-
-                # Create sliding windows manually for correct shape
-                # Need shape: (num_samples, sequence_length, num_features)
-                num_features = features.shape[1]
-                num_sequences = len(features) - sequence_length - 1  # -1 for target
-
-                X = np.zeros((num_sequences, sequence_length, num_features))
-                y = np.zeros(num_sequences)
-
-                # CRITICAL FIX: Align sequences with correct targets
-                # For each sequence ending at position i+sequence_length-1,
-                # the target is: will the NEXT candle (i+sequence_length) close higher?
-                for i in range(num_sequences):
-                    # Sequence uses candles [i] to [i+sequence_length-1]
-                    X[i] = features[i:i + sequence_length]
-
-                    # Target: will candle [i+sequence_length] close higher than candle [i+sequence_length-1]?
-                    current_close = closes[i + sequence_length - 1]
-                    next_close = closes[i + sequence_length]
-                    y[i] = 1.0 if next_close > current_close else 0.0
-
-                # Remove any invalid entries
-                valid = ~(np.isnan(y) | np.isnan(X).any(axis=(1, 2)))
-                X = X[valid]
-                y = y[valid]
-
-                if len(X) < min_candles:
-                    logger.warning(f"[{symbol}] After sequence creation, only {len(X)} samples")
-                    continue
-
-                logger.info(f"[{symbol}] Created {len(X)} training sequences")
-
-                # Train/validation split with validation size check
-                min_val_samples = 50
-                split_idx = int(len(X) * 0.8)
-
-                if len(X) - split_idx < min_val_samples:
-                    logger.warning(f"[{symbol}] Validation set too small, adjusting split")
-                    if len(X) < min_val_samples * 2:
-                        logger.warning(f"[{symbol}] Insufficient data for reliable training")
-                        continue
-                    split_idx = len(X) - min_val_samples
-
-                X_train, X_val = X[:split_idx], X[split_idx:]
-                y_train, y_val = y[:split_idx], y[split_idx:]
-
-                # Create data loaders
-                train_dataset = torch.utils.data.TensorDataset(
-                    torch.FloatTensor(X_train),
-                    torch.FloatTensor(y_train)
-                )
-                val_dataset = torch.utils.data.TensorDataset(
-                    torch.FloatTensor(X_val),
-                    torch.FloatTensor(y_val)
-                )
-                train_loader = torch.utils.data.DataLoader(
-                    train_dataset, batch_size=batch_size, shuffle=True
-                )
-                val_loader = torch.utils.data.DataLoader(
-                    val_dataset, batch_size=batch_size
-                )
-
-                # Create model with config parameters
-                model = LSTMModel(
-                    input_size=len(feature_columns),
-                    hidden_size=hidden_size,
-                    num_layers=num_layers,
-                    dropout=dropout
-                ).to(device)
-
-                # Training
-                criterion = torch.nn.BCELoss()
-                optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-                # LR scheduler: halve LR when val accuracy plateaus
-                scheduler_config = auto_train_config.get('scheduler', {})
-                scheduler = None
-                if scheduler_config.get('enabled', False):
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        mode='max',
-                        factor=scheduler_config.get('factor', 0.5),
-                        patience=scheduler_config.get('patience', 5),
-                        min_lr=scheduler_config.get('min_lr', 1e-5)
+                try:
+                    # Fetch training data from database for THIS interval
+                    candles_df = self._database.get_candles(
+                        symbol=symbol,
+                        interval=train_interval,
+                        limit=training_candles + 100  # Extra for feature warmup
                     )
 
-                best_val_acc = 0
-                best_state = None
-                patience = auto_train_config.get('patience', 15)
-                patience_counter = 0
-
-                logger.info(f"[{symbol}] Training for up to {max_epochs} epochs...")
-
-                for epoch in range(max_epochs):
-                    # Train
-                    model.train()
-                    epoch_loss = 0
-                    for X_batch, y_batch in train_loader:
-                        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                        optimizer.zero_grad()
-                        outputs = model(X_batch).squeeze()
-                        loss = criterion(outputs, y_batch)
-                        loss.backward()
-                        optimizer.step()
-                        epoch_loss += loss.item()
-
-                    # Validate
-                    model.eval()
-                    correct = 0
-                    total = 0
-                    with torch.no_grad():
-                        for X_batch, y_batch in val_loader:
-                            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                            outputs = model(X_batch).squeeze()
-                            predictions = (outputs > 0.5).float()
-                            correct += (predictions == y_batch).sum().item()
-                            total += len(y_batch)
-
-                    val_acc = correct / total if total > 0 else 0
-
-                    # Step LR scheduler based on validation accuracy
-                    if scheduler is not None:
-                        scheduler.step(val_acc)
-
-                    # Track best model
-                    if val_acc > best_val_acc:
-                        best_val_acc = val_acc
-                        best_state = {k: v.clone().detach() for k, v in model.state_dict().items()}
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-
-                    # Log progress with confidence estimate
-                    if (epoch + 1) % 10 == 0:
-                        avg_loss = epoch_loss / len(train_loader)
-                        current_lr = optimizer.param_groups[0]['lr']
-                        logger.info(
-                            f"[{symbol}] Epoch {epoch+1}/{max_epochs} - "
-                            f"Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%} - "
-                            f"LR: {current_lr:.6f}"
-                        )
-
-                    # Early stopping
-                    if patience_counter >= patience:
-                        logger.info(f"[{symbol}] Early stopping at epoch {epoch+1}")
-                        break
-
-                    # Stop if target reached
-                    if val_acc >= target_accuracy:
-                        logger.info(f"[{symbol}] [OK] Target accuracy reached: {val_acc:.2%}")
-                        break
-
-                # Save model and validate
-                if best_state is not None:
-                    # Move model to CPU for saving (ensures compatibility)
-                    model.cpu()
-                    model.load_state_dict(best_state)
-
-                    torch.save({
-                        'model_state_dict': model.state_dict(),
-                        'config': {
-                            'hidden_size': hidden_size,
-                            'num_layers': num_layers,
-                            'dropout': dropout,
-                            'sequence_length': sequence_length
-                        },
-                        'feature_means': feature_means,
-                        'feature_stds': feature_stds,
-                        'symbol': symbol,
-                        'interval': ts.interval,
-                        'trained_at': datetime.utcnow().isoformat(),
-                        'samples_trained': len(X_train),
-                        'validation_accuracy': best_val_acc
-                    }, model_path)
-
-                    # Store accuracy
-                    self._model_accuracies[symbol] = best_val_acc
-
-                    # VALIDATION GATE: Check if model meets minimum accuracy
-                    if best_val_acc >= min_accuracy_required:
-                        self._models_ready[symbol] = True
-                        logger.info(
-                            f"[{symbol}] [VALIDATED] MODEL READY FOR PREDICTIONS\n"
-                            f"    Accuracy: {best_val_acc:.2%} >= {min_accuracy_required:.2%} required\n"
-                            f"    Samples trained: {len(X_train)}\n"
-                            f"    PREDICTIONS ENABLED for {symbol}"
-                        )
-                    else:
-                        self._models_ready[symbol] = False
+                    if candles_df is None or len(candles_df) < min_candles:
                         logger.warning(
-                            f"[{symbol}] [FAILED] MODEL BELOW MINIMUM ACCURACY\n"
-                            f"    Accuracy: {best_val_acc:.2%} < {min_accuracy_required:.2%} required\n"
-                            f"    PREDICTIONS BLOCKED for {symbol}\n"
-                            f"    Need more training data or better features"
+                            f"[{symbol} @ {train_interval}] Insufficient data for training: "
+                            f"{len(candles_df) if candles_df is not None else 0} < {min_candles} candles. "
+                            f"Will train after more data is collected."
                         )
-                else:
-                    logger.error(f"[{symbol}] Training failed - no valid model state")
-                    self._models_ready[symbol] = False
+                        continue
 
-            except Exception as e:
-                logger.error(f"[{symbol}] Auto-training failed: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-                self._models_ready[symbol] = False
+                    logger.info(f"[{symbol} @ {train_interval}] Fetched {len(candles_df)} candles for training")
 
-            finally:
-                # Memory cleanup between symbols
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    # Calculate features
+                    df_features = FeatureCalculator.calculate_all(candles_df)
+
+                    # Extract and normalize features FIRST (before creating target)
+                    features = df_features[feature_columns].values
+                    closes = df_features['close'].values
+
+                    # Normalize features
+                    feature_means = np.nanmean(features, axis=0)
+                    feature_stds = np.nanstd(features, axis=0)
+                    features = (features - feature_means) / (feature_stds + 1e-8)
+                    features = np.nan_to_num(features, nan=0, posinf=0, neginf=0)
+
+                    # Create sliding windows using stride_tricks for zero-copy windowing
+                    # Need shape: (num_samples, sequence_length, num_features)
+                    num_sequences = len(features) - sequence_length - 1  # -1 for target
+
+                    # Vectorized sliding window (no Python loop, ~60-80% faster)
+                    # sliding_window_view returns (num_windows, num_features, window_shape)
+                    # Transpose to (num_windows, sequence_length, num_features) for LSTM
+                    X = np.lib.stride_tricks.sliding_window_view(
+                        features, window_shape=sequence_length, axis=0
+                    )[:num_sequences].transpose(0, 2, 1).copy()  # .copy() to own memory
+
+                    # Vectorized target: next candle close > current candle close
+                    current_closes = closes[sequence_length - 1:sequence_length - 1 + num_sequences]
+                    next_closes = closes[sequence_length:sequence_length + num_sequences]
+                    y = (next_closes > current_closes).astype(np.float64)
+
+                    # Remove any invalid entries
+                    valid = ~(np.isnan(y) | np.isnan(X).any(axis=(1, 2)))
+                    X = X[valid]
+                    y = y[valid]
+
+                    if len(X) < min_candles:
+                        logger.warning(f"[{symbol} @ {train_interval}] After sequence creation, only {len(X)} samples")
+                        continue
+
+                    # Log label distribution
+                    n_positive = float(y.sum())
+                    label_ratio = n_positive / len(y) if len(y) > 0 else 0.5
+                    logger.info(f"[{symbol} @ {train_interval}] {len(X)} sequences, labels: {label_ratio:.1%} UP / {1-label_ratio:.1%} DOWN")
+
+                    # Train/validation split (chronological)
+                    min_val_samples = 50
+                    split_idx = int(len(X) * 0.8)
+
+                    if len(X) - split_idx < min_val_samples:
+                        logger.warning(f"[{symbol} @ {train_interval}] Validation set too small, adjusting split")
+                        if len(X) < min_val_samples * 2:
+                            logger.warning(f"[{symbol} @ {train_interval}] Insufficient data for reliable training")
+                            continue
+                        split_idx = len(X) - min_val_samples
+
+                    X_train, X_val = X[:split_idx], X[split_idx:]
+                    y_train, y_val = y[:split_idx], y[split_idx:]
+
+                    # Create data loaders
+                    train_dataset = torch.utils.data.TensorDataset(
+                        torch.FloatTensor(X_train),
+                        torch.FloatTensor(y_train)
+                    )
+                    val_dataset = torch.utils.data.TensorDataset(
+                        torch.FloatTensor(X_val),
+                        torch.FloatTensor(y_val)
+                    )
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset, batch_size=batch_size, shuffle=True
+                    )
+                    val_loader = torch.utils.data.DataLoader(
+                        val_dataset, batch_size=batch_size
+                    )
+
+                    # Create model with config parameters
+                    model = LSTMModel(
+                        input_size=len(feature_columns),
+                        hidden_size=hidden_size,
+                        num_layers=num_layers,
+                        dropout=dropout
+                    ).to(device)
+
+                    # Training with L2 regularization (weight_decay) to prevent overfitting
+                    criterion = torch.nn.BCELoss()
+                    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+                    # LR scheduler: halve LR when val accuracy plateaus
+                    scheduler_config = auto_train_config.get('scheduler', {})
+                    scheduler = None
+                    if scheduler_config.get('enabled', False):
+                        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer,
+                            mode='max',
+                            factor=scheduler_config.get('factor', 0.5),
+                            patience=scheduler_config.get('patience', 5),
+                            min_lr=scheduler_config.get('min_lr', 1e-5)
+                        )
+
+                    best_val_acc = 0
+                    best_state = None
+                    patience = auto_train_config.get('patience', 10)
+                    patience_counter = 0
+
+                    logger.info(f"[{symbol} @ {train_interval}] Training for up to {max_epochs} epochs...")
+
+                    for epoch in range(max_epochs):
+                        # Train
+                        model.train()
+                        epoch_loss = 0
+                        for X_batch, y_batch in train_loader:
+                            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                            optimizer.zero_grad()
+                            outputs = model(X_batch).squeeze()
+                            loss = criterion(outputs, y_batch)
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            optimizer.step()
+                            epoch_loss += loss.item()
+
+                        # Validate
+                        model.eval()
+                        correct = 0
+                        total = 0
+                        with torch.no_grad():
+                            for X_batch, y_batch in val_loader:
+                                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                                outputs = model(X_batch).squeeze()
+                                predictions = (outputs > 0.5).float()
+                                correct += (predictions == y_batch).sum().item()
+                                total += len(y_batch)
+
+                        val_acc = correct / total if total > 0 else 0
+
+                        # Step LR scheduler based on validation accuracy
+                        if scheduler is not None:
+                            scheduler.step(val_acc)
+
+                        # Track best model
+                        if val_acc > best_val_acc:
+                            best_val_acc = val_acc
+                            best_state = {k: v.clone().detach() for k, v in model.state_dict().items()}
+                            patience_counter = 0
+                        else:
+                            patience_counter += 1
+
+                        # Log progress
+                        if (epoch + 1) % 10 == 0:
+                            avg_loss = epoch_loss / len(train_loader)
+                            current_lr = optimizer.param_groups[0]['lr']
+                            logger.info(
+                                f"[{symbol} @ {train_interval}] Epoch {epoch+1}/{max_epochs} - "
+                                f"Loss: {avg_loss:.4f} - Val Acc: {val_acc:.2%} - "
+                                f"LR: {current_lr:.6f}"
+                            )
+
+                        # Early stopping
+                        if patience_counter >= patience:
+                            logger.info(f"[{symbol} @ {train_interval}] Early stopping at epoch {epoch+1}")
+                            break
+
+                        # Stop if target reached
+                        if val_acc >= target_accuracy:
+                            logger.info(f"[{symbol} @ {train_interval}] [OK] Target accuracy reached: {val_acc:.2%}")
+                            break
+
+                    # Save model and validate
+                    if best_state is not None:
+                        model.cpu()
+                        model.load_state_dict(best_state)
+
+                        torch.save({
+                            'model_state_dict': model.state_dict(),
+                            'config': {
+                                'hidden_size': hidden_size,
+                                'num_layers': num_layers,
+                                'dropout': dropout,
+                                'sequence_length': sequence_length,
+                                'input_size': len(feature_columns)
+                            },
+                            'feature_means': feature_means,
+                            'feature_stds': feature_stds,
+                            'symbol': symbol,
+                            'interval': train_interval,
+                            'trained_at': datetime.utcnow().isoformat(),
+                            'samples_trained': len(X_train),
+                            'validation_accuracy': best_val_acc
+                        }, model_path)
+
+                        # Store accuracy (use best across intervals for readiness)
+                        prev_acc = self._model_accuracies.get(symbol, 0.0)
+                        self._model_accuracies[symbol] = max(prev_acc, best_val_acc)
+
+                        # VALIDATION GATE: Mark symbol ready if ANY interval model passes
+                        if best_val_acc >= min_accuracy_required:
+                            self._models_ready[symbol] = True
+                            logger.info(
+                                f"[{symbol} @ {train_interval}] [VALIDATED] MODEL READY\n"
+                                f"    Accuracy: {best_val_acc:.2%} >= {min_accuracy_required:.2%} required\n"
+                                f"    Samples trained: {len(X_train)}"
+                            )
+                        else:
+                            if not self._models_ready.get(symbol, False):
+                                logger.warning(
+                                    f"[{symbol} @ {train_interval}] [BELOW TARGET]\n"
+                                    f"    Accuracy: {best_val_acc:.2%} < {min_accuracy_required:.2%} required"
+                                )
+                    else:
+                        logger.error(f"[{symbol} @ {train_interval}] Training failed - no valid model state")
+                        if not self._models_ready.get(symbol, False):
+                            self._models_ready[symbol] = False
+
+                except Exception as e:
+                    logger.error(f"[{symbol} @ {train_interval}] Auto-training failed: {e}")
+                    logger.debug(traceback.format_exc())
+                    if not self._models_ready.get(symbol, False):
+                        self._models_ready[symbol] = False
+
+                finally:
+                    # Memory cleanup between training runs
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         # Final summary
         logger.info("\n" + "=" * 70)
@@ -1013,63 +1098,143 @@ class LiveTradingRunner:
         logger.info("=" * 70)
 
     def _start_streams(self):
-        """Start unified data provider for all symbols."""
-        try:
-            # Get singleton UnifiedDataProvider
-            self._provider = UnifiedDataProvider.get_instance(self._config_path)
+        """Start data providers for all symbols (crypto via CCXT, forex via MT5)."""
+        # Split symbols by market type
+        crypto_symbols = {s: ts for s, ts in self._symbols.items() if ts.market_type == "crypto"}
+        forex_symbols = {s: ts for s, ts in self._symbols.items() if ts.market_type == "forex"}
 
-            # Get multi-timeframe intervals from config
-            timeframe_config = self.config.raw.get('timeframes', {})
-            enabled_intervals = []
+        # Get multi-timeframe intervals from config
+        timeframe_config = self.config.raw.get('timeframes', {})
+        enabled_intervals = []
 
-            if timeframe_config.get('enabled', False):
-                # Extract enabled intervals from config
-                for tf_config in timeframe_config.get('intervals', []):
-                    if tf_config.get('enabled', True):
+        if timeframe_config.get('enabled', False):
+            for tf_config in timeframe_config.get('intervals', []):
+                if tf_config.get('enabled', True):
+                    interval = tf_config.get('interval')
+                    if interval:
+                        enabled_intervals.append(interval)
+
+        if not enabled_intervals:
+            enabled_intervals = [self.config.data.interval if hasattr(self.config.data, 'interval') else '1h']
+
+        logger.info(f"Subscribing to intervals: {enabled_intervals}")
+
+        # ---- Start crypto streams (existing CCXT/Binance provider) ----
+        if crypto_symbols:
+            try:
+                self._provider = UnifiedDataProvider.get_instance(self._config_path)
+
+                for symbol, ts in crypto_symbols.items():
+                    if not ts.enabled:
+                        continue
+                    for interval in enabled_intervals:
+                        self._provider.subscribe(symbol, exchange=ts.exchange, interval=interval)
+                        logger.info(f"[Crypto] Subscribed to {symbol} @ {interval}")
+                    ts.interval = enabled_intervals[0]
+                    self._initialize_buffer(symbol, ts)
+
+                self._provider.on_candle_closed(self._handle_candle_callback)
+
+                if self._database:
+                    self._provider.set_database(self._database)
+
+                self._provider.start()
+                logger.info("UnifiedDataProvider started (crypto)")
+
+            except Exception as e:
+                logger.error(f"Failed to start crypto data provider: {e}")
+
+        # ---- Start forex streams (MT5 provider) ----
+        # Only route forex symbols with exchange=="mt5" to MT5 provider
+        mt5_forex = {s: ts for s, ts in forex_symbols.items() if ts.exchange == "mt5"} if forex_symbols else {}
+        if mt5_forex and self._mt5_provider:
+            try:
+                # Get forex-specific intervals from mt5 config
+                mt5_config = self.config.raw.get('mt5', {})
+                forex_intervals = []
+                for tf_config in mt5_config.get('intervals', []):
+                    interval = tf_config.get('interval')
+                    if interval:
+                        forex_intervals.append(interval)
+                if not forex_intervals:
+                    forex_intervals = enabled_intervals
+
+                # Connect MT5
+                if not self._mt5_provider.connect():
+                    logger.error("Failed to connect MT5 data provider")
+                else:
+                    for symbol, ts in mt5_forex.items():
+                        if not ts.enabled:
+                            continue
+                        for interval in forex_intervals:
+                            self._mt5_provider.subscribe(symbol, interval=interval)
+                            logger.info(f"[Forex/MT5] Subscribed to {symbol} @ {interval}")
+                        ts.interval = forex_intervals[0]
+                        self._initialize_buffer(symbol, ts)
+
+                    # Same callback for both providers
+                    self._mt5_provider.on_candle_closed(self._handle_candle_callback)
+
+                    if self._database:
+                        self._mt5_provider.set_database(self._database)
+
+                    self._mt5_provider.start()
+                    logger.info("MT5DataProvider started (forex)")
+
+            except Exception as e:
+                logger.error(f"Failed to start MT5 data provider: {e}")
+
+        # ---- Start Capital.com forex streams ----
+        if forex_symbols and self._capital_provider:
+            # Filter forex symbols routed to Capital.com (exchange=="capital")
+            capital_forex = {s: ts for s, ts in forex_symbols.items() if ts.exchange == "capital"}
+            if capital_forex:
+                try:
+                    # Get Capital.com-specific intervals from config
+                    capital_config = self.config.raw.get('capital', {})
+                    capital_intervals = []
+                    for tf_config in capital_config.get('intervals', []):
                         interval = tf_config.get('interval')
                         if interval:
-                            enabled_intervals.append(interval)
+                            capital_intervals.append(interval)
+                    if not capital_intervals:
+                        capital_intervals = enabled_intervals
 
-            # Fallback to single interval if multi-timeframe not configured
-            if not enabled_intervals:
-                enabled_intervals = [self.config.data.interval if hasattr(self.config.data, 'interval') else '1h']
+                    # Connect Capital.com
+                    if not self._capital_provider.connect():
+                        logger.error("Failed to connect Capital.com data provider")
+                    else:
+                        for symbol, ts in capital_forex.items():
+                            if not ts.enabled:
+                                continue
+                            for interval in capital_intervals:
+                                self._capital_provider.subscribe(symbol, interval=interval)
+                                logger.info(f"[Forex/Capital] Subscribed to {symbol} @ {interval}")
+                            ts.interval = capital_intervals[0]
+                            self._initialize_buffer(symbol, ts)
 
-            logger.info(f"Subscribing to intervals: {enabled_intervals}")
+                        # Same callback for all providers
+                        self._capital_provider.on_candle_closed(self._handle_candle_callback)
 
-            # Subscribe to all symbols with all enabled intervals
-            for symbol, ts in self._symbols.items():
-                if not ts.enabled:
-                    continue
+                        if self._database:
+                            self._capital_provider.set_database(self._database)
 
-                # Subscribe to each timeframe for this symbol
-                for interval in enabled_intervals:
-                    self._provider.subscribe(
-                        symbol,
-                        exchange=ts.exchange,
-                        interval=interval
-                    )
-                    logger.info(f"Subscribed to {symbol} @ {interval}")
+                        self._capital_provider.start()
+                        logger.info("CapitalDataProvider started (forex)")
 
-                # Initialize data buffer with historical data (using first interval)
-                ts.interval = enabled_intervals[0]  # Set primary interval
-                self._initialize_buffer(symbol, ts)
+                except Exception as e:
+                    logger.error(f"Failed to start Capital.com data provider: {e}")
 
-            # Register callbacks
-            # Note: Using on_candle_closed for completed candles only
-            self._provider.on_candle_closed(self._handle_candle_callback)
-
-            # Connect database to provider for candle persistence
-            # This enables WebSocket candles to be saved for learning system
-            if self._database:
-                self._provider.set_database(self._database)
-                logger.info("Database connected to data provider for candle persistence")
-
-            # Start provider
-            self._provider.start()
-            logger.info("UnifiedDataProvider started")
-
-        except Exception as e:
-            logger.error(f"Failed to start data provider: {e}")
+        # ---- Connect forex brokerage ----
+        if forex_symbols and self._forex_brokerage:
+            try:
+                if not self._forex_brokerage.connect():
+                    logger.error("Failed to connect forex brokerage (MT5)")
+                else:
+                    self._forex_brokerage.on_order_event(self._handle_order_event)
+                    logger.info("MT5 forex brokerage connected")
+            except Exception as e:
+                logger.error(f"Failed to connect forex brokerage: {e}")
 
     def _stop_stream(self, symbol: str):
         """Unsubscribe from a symbol (provider handles connection)."""
@@ -1344,13 +1509,17 @@ class LiveTradingRunner:
         logger.info("Execution loop stopped")
 
     def _execute_signal(self, signal: Signal):
-        """Execute a trading signal."""
+        """Execute a trading signal (routes to correct brokerage by market type)."""
         try:
-            # Spot trading: SELL signals close existing positions only
-            if not signal.is_buy:
+            # Determine market type and brokerage
+            ts = self._symbols.get(signal.symbol)
+            is_forex = ts and ts.market_type == "forex"
+            brokerage = self._forex_brokerage if is_forex and self._forex_brokerage else self._brokerage
+
+            # Forex supports both BUY and SELL; Crypto spot: SELL only closes
+            if not is_forex and not signal.is_buy:
                 has_position = self._portfolio.has_position(signal.symbol)
                 if not has_position:
-                    # No position to sell in spot trading — skip
                     return
 
             # Check if we can open position
@@ -1360,12 +1529,15 @@ class LiveTradingRunner:
                 return
 
             # Calculate position size
-            quantity = self._portfolio.calculate_position_size(
-                symbol=signal.symbol,
-                entry_price=signal.entry_price,
-                stop_price=signal.stop_loss,
-                risk_percent=self.config.signals.risk_per_trade
-            )
+            if is_forex:
+                quantity = self._calculate_forex_position_size(signal)
+            else:
+                quantity = self._portfolio.calculate_position_size(
+                    symbol=signal.symbol,
+                    entry_price=signal.entry_price,
+                    stop_price=signal.stop_loss,
+                    risk_percent=self.config.signals.risk_per_trade
+                )
 
             if quantity <= 0:
                 logger.warning(f"Position size is zero for {signal.symbol}")
@@ -1399,14 +1571,16 @@ class LiveTradingRunner:
                 take_profit=signal.take_profit
             )
 
-            # Submit order
-            ticket = self._brokerage.place_order(order)
+            # Submit to correct brokerage
+            ticket = brokerage.place_order(order)
             self._active_orders[order.id] = order
             self._total_orders += 1
 
+            market_label = "FOREX" if is_forex else "CRYPTO"
+            unit_label = "lots" if is_forex else "units"
             logger.info(
-                f"ORDER: {order.side.name} {order.quantity} {order.symbol} "
-                f"(SL: {signal.stop_loss:.2f}, TP: {signal.take_profit:.2f})"
+                f"ORDER [{market_label}]: {order.side.name} {order.quantity} {unit_label} "
+                f"{order.symbol} (SL: {signal.stop_loss:.5f}, TP: {signal.take_profit:.5f})"
             )
 
             # Notify callbacks
@@ -1420,6 +1594,53 @@ class LiveTradingRunner:
             logger.error(f"Execution error: {e}")
             logger.error(traceback.format_exc())
             self._handle_error(e)
+
+    def _calculate_forex_position_size(self, signal: Signal) -> float:
+        """
+        Calculate position size in lots for forex trades.
+
+        Uses the ForexPositionSizer from src/portfolio/forex/ module.
+        Falls back to simple risk-based calculation if module unavailable.
+        """
+        try:
+            from src.portfolio.forex import ForexPositionSizer, PipCalculator
+
+            forex_config = self.config.raw.get('forex', {})
+            risk_config = forex_config.get('risk', {})
+            max_risk_pct = risk_config.get('max_risk_per_trade', 1.0)
+
+            sizer = ForexPositionSizer(max_risk_percent=max_risk_pct)
+            pip_calc = PipCalculator()
+
+            # Calculate stop distance in pips
+            stop_pips = pip_calc.price_to_pips(
+                signal.symbol,
+                abs(signal.entry_price - signal.stop_loss)
+            )
+            if stop_pips <= 0:
+                stop_pips = 50  # Fallback: 50 pip stop
+
+            # Get account equity
+            equity = self._portfolio.total_value
+
+            result = sizer.calculate_position_size(
+                symbol=signal.symbol,
+                account_equity=equity,
+                stop_pips=stop_pips,
+                current_price=signal.entry_price,
+            )
+
+            return result.lots if hasattr(result, 'lots') else result.volume
+
+        except Exception as e:
+            logger.warning(f"ForexPositionSizer failed, using fallback: {e}")
+            # Fallback: simple risk-based lot calculation
+            risk_amount = self._portfolio.total_value * self.config.signals.risk_per_trade
+            risk_per_lot = abs(signal.entry_price - signal.stop_loss) * 100000
+            if risk_per_lot > 0:
+                lots = risk_amount / risk_per_lot
+                return max(round(lots, 2), 0.01)  # Minimum 0.01 micro lot
+            return 0.01
 
     def _handle_order_event(self, event: OrderEvent):
         """Handle order status updates from brokerage."""

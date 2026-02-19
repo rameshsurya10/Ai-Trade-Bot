@@ -124,21 +124,119 @@ news:
     min_articles: 1
 currencies: null
 prediction:
-  confidence_floor: 0.52
-  confidence_ceiling: 0.72
+  confidence_floor: 0.50
+  confidence_ceiling: 0.60
   regime_penalties:
     TRENDING: 1.0
     NORMAL: 1.0
     CHOPPY: 0.85
     VOLATILE: 0.80
+  buy_threshold: 0.52
+  sell_threshold: 0.48
+
+  fourier:
+    dynamic_prob: true
+    amplitude: 0.15
+    n_harmonics: 5
+    min_samples: 32
+    phase_bullish_upper: 0.25
+    phase_neutral_upper: 0.50
+    phase_bearish_upper: 0.75
+    prob_bullish: 0.75
+    prob_bearish: 0.25
+    prob_neutral: 0.50
+    default_period: 20.0
+
+  kalman:
+    dynamic_prob: true
+    sigmoid_sensitivity: 2.0
+    process_variance: 0.00001
+    measurement_variance: 0.01
+    initial_error_covariance: 1.0
+    velocity_lookback: 10
+    prob_up: 0.70
+    prob_down: 0.30
+    prob_sideways: 0.50
+
+  entropy:
+    dynamic_prob: true
+    certainty_scaling: 0.8
+    n_bins: 10
+    lookback: 50
+    min_samples: 10
+    trending_threshold: 0.55
+    normal_threshold: 0.75
+    choppy_threshold: 0.88
+    prob_trending_up: 0.65
+    prob_trending_down: 0.35
+    prob_normal_up: 0.55
+    prob_normal_down: 0.45
+    low_entropy_threshold: 0.5
+
+  markov:
+    n_states: 3
+    min_samples: 20
+    damping: 0.8
+    percentile_lower: 33
+    percentile_upper: 67
+
+  monte_carlo:
+    n_simulations: 1000
+    time_horizon: 24
+    default_volatility: 0.02
+    default_stop_loss_pct: 0.02
+    default_take_profit_pct: 0.03
+    min_returns_samples: 10
+    var_weight: 0.5
+    annualization_factor: 252
+
+  ensemble:
+    symmetric_confidence: true
+    sentiment_weight: 0.05
+    sentiment_1h_weight: 0.6
+    sentiment_6h_weight: 0.4
+    sentiment_clamp_min: 0.2
+    sentiment_clamp_max: 0.8
+    mc_scaling: 20
+    mc_clamp_min: 0.2
+    mc_clamp_max: 0.8
+
+  atr:
+    period: 14
+    default_pct: 0.02
+    sl_multiplier: 2
+    tp_multiplier: 3
+    sl_pct_min: 0.01
+    sl_pct_max: 0.05
+    tp_pct_min: 0.015
+    tp_pct_max: 0.10
+
+  kelly:
+    max_fraction: 0.25
+
+  rules:
+    cycle_buy_max_phase: 0.7
+    cycle_sell_min_phase: 0.3
+    markov_min_prob: 0.55
+    mc_min_win_prob: 0.50
+    min_risk_reward: 1.5
+    max_daily_volatility: 0.05
+    min_confidence: 0.60
+    min_kelly: 0.01
+
+  online_update:
+    output_clamp_min: 0.01
+    output_clamp_max: 0.99
+    max_loss_threshold: 2.0
+    grad_clip_max_norm: 1.0
 auto_training:
   enabled: true
-  min_accuracy_required: 0.62
-  target_accuracy: 0.72
-  max_epochs: 200
+  min_accuracy_required: 0.50  # LSTM near-random on financial data; math ensemble drives confidence
+  target_accuracy: 0.60
+  max_epochs: 100
   batch_size: 64
   learning_rate: 0.0005
-  patience: 15
+  patience: 10
   min_candles: 1000
   training_candles: 5000
   min_trades_before_retrain: 50
@@ -152,7 +250,7 @@ auto_training:
 continuous_learning:
   enabled: true
   confidence:
-    trading_threshold: 0.8
+    trading_threshold: 0.65
     hysteresis: 0.05
     smoothing_alpha: 0.3
     regime_adjustment: true
@@ -168,10 +266,19 @@ continuous_learning:
     recent_candles: 5000
     replay_mix_ratio: 0.3
     min_samples: 1000
+    replay_loss_importance: 2.0
+    replay_win_importance: 1.0
+    win_rate_lookback: 100
+    drift_min_samples: 10
+    drift_decay_factor: 0.95
+    drift_high_conf_threshold: 0.7
+    drift_high_conf_weight: 1.5
+    min_candles_for_features: 100
   experience_replay:
     buffer_size: 10000
     replay_mix_ratio: 0.3
     prioritize_losses: true
+    batch_size: 32
   ewc:
     lambda: 1000.0
     fisher_sample_size: 200
@@ -179,6 +286,10 @@ continuous_learning:
     enabled: true
     learning_rate: 0.0005
     update_frequency: 1
+    min_price_change_pct: 0.001
+  stale_cleanup_interval: 100
+  prediction_max_age_minutes: 60
+  drift_window: 100
   exit_logic:
     stop_loss_pct: 2.0
     take_profit_pct: 4.0
@@ -264,6 +375,62 @@ brokerages:
   capital:
     demo: true
     leverage: 30
+  mt5:
+    demo: true
+    terminal_path: ''
+    server: ''
+    bridge_host: localhost
+    bridge_port: 5555
+    magic_number: 234000
+mt5:
+  enabled: false
+  demo: true
+  terminal_path: ''
+  server: ''
+  bridge_host: localhost
+  bridge_port: 5555
+  poll_interval_ms: 2000
+  tick_poll_interval_ms: 500
+  magic_number: 234000
+  pairs:
+  - EUR/USD
+  - GBP/USD
+  - USD/JPY
+  - USD/CHF
+  - AUD/USD
+  - NZD/USD
+  - USD/CAD
+  intervals:
+  - interval: 15m
+    weight: 0.4
+    sequence_length: 96
+  - interval: 1h
+    weight: 0.6
+    sequence_length: 60
+capital:
+  enabled: false  # Set to true when you have Capital.com credentials
+  demo: true
+  poll_interval_ms: 5000    # Candle close polling interval (ms)
+  tick_poll_interval_ms: 2000  # Tick/price polling interval (ms)
+  buffer_size: 5000         # Max candles to buffer per subscription
+  max_retries: 3            # API request retry count
+  # Set these environment variables:
+  # CAPITAL_API_KEY - your API key
+  # CAPITAL_EMAIL - your email/identifier
+  # CAPITAL_PASSWORD - your password
+  pairs:
+    - EUR/USD
+    - GBP/USD
+    - USD/JPY
+    - USD/CHF
+    - AUD/USD
+  intervals:
+    - interval: 1h
+      weight: 0.6
+      sequence_length: 60
+    - interval: 4h
+      weight: 0.4
+      sequence_length: 42
 forex:
   enabled: true
   broker: capital
@@ -333,3 +500,13 @@ strategy_analysis:
     default_lookback_days: 7
     min_lookback_days: 1
     max_lookback_days: 30
+confidence_gate:
+  min_threshold_clamp: 0.50
+  max_threshold_clamp: 0.95
+  max_history_size: 100
+performance_tracking:
+  min_signals_for_retrain_check: 20
+  win_rate_retrain_threshold: 0.45
+  initial_retrain_after_signals: 100
+  days_between_retrains: 30
+  min_signals_for_periodic_retrain: 50
