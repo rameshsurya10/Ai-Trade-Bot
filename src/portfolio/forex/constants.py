@@ -69,13 +69,8 @@ class CurrencyPairConfig:
         return self.symbol.replace("/", "_")
 
     @property
-    def capital_symbol(self) -> str:
-        """Convert to Capital.com format (EURUSD)."""
-        return self.symbol.replace("/", "")
-
-    @property
     def compact_symbol(self) -> str:
-        """Convert to compact format (EURUSD) - same as Capital.com/Binance."""
+        """Convert to compact format (EURUSD)."""
         return self.symbol.replace("/", "")
 
     def is_jpy_pair(self) -> bool:

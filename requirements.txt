@@ -12,8 +12,7 @@ pyyaml>=6.0,<7.0
 # DATA COLLECTION
 # =============================================================================
 ccxt>=4.0.0,<5.0.0              # Exchange API (Binance, Coinbase, etc.)
-capitalcom-python>=0.1.0        # Capital.com Forex API (REST + WebSocket)
-requests>=2.31.0,<3.0.0         # HTTP requests for CoinGecko API fallback
+requests>=2.31.0,<3.0.0         # HTTP requests (Twelve Data API, CoinGecko fallback)
 
 # =============================================================================
 # TECHNICAL ANALYSIS

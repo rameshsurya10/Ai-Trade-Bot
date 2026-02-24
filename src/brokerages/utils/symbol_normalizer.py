@@ -6,12 +6,11 @@ Normalize currency pair symbols between different formats.
 
 Formats:
 - Standard: "EUR/USD" (internal format)
-- Capital.com: "EURUSD" (no separator)
-- MT4/MT5: "EURUSD" (no separator)
+- Compact/MT4/MT5: "EURUSD" (no separator)
 - Underscore: "EUR_USD" (underscore separator)
 
 Usage:
-    from src.brokerages.utils import SymbolNormalizer, to_capital_format
+    from src.brokerages.utils import SymbolNormalizer
 
     normalizer = SymbolNormalizer()
 
@@ -19,13 +18,9 @@ Usage:
     standard = normalizer.to_standard("EURUSD")
     # Returns: "EUR/USD"
 
-    # Convert to Capital.com format
-    capital = normalizer.to_capital("EUR/USD")
+    # Convert to compact format (MT4/MT5)
+    compact = normalizer.to_compact("EUR/USD")
     # Returns: "EURUSD"
-
-    # Helper functions
-    capital_symbol = to_capital_format("EUR/USD")
-    standard_symbol = from_capital_format("EURUSD")
 """
 
 import logging
@@ -55,6 +50,7 @@ CURRENCY_CODES = {
     "AUD", "CAD", "NZD", "SGD", "HKD",
     "SEK", "NOK", "DKK", "PLN", "MXN",
     "ZAR", "TRY", "CNH", "INR",
+    "XAU", "XAG",  # Precious metals (traded as forex)
 }
 
 
@@ -64,9 +60,8 @@ class SymbolNormalizer:
 
     Supports conversion between:
     - Standard format: EUR/USD (slash separator)
-    - Capital.com format: EURUSD (no separator)
+    - Compact/MT4/MT5 format: EURUSD (no separator)
     - Underscore format: EUR_USD (underscore separator)
-    - MT4/MT5 format: EURUSD (no separator)
 
     Example:
         normalizer = SymbolNormalizer()
@@ -81,7 +76,7 @@ class SymbolNormalizer:
         """Initialize symbol normalizer."""
         self._cache: Dict[str, str] = {}
         self._reverse_cache: Dict[str, Dict[str, str]] = {
-            "capital": {},
+            "compact": {},
             "mt4": {},
             "underscore": {},
         }
@@ -111,22 +106,6 @@ class SymbolNormalizer:
         self._cache[cache_key] = result
         return result
 
-    def to_capital(self, symbol: str) -> str:
-        """
-        Convert to Capital.com format (EURUSD).
-
-        Args:
-            symbol: Symbol in any format
-
-        Returns:
-            Symbol in Capital.com format
-
-        Example:
-            to_capital("EUR/USD") -> "EURUSD"
-        """
-        standard = self.to_standard(symbol)
-        return standard.replace("/", "")
-
     def to_underscore(self, symbol: str) -> str:
         """
         Convert to underscore format (EUR_USD).
@@ -143,43 +122,30 @@ class SymbolNormalizer:
         standard = self.to_standard(symbol)
         return standard.replace("/", "_")
 
-    def to_mt4(self, symbol: str) -> str:
+    def to_compact(self, symbol: str) -> str:
         """
-        Convert to MT4/MT5 format (EURUSD).
+        Convert to compact/MT4/MT5 format (EURUSD).
 
         Args:
             symbol: Symbol in any format
 
         Returns:
-            Symbol in MT4 format
+            Symbol in compact format (no separator)
+
+        Example:
+            to_compact("EUR/USD") -> "EURUSD"
+        """
+        standard = self.to_standard(symbol)
+        return standard.replace("/", "")
+
+    def to_mt4(self, symbol: str) -> str:
+        """
+        Convert to MT4/MT5 format (EURUSD). Alias for to_compact().
 
         Example:
             to_mt4("EUR/USD") -> "EURUSD"
         """
-        return self.to_capital(symbol)
-
-    def to_compact(self, symbol: str) -> str:
-        """
-        Convert to compact format (EURUSD).
-
-        Same as Capital.com/MT4 format.
-        """
-        return self.to_capital(symbol)
-
-    def from_capital(self, symbol: str) -> str:
-        """
-        Convert from Capital.com format to standard.
-
-        Args:
-            symbol: Symbol in Capital.com format
-
-        Returns:
-            Symbol in standard format
-
-        Example:
-            from_capital("EURUSD") -> "EUR/USD"
-        """
-        return self.to_standard(symbol)
+        return self.to_compact(symbol)
 
     def from_underscore(self, symbol: str) -> str:
         """
@@ -300,34 +266,13 @@ def normalize_forex_symbol(symbol: str) -> str:
     return _normalizer.to_standard(symbol)
 
 
-def to_capital_format(symbol: str) -> str:
+def to_compact_format(symbol: str) -> str:
     """
-    Convert symbol to Capital.com format.
+    Convert symbol to compact/MT4 format (EURUSD).
 
     Convenience function using singleton normalizer.
-
-    Args:
-        symbol: Symbol in any format
-
-    Returns:
-        Symbol in Capital.com format (EURUSD)
     """
-    return _normalizer.to_capital(symbol)
-
-
-def from_capital_format(symbol: str) -> str:
-    """
-    Convert from Capital.com format to standard.
-
-    Convenience function using singleton normalizer.
-
-    Args:
-        symbol: Symbol in Capital.com format
-
-    Returns:
-        Symbol in standard format (EUR/USD)
-    """
-    return _normalizer.from_capital(symbol)
+    return _normalizer.to_compact(symbol)
 
 
 def to_underscore_format(symbol: str) -> str:

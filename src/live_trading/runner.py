@@ -38,9 +38,8 @@ from src.brokerages.orders import Order, OrderType, OrderSide, OrderStatus
 from src.brokerages.events import OrderEvent, OrderEventType
 from src.portfolio.manager import PortfolioManager, InsightDirection
 from src.portfolio.risk import RiskManager, RiskAction, MaximumDrawdownRisk, MaximumPositionSizeRisk
-from src.data.provider import UnifiedDataProvider, Tick, Candle
+from src.core.types import Candle, Tick
 from src.multi_currency_system import MultiCurrencySystem
-from src.data_service import DataService
 from src.news.collector import NewsCollector
 
 # CONTINUOUS LEARNING: Strategic Learning Bridge integrates continuous learning
@@ -196,9 +195,9 @@ class LiveTradingRunner:
 
         # Symbols and data providers
         self._symbols: Dict[str, TradingSymbol] = {}
-        self._provider: Optional[UnifiedDataProvider] = None
+        self._provider = None  # UnifiedDataProvider (lazy import)
         self._mt5_provider = None  # MT5DataProvider (lazy import)
-        self._capital_provider = None  # CapitalDataProvider (lazy import)
+        self._twelvedata_provider = None  # TwelveDataProvider (lazy import)
         self._forex_brokerage: Optional[BaseBrokerage] = None  # Separate brokerage for forex
         self._data_buffers: Dict[str, pd.DataFrame] = {}
 
@@ -306,6 +305,9 @@ class LiveTradingRunner:
             # Initialize components
             self._initialize_components()
 
+            # Pre-fill forex data from Twelve Data BEFORE training
+            self._backfill_forex_data()
+
             # Ensure models are ready (auto-train if needed)
             self._ensure_models_ready()
 
@@ -370,11 +372,11 @@ class LiveTradingRunner:
             self._mt5_provider = None
             logger.info("MT5 data provider stopped")
 
-        if self._capital_provider:
-            self._capital_provider.stop()
-            self._capital_provider.disconnect()
-            self._capital_provider = None
-            logger.info("Capital.com data provider stopped")
+        if self._twelvedata_provider:
+            self._twelvedata_provider.stop()
+            self._twelvedata_provider.disconnect()
+            self._twelvedata_provider = None
+            logger.info("Twelve Data provider stopped")
 
         # Wait for threads
         for thread in [self._main_thread, self._signal_thread, self._execution_thread]:
@@ -499,16 +501,16 @@ class LiveTradingRunner:
                 self._mt5_provider = None
                 self._forex_brokerage = None
 
-        # Capital.com Forex Components (if enabled)
-        capital_config = self.config.raw.get('capital', {})
-        if capital_config.get('enabled', False) and has_forex_symbols:
+        # Twelve Data Forex Components (if enabled)
+        twelvedata_config = self.config.raw.get('twelvedata', {})
+        if twelvedata_config.get('enabled', False) and has_forex_symbols:
             try:
-                from src.data.capital_provider import CapitalDataProvider
-                self._capital_provider = CapitalDataProvider(capital_config)
-                logger.info("Capital.com forex components initialized")
+                from src.data.twelvedata_provider import TwelveDataProvider
+                self._twelvedata_provider = TwelveDataProvider(twelvedata_config)
+                logger.info("Twelve Data forex components initialized")
             except Exception as e:
-                logger.warning(f"Failed to initialize Capital.com: {e}. Capital.com forex disabled.")
-                self._capital_provider = None
+                logger.warning(f"Failed to initialize Twelve Data: {e}. Twelve Data forex disabled.")
+                self._twelvedata_provider = None
 
         # Prediction System
         self._prediction_system = MultiCurrencySystem(self._config_path)
@@ -538,11 +540,86 @@ class LiveTradingRunner:
             predictor=self._prediction_system.advanced_predictor,  # Use AdvancedPredictor
             paper_brokerage=paper_brokerage,
             live_brokerage=live_brokerage,
-            config=self.config.raw  # Pass full config dict
+            config=self.config.raw,  # Pass full config dict
+            boosted_predictor=self._prediction_system.boosted_predictor
         )
 
         logger.info("Strategic Learning Bridge initialized - Continuous learning ENABLED")
         logger.info("Components initialized")
+
+    def _backfill_forex_data(self):
+        """
+        Pre-fill forex candle data from Twelve Data BEFORE model training.
+
+        The training pipeline reads candles from the database, so we must
+        populate the DB with historical data first. This connects to Twelve Data,
+        backfills all configured pairs/intervals, then leaves the provider
+        ready for later use in _start_streams().
+        """
+        if not self._twelvedata_provider:
+            return
+
+        td_config = self.config.raw.get('twelvedata', {})
+        if not td_config.get('enabled', False):
+            return
+
+        # Get forex symbols that use twelvedata
+        td_symbols = {
+            s: ts for s, ts in self._symbols.items()
+            if ts.market_type == "forex" and ts.exchange == "twelvedata"
+        }
+        if not td_symbols:
+            return
+
+        logger.info("=" * 70)
+        logger.info("PRE-TRAINING: Backfilling forex data from Twelve Data")
+        logger.info("=" * 70)
+
+        if not self._database:
+            logger.error("Database not initialized — cannot backfill forex data")
+            return
+
+        # Connect to Twelve Data API
+        if not self._twelvedata_provider.connect():
+            logger.error("Failed to connect Twelve Data for pre-training backfill")
+            return
+
+        # Get intervals from config
+        td_intervals = []
+        for tf_config in td_config.get('intervals', []):
+            interval = tf_config.get('interval')
+            if interval:
+                td_intervals.append(interval)
+        if not td_intervals:
+            td_intervals = ['1h']
+
+        # Set database so backfill saves candles + set symbol intervals for replay
+        self._twelvedata_provider.set_database(self._database)
+        for symbol, ts_obj in td_symbols.items():
+            if ts_obj.interval is None:
+                ts_obj.interval = td_intervals[0]
+
+        # Subscribe triggers backfill for each pair+interval
+        for symbol in td_symbols:
+            for interval in td_intervals:
+                self._twelvedata_provider.subscribe(symbol, interval=interval)
+                logger.info(f"[Pre-training] Backfilled {symbol} @ {interval}")
+
+        # Check how much data we got
+        min_candles = self.config.raw.get('auto_training', {}).get('min_candles', 1000)
+        for symbol in td_symbols:
+            for interval in td_intervals:
+                count_df = self._database.get_candles(symbol=symbol, interval=interval, limit=min_candles + 100)
+                count = len(count_df) if count_df is not None else 0
+                if count < min_candles:
+                    logger.warning(
+                        f"[Pre-training] {symbol} @ {interval}: only {count} candles "
+                        f"(need {min_candles}). Training may skip this symbol."
+                    )
+                else:
+                    logger.info(f"[Pre-training] {symbol} @ {interval}: {count} candles in DB (sufficient)")
+
+        logger.info("Pre-training forex backfill complete")
 
     def _ensure_models_ready(self):
         """
@@ -887,6 +964,38 @@ class LiveTradingRunner:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
+        # ===================================================================
+        # GRADIENT BOOSTING TRAINING (XGBoost + LightGBM per symbol)
+        # ===================================================================
+        if self._prediction_system and hasattr(self._prediction_system, 'boosted_predictor'):
+            boost_cfg = self.config.raw.get('boosting', {})
+            if boost_cfg.get('enabled', True):
+                logger.info("\n" + "=" * 70)
+                logger.info("TRAINING GRADIENT BOOSTING MODELS (XGBoost + LightGBM)")
+                logger.info("=" * 70)
+
+                for symbol in self._symbols:
+                    try:
+                        # Get historical data from database
+                        if self._database:
+                            candles = self._database.get_candles(symbol, interval='1h', limit=5000)
+                            if candles is not None and len(candles) >= boost_cfg.get('min_samples', 500):
+                                boost_acc = self._prediction_system.boosted_predictor.fit(
+                                    candles, symbol
+                                )
+                                if boost_acc > 0:
+                                    logger.info(
+                                        f"[{symbol}] Boosted ensemble accuracy: {boost_acc:.2%}"
+                                    )
+                            else:
+                                count = len(candles) if candles is not None else 0
+                                logger.warning(
+                                    f"[{symbol}] Not enough data for boosting: "
+                                    f"{count} < {boost_cfg.get('min_samples', 500)}"
+                                )
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] Boosted training failed: {e}")
+
         # Final summary
         logger.info("\n" + "=" * 70)
         logger.info("MODEL TRAINING COMPLETE - READINESS SUMMARY")
@@ -938,7 +1047,7 @@ class LiveTradingRunner:
             return
 
         replay_days = replay_config.get('days', 30)
-        replay_interval = replay_config.get('interval', '15m')
+        default_replay_interval = replay_config.get('interval', '15m')
         batch_log_interval = replay_config.get('log_every', 100)
 
         # Clean stale pending signals from previous sessions
@@ -957,18 +1066,29 @@ class LiveTradingRunner:
             learning_sys.replay_mode = True
             logger.info("Replay mode ON — trades and retraining suppressed (predictions + online updates active)")
 
-        # Calculate expected candle count
         interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440}
-        minutes_per_candle = interval_minutes.get(replay_interval, 15)
-        expected_candles = (replay_days * 24 * 60) // minutes_per_candle
 
         logger.info("=" * 70)
-        logger.info(f"HISTORICAL REPLAY - Learning from {replay_days} days of {replay_interval} candles")
-        logger.info(f"Expected candles: ~{expected_candles}")
+        logger.info(f"HISTORICAL REPLAY - Learning from {replay_days} days of data")
         logger.info("=" * 70)
 
         for symbol in self._symbols.keys():
             try:
+                ts = self._symbols[symbol]
+
+                # Use symbol's primary interval for forex (they only have 1h data)
+                # Crypto symbols use the default replay interval (15m)
+                if ts.market_type == "forex":
+                    replay_interval = ts.interval or '1h'
+                else:
+                    replay_interval = default_replay_interval
+
+                # Calculate expected candle count for this interval
+                minutes_per_candle = interval_minutes.get(replay_interval, 15)
+                expected_candles = (replay_days * 24 * 60) // minutes_per_candle
+
+                logger.info(f"[{symbol}] Replaying {replay_interval} candles (~{expected_candles} expected)")
+
                 # Step 1: Fetch historical candles from database
                 candles_df = self._database.get_candles(
                     symbol=symbol,
@@ -978,24 +1098,31 @@ class LiveTradingRunner:
 
                 if candles_df is None or len(candles_df) < 50:
                     db_count = len(candles_df) if candles_df is not None else 0
-                    logger.warning(
-                        f"[{symbol}] Insufficient data in database ({db_count} candles). "
-                        f"Fetching from exchange..."
-                    )
-                    # Fall back to exchange fetch
-                    if self._provider is None:
-                        self._provider = UnifiedDataProvider.get_instance(self._config_path)
-                    ts = self._symbols[symbol]
-                    candles_df = self._provider.fetch_historical(
-                        symbol=symbol,
-                        exchange=ts.exchange,
-                        interval=replay_interval,
-                        limit=min(expected_candles, 1000)
-                    )
-                    if candles_df is not None and not candles_df.empty:
-                        self._database.save_candles(
-                            candles_df, symbol=symbol, interval=replay_interval
+                    # Fall back to exchange fetch (crypto only — forex data comes from Twelve Data backfill)
+                    if ts.market_type == "forex":
+                        logger.warning(
+                            f"[{symbol}] Insufficient forex data ({db_count} candles). "
+                            f"Ensure Twelve Data backfill completed successfully."
                         )
+                    else:
+                        logger.warning(
+                            f"[{symbol}] Insufficient data in database ({db_count} candles). "
+                            f"Fetching from exchange..."
+                        )
+                    if ts.market_type != "forex":
+                        if self._provider is None:
+                            from src.data.provider import UnifiedDataProvider
+                            self._provider = UnifiedDataProvider.get_instance(self._config_path)
+                        candles_df = self._provider.fetch_historical(
+                            symbol=symbol,
+                            exchange=ts.exchange,
+                            interval=replay_interval,
+                            limit=min(expected_candles, 1000)
+                        )
+                        if candles_df is not None and not candles_df.empty:
+                            self._database.save_candles(
+                                candles_df, symbol=symbol, interval=replay_interval
+                            )
 
                 if candles_df is None or len(candles_df) < 50:
                     logger.warning(f"[{symbol}] Still insufficient data, skipping replay")
@@ -1122,6 +1249,7 @@ class LiveTradingRunner:
         # ---- Start crypto streams (existing CCXT/Binance provider) ----
         if crypto_symbols:
             try:
+                from src.data.provider import UnifiedDataProvider
                 self._provider = UnifiedDataProvider.get_instance(self._config_path)
 
                 for symbol, ts in crypto_symbols.items():
@@ -1184,46 +1312,42 @@ class LiveTradingRunner:
             except Exception as e:
                 logger.error(f"Failed to start MT5 data provider: {e}")
 
-        # ---- Start Capital.com forex streams ----
-        if forex_symbols and self._capital_provider:
-            # Filter forex symbols routed to Capital.com (exchange=="capital")
-            capital_forex = {s: ts for s, ts in forex_symbols.items() if ts.exchange == "capital"}
-            if capital_forex:
+        # ---- Start Twelve Data forex streams ----
+        if forex_symbols and self._twelvedata_provider:
+            td_forex = {s: ts for s, ts in forex_symbols.items() if ts.exchange == "twelvedata"}
+            if td_forex:
                 try:
-                    # Get Capital.com-specific intervals from config
-                    capital_config = self.config.raw.get('capital', {})
-                    capital_intervals = []
-                    for tf_config in capital_config.get('intervals', []):
+                    td_config = self.config.raw.get('twelvedata', {})
+                    td_intervals = []
+                    for tf_config in td_config.get('intervals', []):
                         interval = tf_config.get('interval')
                         if interval:
-                            capital_intervals.append(interval)
-                    if not capital_intervals:
-                        capital_intervals = enabled_intervals
+                            td_intervals.append(interval)
+                    if not td_intervals:
+                        td_intervals = enabled_intervals
 
-                    # Connect Capital.com
-                    if not self._capital_provider.connect():
-                        logger.error("Failed to connect Capital.com data provider")
+                    if not self._twelvedata_provider.connect():
+                        logger.error("Failed to connect Twelve Data provider")
                     else:
-                        for symbol, ts in capital_forex.items():
+                        for symbol, ts in td_forex.items():
                             if not ts.enabled:
                                 continue
-                            for interval in capital_intervals:
-                                self._capital_provider.subscribe(symbol, interval=interval)
-                                logger.info(f"[Forex/Capital] Subscribed to {symbol} @ {interval}")
-                            ts.interval = capital_intervals[0]
+                            for interval in td_intervals:
+                                self._twelvedata_provider.subscribe(symbol, interval=interval)
+                                logger.info(f"[Forex/TwelveData] Subscribed to {symbol} @ {interval}")
+                            ts.interval = td_intervals[0]
                             self._initialize_buffer(symbol, ts)
 
-                        # Same callback for all providers
-                        self._capital_provider.on_candle_closed(self._handle_candle_callback)
+                        self._twelvedata_provider.on_candle_closed(self._handle_candle_callback)
 
                         if self._database:
-                            self._capital_provider.set_database(self._database)
+                            self._twelvedata_provider.set_database(self._database)
 
-                        self._capital_provider.start()
-                        logger.info("CapitalDataProvider started (forex)")
+                        self._twelvedata_provider.start()
+                        logger.info("TwelveDataProvider started (forex)")
 
                 except Exception as e:
-                    logger.error(f"Failed to start Capital.com data provider: {e}")
+                    logger.error(f"Failed to start Twelve Data provider: {e}")
 
         # ---- Connect forex brokerage ----
         if forex_symbols and self._forex_brokerage:

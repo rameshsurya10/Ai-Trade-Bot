@@ -130,7 +130,25 @@
       "Bash(# Look for what happens AROUND the rejection - full context cat /proc/59830/fd/1)",
       "Bash(venv/bin/ruff check:*)",
       "Bash(# Kill old bot instance kill 59830 && sleep 2 && echo \"\"Killed\"\" || echo \"\"Already gone\"\" # Verify it''s dead ps aux)",
-      "Bash(timeout 15 strace:*)"
+      "Bash(timeout 15 strace:*)",
+      "Bash(git check-ignore:*)",
+      "WebFetch(domain:finnhub.io)",
+      "WebFetch(domain:twelvedata.com)",
+      "WebFetch(domain:open-api.capital.com)",
+      "WebFetch(domain:newsapi.org)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --oneline --follow -- \"src/data/provider.py\")",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --oneline --diff-filter=D -- \"src/data/provider.py\")",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot show HEAD:src/data/provider.py)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot log --all --oneline --diff-filter=D -- \"src/data/provider.py\")",
+      "Bash(# The import is: from src.data.provider import UnifiedDataProvider, Tick, Candle # but provider.py doesn''t exist. Let''s see what the git status is to understand state git -C /home/development1/Desktop/Ai-Trade-Bot status)",
+      "Bash(# The import says: from src.data.provider import UnifiedDataProvider, Tick, Candle # but provider.py doesn''t exist. Check what the committed version of runner.py imports vs the modified one git -C /home/development1/Desktop/Ai-Trade-Bot diff HEAD src/live_trading/runner.py)",
+      "Bash(# Check the committed version of runner.py import line for UnifiedDataProvider git -C /home/development1/Desktop/Ai-Trade-Bot show HEAD:src/live_trading/runner.py)",
+      "Bash(# Check if there''s still a provider.py somewhere in commit history / in a different location git -C /home/development1/Desktop/Ai-Trade-Bot log --all --oneline)",
+      "Bash(git -C /home/development1/Desktop/Ai-Trade-Bot show HEAD:src/live_trading/runner.py)",
+      "Bash(# Both HEAD and current runner.py import from src.data.provider which doesn''t exist as a .py file # Check if it''s installed as a package or if there''s something in __pycache__ ls /home/development1/Desktop/Ai-Trade-Bot/src/__pycache__/)",
+      "Bash(git log:*)",
+      "Bash(xxd:*)",
+      "Bash(tee:*)"
     ]
   }
 }

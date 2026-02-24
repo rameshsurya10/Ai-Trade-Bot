@@ -684,24 +684,24 @@ class TestConfidenceGateEdgeCases:
         """Test exact boundary values (80%, 75%)."""
         gate = ConfidenceGate()
 
-        # Exactly at threshold
-        can_trade, _ = gate.should_trade(0.80, 'LEARNING', 'NORMAL')
+        # Exactly at threshold (0.65)
+        can_trade, _ = gate.should_trade(0.65, 'LEARNING', 'NORMAL')
         assert can_trade is True  # Should trade at exact threshold
 
-        # Exactly at exit threshold
-        can_trade, _ = gate.should_trade(0.75, 'TRADING', 'NORMAL')
+        # Exactly at exit threshold (0.65 - 0.05 = 0.60)
+        can_trade, _ = gate.should_trade(0.60, 'TRADING', 'NORMAL')
         assert can_trade is True  # Should maintain at exact exit threshold (not below)
 
         # Just below exit threshold
-        can_trade, _ = gate.should_trade(0.749, 'TRADING', 'NORMAL')
+        can_trade, _ = gate.should_trade(0.599, 'TRADING', 'NORMAL')
         assert can_trade is False
 
     def test_invalid_mode_defaults_to_learning(self):
         """Test invalid mode is handled gracefully."""
         gate = ConfidenceGate()
-        can_trade, _ = gate.should_trade(0.85, 'INVALID_MODE', 'NORMAL')
+        can_trade, _ = gate.should_trade(0.70, 'INVALID_MODE', 'NORMAL')
         # Should default to LEARNING mode behavior
-        assert can_trade is True  # 85% > 80% threshold
+        assert can_trade is True  # 70% > 65% threshold
 
     def test_trending_easier_threshold(self):
         """Test TRENDING regime lowers threshold."""
@@ -846,11 +846,11 @@ class TestLearningPipelineIntegration:
         mode = state_mgr.get_current_mode(symbol, interval)
         assert mode == 'LEARNING'
 
-        can_trade, reason = gate.should_trade(0.60, mode, 'NORMAL')
-        assert can_trade is False  # Below 80%
+        can_trade, reason = gate.should_trade(0.50, mode, 'NORMAL')
+        assert can_trade is False  # Below 65%
 
         # Phase 2: Model improves, enters TRADING mode
-        can_trade, reason = gate.should_trade(0.85, mode, 'NORMAL')
+        can_trade, reason = gate.should_trade(0.70, mode, 'NORMAL')
         assert can_trade is True
         state_mgr.transition_to_trading(symbol, interval, 0.85)
 
@@ -913,9 +913,10 @@ class TestLearningPipelineIntegration:
         assert outcome_result['pnl_percent'] < 0
 
         # Phase 5: After loss, confidence drops, back to LEARNING
-        can_trade, _ = gate.should_trade(0.70, 'TRADING', 'NORMAL')
+        # Exit threshold = 0.65 - 0.05 = 0.60, so 0.55 triggers exit
+        can_trade, _ = gate.should_trade(0.55, 'TRADING', 'NORMAL')
         assert can_trade is False
-        state_mgr.transition_to_learning(symbol, interval, "Loss detected", 0.70)
+        state_mgr.transition_to_learning(symbol, interval, "Loss detected", 0.55)
 
         final_mode = state_mgr.get_current_mode(symbol, interval, use_cache=False)
         assert final_mode == 'LEARNING'

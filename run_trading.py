@@ -37,7 +37,7 @@ def main():
     print("  ✅ Automatic retraining when accuracy drops")
     print("  ✅ Multi-timeframe analysis (15m, 1h, 4h, 1d)")
     print("  ✅ Strategy discovery and comparison")
-    print("  ✅ Dual-market: Crypto (Binance) + Forex (Capital.com / MT5)")
+    print("  ✅ Crypto (Binance) + Forex/Metals (Twelve Data)")
     print()
 
     # Initialize runner
@@ -47,33 +47,22 @@ def main():
         mode=TradingMode.PAPER  # Change to LIVE when ready for real trading
     )
 
+    config = Config.load("config.yaml")
+
     # Add crypto symbols (Binance)
-    print("Adding crypto symbols...")
+    print("Adding crypto symbols (Binance)...")
     runner.add_symbol("BTC/USDT", exchange="binance", interval="1h")
     runner.add_symbol("ETH/USDT", exchange="binance", interval="1h")
 
-    # Add forex symbols (MT5) - requires MT5 terminal + demo account
-    config = Config.load("config.yaml")
-    if config.mt5.enabled:
-        print("Adding forex symbols (MT5)...")
-        runner.add_symbol("EUR/USD", exchange="mt5", interval="1h")
-        runner.add_symbol("GBP/USD", exchange="mt5", interval="1h")
-        runner.add_symbol("USD/JPY", exchange="mt5", interval="1h")
-        runner.add_symbol("USD/CHF", exchange="mt5", interval="1h")
-        runner.add_symbol("AUD/USD", exchange="mt5", interval="1h")
-        runner.add_symbol("NZD/USD", exchange="mt5", interval="1h")
-        runner.add_symbol("USD/CAD", exchange="mt5", interval="1h")
+    # Add forex/metals symbols from Twelve Data config
+    twelvedata_config = config.raw.get('twelvedata', {})
+    if twelvedata_config.get('enabled', False):
+        print("Adding forex/metals symbols (Twelve Data)...")
+        for pair in twelvedata_config.get('pairs', ['EUR/USD', 'XAU/USD']):
+            runner.add_symbol(pair, exchange="twelvedata", interval="1h")
+            print(f"  + {pair}")
     else:
-        print("MT5 disabled in config, skipping forex symbols")
-
-    # Add forex symbols (Capital.com) - REST API, works on Linux
-    capital_config = config.raw.get('capital', {})
-    if capital_config.get('enabled', False):
-        print("Adding forex symbols (Capital.com)...")
-        for pair in capital_config.get('pairs', ['EUR/USD', 'GBP/USD', 'USD/JPY']):
-            runner.add_symbol(pair, exchange="capital", interval="1h")
-    else:
-        print("Capital.com disabled in config, skipping Capital.com forex")
+        print("Twelve Data disabled in config")
 
     print()
     print("="*70)
@@ -82,7 +71,7 @@ def main():
     print()
     print("What happens now:")
     print("  1. Loads/trains models for all symbols and timeframes")
-    print("  2. Connects to Binance WebSocket (crypto) + MT5 terminal (forex)")
+    print("  2. Connects to Binance WebSocket (crypto) + Twelve Data REST (forex)")
     print("  3. Makes predictions on every candle close")
     print("  4. Executes paper trades when confidence is high")
     print("  5. Records outcomes and retrains when needed")

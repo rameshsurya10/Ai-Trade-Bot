@@ -57,7 +57,8 @@ class ContinuousLearningSystem:
         database: Database,
         paper_brokerage: any,
         live_brokerage: any = None,
-        config: dict = None
+        config: dict = None,
+        boosted_predictor: any = None
     ):
         """
         Initialize continuous learning system.
@@ -68,12 +69,14 @@ class ContinuousLearningSystem:
             paper_brokerage: Paper trading brokerage
             live_brokerage: Live trading brokerage (optional)
             config: Configuration dict from config.yaml
+            boosted_predictor: BoostedPredictor instance (optional)
         """
         self.predictor = predictor
         self.database = database
         self.paper_brokerage = paper_brokerage
         self.live_brokerage = live_brokerage
         self.config = config or {}
+        self.boosted_predictor = boosted_predictor
 
         # Get configurations
         self.cl_config = self.config.get('continuous_learning', {})
@@ -303,7 +306,7 @@ class ContinuousLearningSystem:
             )
 
             # 6. DETERMINE MODE AND BROKERAGE
-            if can_trade_live and aggregated.confidence >= self.cl_config.get('confidence', {}).get('trading_threshold', 0.80):
+            if can_trade_live and aggregated.confidence >= self.cl_config.get('confidence', {}).get('trading_threshold', 0.65):
                 mode = 'TRADING'
                 brokerage = self.live_brokerage if self.live_brokerage else self.paper_brokerage
                 brokerage_type = 'live' if self.live_brokerage else 'paper_fallback'
@@ -548,12 +551,38 @@ class ContinuousLearningSystem:
                 else:
                     logger.debug(f"[{symbol}@{interval}] No model_manager on predictor")
 
+                # Blend LSTM + boosted prediction (same logic as MultiCurrencySystem.predict)
+                has_boost = False
+                boost_prob = 0.5
+                if self.boosted_predictor is not None:
+                    try:
+                        if self.boosted_predictor.is_symbol_fitted(symbol):
+                            boost_prob = self.boosted_predictor.predict(df, symbol)
+                            has_boost = True
+                    except Exception as e:
+                        logger.debug(f"Boosted prediction failed for {symbol}: {e}")
+
+                boost_cfg = self.config.get('boosting', {})
+                boost_weight = boost_cfg.get('ensemble_weight', 0.6)
+                lstm_weight = 1.0 - boost_weight
+
+                has_lstm = lstm_prob != 0.5
+
+                if has_lstm and has_boost:
+                    combined_prob = lstm_weight * lstm_prob + boost_weight * boost_prob
+                elif has_boost:
+                    combined_prob = boost_prob
+                elif has_lstm:
+                    combined_prob = lstm_prob
+                else:
+                    combined_prob = 0.5
+
                 # Get prediction from model
                 result = self.predictor.predict(
                     df=df,
                     symbol=symbol,
                     interval=interval,
-                    lstm_probability=lstm_prob
+                    lstm_probability=combined_prob
                 )
 
                 # Create TimeframeSignal

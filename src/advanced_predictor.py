@@ -770,9 +770,25 @@ class AdvancedPredictor:
             prediction_validator: PredictionValidator instance for streak tracking
             config: Full application config dict for calibration settings
         """
-        self.weights = weights or self.DEFAULT_WEIGHTS.copy()
         self.prediction_validator = prediction_validator
         self.config = config or {}
+
+        # Load ensemble weights from config (or use explicit weights, or defaults)
+        if weights is not None:
+            self.weights = weights
+        else:
+            ens_weights_cfg = self.config.get('prediction', {}).get('ensemble', {}).get('weights', {})
+            if ens_weights_cfg:
+                self.weights = {
+                    'lstm': ens_weights_cfg.get('lstm', 0.35),
+                    'fourier': ens_weights_cfg.get('fourier', 0.15),
+                    'kalman': ens_weights_cfg.get('kalman', 0.20),
+                    'markov': ens_weights_cfg.get('markov', 0.15),
+                    'entropy': ens_weights_cfg.get('entropy', 0.10),
+                    'monte_carlo': ens_weights_cfg.get('monte_carlo', 0.05),
+                }
+            else:
+                self.weights = self.DEFAULT_WEIGHTS.copy()
 
         # Confidence calibration from config
         pred_config = self.config.get('prediction', {})

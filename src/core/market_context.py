@@ -17,7 +17,7 @@ class MarketType(Enum):
 
 
 # Exchanges that are explicitly forex
-_FOREX_EXCHANGES = {"mt5", "metatrader5", "capital", "oanda", "fxcm"}
+_FOREX_EXCHANGES = {"mt5", "metatrader5", "twelvedata", "oanda", "fxcm"}
 
 # Exchanges that are explicitly crypto
 _CRYPTO_EXCHANGES = {"binance", "coinbase", "kraken", "bybit", "okx", "kucoin"}

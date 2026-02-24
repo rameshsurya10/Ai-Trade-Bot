@@ -1,7 +1,9 @@
-market_mode: crypto
+market_mode: both
 symbols:
 - BTC/USDT
 - ETH/USDT
+- EUR/USD
+- XAU/USD
 exchange: binance
 data:
   symbol: BTC/USDT
@@ -124,8 +126,8 @@ news:
     min_articles: 1
 currencies: null
 prediction:
-  confidence_floor: 0.50
-  confidence_ceiling: 0.60
+  confidence_floor: 0.45
+  confidence_ceiling: 0.65
   regime_penalties:
     TRENDING: 1.0
     NORMAL: 1.0
@@ -191,7 +193,16 @@ prediction:
     annualization_factor: 252
 
   ensemble:
-    symmetric_confidence: true
+    symmetric_confidence: false
+    # Ensemble weights: 'lstm' slot carries blended LSTM+boosting signal
+    # Give ML models dominant weight since math algos average ~0.50
+    weights:
+      lstm: 0.55          # LSTM + XGBoost/LightGBM blend (the trained ML signal)
+      fourier: 0.10       # Cycle detection (supplementary)
+      kalman: 0.15        # Trend following (useful signal)
+      markov: 0.10        # State transitions (supplementary)
+      entropy: 0.05       # Regime detection (minor)
+      monte_carlo: 0.05   # Risk simulation (minor)
     sentiment_weight: 0.05
     sentiment_1h_weight: 0.6
     sentiment_6h_weight: 0.4
@@ -372,9 +383,6 @@ brokerages:
     testnet: false
   alpaca:
     paper: true
-  capital:
-    demo: true
-    leverage: 30
   mt5:
     demo: true
     terminal_path: ''
@@ -407,50 +415,54 @@ mt5:
   - interval: 1h
     weight: 0.6
     sequence_length: 60
-capital:
-  enabled: false  # Set to true when you have Capital.com credentials
-  demo: true
-  poll_interval_ms: 5000    # Candle close polling interval (ms)
-  tick_poll_interval_ms: 2000  # Tick/price polling interval (ms)
-  buffer_size: 5000         # Max candles to buffer per subscription
-  max_retries: 3            # API request retry count
-  # Set these environment variables:
-  # CAPITAL_API_KEY - your API key
-  # CAPITAL_EMAIL - your email/identifier
-  # CAPITAL_PASSWORD - your password
+# Gradient Boosting (XGBoost + LightGBM) ensemble
+boosting:
+  enabled: true
+  xgboost:
+    n_estimators: 200
+    max_depth: 6
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 3
+  lightgbm:
+    n_estimators: 200
+    num_leaves: 31
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_samples: 20
+  ensemble_weight: 0.6   # Boosting weight in LSTM+Boosting blend (LSTM gets 1-this)
+  min_samples: 500       # Minimum candles required to train
+  retrain_interval: 168  # Hours between retraining (1 week)
+
+twelvedata:
+  enabled: true
+  backfill_count: 1200
+  buffer_size: 5000
   pairs:
     - EUR/USD
-    - GBP/USD
-    - USD/JPY
-    - USD/CHF
-    - AUD/USD
+    - XAU/USD
   intervals:
     - interval: 1h
       weight: 0.6
       sequence_length: 60
-    - interval: 4h
-      weight: 0.4
-      sequence_length: 42
+  polling:
+    divisor: 5          # Poll interval = candle_interval / divisor (1h/5 = 12 min)
+    min_seconds: 8      # Minimum seconds between API calls
+    max_seconds: 720    # Maximum seconds between polls
+  rate_limit:
+    per_minute: 8       # Free tier: 8 requests/minute
+    per_day: 800        # Free tier: 800 requests/day
+    warn_threshold: 700 # Log warning when daily calls reach this
 forex:
   enabled: true
-  broker: capital
+  broker: twelvedata
   pairs:
     majors:
     - EUR/USD
-    - GBP/USD
-    - USD/JPY
-    - USD/CHF
-    - AUD/USD
-    - USD/CAD
-    - NZD/USD
-    crosses:
-    - EUR/GBP
-    - EUR/JPY
-    - GBP/JPY
-    - EUR/CHF
-    - EUR/AUD
-    - AUD/JPY
-    - CHF/JPY
+    metals:
+    - XAU/USD
   leverage:
     default: 50
     majors: 50

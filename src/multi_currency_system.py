@@ -33,6 +33,7 @@ import yaml
 from src.analysis_engine import LSTMModel, FeatureCalculator
 from src.data_service import DataService, CachedData
 from src.advanced_predictor import AdvancedPredictor
+from src.ml.boosted_predictor import BoostedPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ _CACHE_LOCK = threading.Lock()
 class CurrencyConfig:
     """Configuration for a single currency pair."""
     symbol: str  # e.g., "EUR/USD", "BTC/USD"
-    exchange: str  # e.g., "capital", "binance", "coinbase"
+    exchange: str  # e.g., "twelvedata", "binance", "mt5"
     interval: str  # e.g., "1h", "4h"
     model_path: str  # Path to trained model
     enabled: bool = True
@@ -420,6 +421,7 @@ class MultiCurrencySystem:
         self.auto_trainer = AutoTrainer(self.model_manager, self.config.get('model', {}))
         self.advanced_predictor = AdvancedPredictor(config=self.config)
         self.advanced_predictor.set_model_manager(self.model_manager)
+        self.boosted_predictor = BoostedPredictor(config=self.config)
 
         # Currency configurations
         self.currencies: Dict[str, CurrencyConfig] = {}
@@ -459,7 +461,7 @@ class MultiCurrencySystem:
 
         Args:
             symbol: Currency pair (e.g., "BTC/USD", "EUR/USD")
-            exchange: Exchange name (coinbase, binance, capital)
+            exchange: Exchange name (binance, twelvedata, mt5)
             interval: Candle interval
         """
         currency_config = CurrencyConfig(
@@ -594,10 +596,36 @@ class MultiCurrencySystem:
                 except Exception as e:
                     logger.error(f"LSTM prediction failed for {symbol}: {e}")
 
+            # Get gradient boosting prediction (XGBoost + LightGBM)
+            has_boost = False
+            boost_prob = 0.5
+            if self.boosted_predictor.is_symbol_fitted(symbol):
+                try:
+                    boost_prob = self.boosted_predictor.predict(df, symbol)
+                    has_boost = True
+                except Exception as e:
+                    logger.debug(f"Boosted prediction failed for {symbol}: {e}")
+
+            # Blend LSTM + boosting (boosting gets higher weight — it's more accurate)
+            boost_cfg = self.config.get('boosting', {})
+            boost_weight = boost_cfg.get('ensemble_weight', 0.6)
+            lstm_weight = 1.0 - boost_weight
+
+            has_lstm = model is not None and lstm_prob != 0.5
+
+            if has_lstm and has_boost:
+                combined_prob = lstm_weight * lstm_prob + boost_weight * boost_prob
+            elif has_boost:
+                combined_prob = boost_prob
+            elif has_lstm:
+                combined_prob = lstm_prob
+            else:
+                combined_prob = 0.5
+
             # Get advanced mathematical prediction
             atr = (df['high'] - df['low']).rolling(14).mean().iloc[-1]
             advanced_result = self.advanced_predictor.predict(
-                df=df, symbol=symbol, lstm_probability=lstm_prob, atr=atr
+                df=df, symbol=symbol, lstm_probability=combined_prob, atr=atr
             )
 
             # Build result
@@ -616,6 +644,8 @@ class MultiCurrencySystem:
                 # Mathematical breakdown (transparency)
                 'components': {
                     'lstm_probability': lstm_prob,
+                    'boosted_probability': boost_prob,
+                    'combined_probability': combined_prob,
                     'fourier_signal': advanced_result.fourier_signal,
                     'kalman_trend': advanced_result.kalman_trend,
                     'entropy_regime': advanced_result.entropy_regime,
@@ -785,19 +815,19 @@ MULTI_CURRENCY_CONFIG = """
 # Add this to your config.yaml or use as separate file
 
 currencies:
-  # Forex pairs (use with Capital.com, etc.)
+  # Forex pairs (use with Twelve Data, MT5, etc.)
   - symbol: "EUR/USD"
-    exchange: "capital"
+    exchange: "twelvedata"
     interval: "1h"
     enabled: true
 
   - symbol: "GBP/USD"
-    exchange: "capital"
+    exchange: "twelvedata"
     interval: "1h"
     enabled: true
 
   - symbol: "USD/JPY"
-    exchange: "capital"
+    exchange: "twelvedata"
     interval: "1h"
     enabled: false  # Disabled example
 

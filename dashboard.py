@@ -3616,39 +3616,34 @@ def page_forex_markets():
 
     st.markdown("---")
 
-    # Capital.com connection status
-    st.markdown("### Capital.com Connection")
+    # Twelve Data connection status
+    st.markdown("### Twelve Data Connection")
 
-    capital_key = os.getenv("CAPITAL_API_KEY", "")
-    capital_email = os.getenv("CAPITAL_EMAIL", "")
+    td_key = os.getenv("TWELVE_DATA_API_KEY", "")
 
-    if capital_key and capital_email:
-        st.success("Capital.com credentials configured")
+    if td_key and td_key != "your_twelve_data_key_here":
+        st.success("Twelve Data API key configured")
 
-        if st.button("Test Capital.com Connection"):
+        if st.button("Test Twelve Data Connection"):
             try:
-                from src.brokerages.capital import CapitalBrokerage
-                broker = CapitalBrokerage(demo=True)
-                if broker.connect():
-                    summary = broker.get_account_summary()
+                from src.data.twelvedata_provider import TwelveDataProvider
+                provider = TwelveDataProvider({'enabled': True})
+                if provider.connect():
+                    status = provider.get_status()
                     st.success(f"""
-                    **Connected to Capital.com**
+                    **Connected to Twelve Data**
 
-                    Account ID: {summary.get('id', 'N/A')}
+                    Status: Connected
 
-                    Balance: ${summary.get('balance', 0):,.2f}
-
-                    Available: ${summary.get('available', 0):,.2f}
-
-                    Profit/Loss: ${summary.get('profit_loss', 0):,.2f}
+                    Daily calls remaining: {status.get('calls_remaining', 'N/A')}
                     """)
-                    broker.disconnect()
+                    provider.disconnect()
                 else:
-                    st.error("Failed to connect to Capital.com")
+                    st.error("Failed to connect to Twelve Data. Check your API key.")
             except Exception as e:
                 st.error(f"Connection error: {e}")
     else:
-        st.warning("Capital.com credentials not configured. Set CAPITAL_API_KEY, CAPITAL_EMAIL, and CAPITAL_PASSWORD in .env")
+        st.warning("Twelve Data API key not configured. Set TWELVE_DATA_API_KEY in .env")
 
     # Trading session info
     st.markdown("---")
@@ -4574,7 +4569,7 @@ def page_settings():
         # Market Mode Selection
         st.markdown("##### Market Mode")
         current_market_mode = config.get('market_mode', 'crypto')
-        market_modes = {'Cryptocurrency (Binance)': 'crypto', 'Forex (Capital.com)': 'forex'}
+        market_modes = {'Cryptocurrency (Binance)': 'crypto', 'Forex (Twelve Data)': 'forex'}
         market_mode_labels = list(market_modes.keys())
         current_mode_label = [k for k, v in market_modes.items() if v == current_market_mode]
         current_mode_label = current_mode_label[0] if current_mode_label else market_mode_labels[0]
@@ -4601,17 +4596,15 @@ def page_settings():
                 symbol_options = crypto_symbols
                 st.info("📈 **Crypto Mode**: Trading on Binance exchange")
             else:  # forex
-                exchange_options = ['capital']
+                exchange_options = ['twelvedata']
                 forex_symbols = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD',
                                 'USD/CAD', 'NZD/USD', 'EUR/GBP', 'EUR/JPY', 'GBP/JPY']
                 symbol_options = forex_symbols
-                st.info("💱 **Forex Mode**: Trading on Capital.com (requires API key)")
+                st.info("💱 **Forex Mode**: Data via Twelve Data API (requires API key)")
 
-                # Check for Capital.com credentials
-                capital_key = os.getenv("CAPITAL_API_KEY", "")
-                capital_email = os.getenv("CAPITAL_EMAIL", "")
-                if not capital_key or capital_key == "your_capital_api_key_here" or not capital_email or capital_email == "your_capital_email_here":
-                    st.warning("⚠️ **Capital.com credentials not configured.** Set CAPITAL_API_KEY and CAPITAL_EMAIL in your .env file to enable forex trading.")
+                td_key = os.getenv("TWELVE_DATA_API_KEY", "")
+                if not td_key or td_key == "your_twelve_data_key_here":
+                    st.warning("⚠️ **Twelve Data API key not configured.** Set TWELVE_DATA_API_KEY in your .env file to enable forex data.")
 
             current_symbol = config.get('data', {}).get('symbol', symbol_options[0])
             if current_symbol not in symbol_options:

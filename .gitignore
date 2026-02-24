@@ -3,6 +3,9 @@
 # =============================================================================
 # SECURITY - Never commit these!
 # =============================================================================
+.env
+.env.*
+!.env.example
 config.yaml          # Contains credentials - use config.example.yaml as template
 *.pem
 *.key

@@ -121,7 +121,8 @@ class StrategicLearningBridge:
         predictor: any,  # UnbreakablePredictor or AdvancedPredictor
         paper_brokerage: BaseBrokerage,
         live_brokerage: Optional[BaseBrokerage] = None,
-        config: dict = None
+        config: dict = None,
+        boosted_predictor: any = None
     ):
         """
         Initialize Strategic Learning Bridge.
@@ -132,6 +133,7 @@ class StrategicLearningBridge:
             paper_brokerage: Paper trading brokerage
             live_brokerage: Live trading brokerage (optional)
             config: Configuration dict from config.yaml
+            boosted_predictor: BoostedPredictor instance (optional)
         """
         self.database = database
         self.predictor = predictor
@@ -146,7 +148,8 @@ class StrategicLearningBridge:
             database=database,
             paper_brokerage=paper_brokerage,
             live_brokerage=live_brokerage,
-            config=config
+            config=config,
+            boosted_predictor=boosted_predictor
         )
 
         # Track open trades (for outcome recording)
